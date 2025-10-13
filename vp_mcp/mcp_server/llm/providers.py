@@ -5,6 +5,8 @@ from typing import Optional, Dict, Any, List
 import os
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.language_models.chat_models import BaseChatModel
+from app.core.logging import get_logger
+logger = get_logger(__name__)
 
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -149,16 +151,23 @@ class _BaseLLM:
         # 모델명 접두로 프로바이더 선택 (app 코드 정책 반영)
         m = (model or "").lower()
         if m.startswith(("gpt", "o", "openai")):
+            provider = "openai"
             self.llm: BaseChatModel = _openai_chat(model, temperature)
         elif m.startswith("gemini"):
+            provider = "gemini"
             self.llm = _gemini_chat(model, temperature)
         else:
             # 기본은 OpenAI
+            provider = "openai(default)"
             self.llm = _openai_chat(model or "gpt-4o-mini-2024-07-18", temperature)
+        logger.info(f"[LLM:init] model={model} provider={provider} temperature={temperature}")
 
     def _invoke(self, messages: List):
+        logger.info(f"[LLM:invoke] model={self.model_name} len_messages={len(messages)}")
         res = self.llm.invoke(messages)
-        return getattr(res, "content", str(res)).strip()
+        out = getattr(res, "content", str(res)).strip()
+        logger.info(f"[LLM:done] model={self.model_name} out_len={len(out)}")
+        return out
 
 class AttackerLLM(_BaseLLM):
     def next(

@@ -157,6 +157,8 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             }
             conv = Conversation.create(db, meta=meta)
             conversation_id = conv.id
+        
+        print(">> models:", input_obj.models)
 
         # 2) LLM 준비
         atk = AttackerLLM(
@@ -299,6 +301,7 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             "round_no": input_obj.round_no or 1,
             "guidance": input_obj.guidance or {},
             "scenario": input_obj.scenario,
+            "models": input_obj.models,
         }
         result = SimulationResult(
             conversation_id=conversation_id,

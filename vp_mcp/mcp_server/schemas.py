@@ -1,5 +1,7 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, Dict, Any, List
+
+DEFAULT_MODELS = {"attacker": "gpt-4o-mini", "victim": "gemini-2.5-flash-lite"}
 
 class RolePrompt(BaseModel):
     system: str
@@ -21,8 +23,14 @@ class SimulationInput(BaseModel):
     scenario: Dict[str, Any] = {}
     victim_profile: Dict[str, Any] = {}
     templates: Dict[str, Any] = {}
-    models: Dict[str, str] = {"attacker": "gpt-4o-mini", "victim": "gemini-2.5-flash-lite"}
+    models: Dict[str, str] = Field(default_factory=dict)
     temperature: float = 0.6
+
+    @model_validator(mode="after")
+    def _merge_model_defaults(self):
+        # 사용자가 일부만 보내도 기본과 병합되도록
+        self.models = {**DEFAULT_MODELS, **(self.models or {})}
+        return self
 
 class Turn(BaseModel):
     role: str  # "offender" | "victim"

@@ -9,6 +9,9 @@ from langchain_core.tools import tool
 from app.core.logging import get_logger
 import re
 
+from app.services.prompts import render_attacker_system_string, render_victim_system_string
+from app.services.agent.payload_store import load_payload
+
 logger = get_logger(__name__)
 
 # ─────────────────────────────────────────────────────────
@@ -49,8 +52,10 @@ class MCPRunInput(BaseModel):
     case_id_override: Optional[str] = None
     round_no: Optional[int] = None
     combined_prompt: Optional[str] = None
+
 class SingleData(BaseModel):
     data: dict = Field(...)
+
 # ───────── 유틸 ─────────
 def _unwrap(data: Any) -> Dict[str, Any]:
     """
@@ -58,10 +63,11 @@ def _unwrap(data: Any) -> Dict[str, Any]:
     - dict면 {"data": {...}} 이면 내부 {...}만 반환, 아니면 그대로
     - str이면 첫 JSON 객체만 raw_decode로 파싱 후, {"data": {...}}면 내부만 반환
     - 코드펜스/접두 텍스트/트레일링 문자 방어 포함
+    - JSON 파싱 실패 시 ast.literal_eval 폴백
     """
     if isinstance(data, dict):
         if set(data.keys()) == {"data"} and isinstance(data["data"], dict):
-            return data["data"]               # ✅ 최상위 'data' 벗기기
+            return data["data"]
         return data
 
     if data is None:
@@ -69,7 +75,7 @@ def _unwrap(data: Any) -> Dict[str, Any]:
 
     s = str(data).strip()
 
-    # 코드펜스 제거
+    # 코드펜스 제거 (```json ... ``` 등)
     if s.startswith("```"):
         m = re.search(r"```(?:json)?\s*(.*?)```", s, re.S | re.I)
         if m:
@@ -81,27 +87,48 @@ def _unwrap(data: Any) -> Dict[str, Any]:
         s = s[i:]
 
     dec = JSONDecoder()
-    obj, end = dec.raw_decode(s)  # 첫 JSON만 파싱
+    try:
+        obj, end = dec.raw_decode(s)
+    except Exception:
+        # 1) 본문 내 가장 바깥의 { ... } 블록을 추출
+        m = re.search(r"\{.*\}", s, re.S)
+        if m:
+            sub = m.group(0)
+        else:
+            raise ValueError("No JSON object found in action input")
 
-    # ✅ 문자열로 들어온 경우도 'data' 래퍼 벗기기
+        # 2) json.loads 시도
+        try:
+            obj = json.loads(sub)
+        except Exception:
+            # 3) ast.literal_eval (파이썬 dict 리터럴 허용)
+            try:
+                pyobj = ast.literal_eval(sub)
+                if isinstance(pyobj, dict):
+                    obj = pyobj
+                else:
+                    raise ValueError("Parsed object is not a dict")
+            except Exception as e:
+                raise ValueError(f"Unable to parse Action Input as JSON or Python literal: {e}")
+
+    # payload_key 복원: {"payload_key": "..."} 형태
+    if isinstance(obj, dict) and "payload_key" in obj:
+        try:
+            loaded = load_payload(obj["payload_key"])
+            if loaded is None:
+                raise ValueError(f"payload_key not found or expired: {obj['payload_key']}")
+            obj = loaded
+        except Exception as e:
+            raise ValueError(f"failed to load payload from payload_key: {e}")
+
+    # 'data' 래퍼가 있는 경우 벗겨서 반환
     if isinstance(obj, dict) and set(obj.keys()) == {"data"} and isinstance(obj["data"], dict):
         return obj["data"]
 
-    return obj
+    if not isinstance(obj, dict):
+        raise ValueError("Action Input did not resolve to a dict")
 
-# def _unwrap_forgiving(obj: dict) -> dict:
-#     """
-#     {"data":{...}, "guidance":..., "round_no":..., "case_id_override":...}
-#     처럼 섞여 들어와도 data 안으로 병합해서 돌려줌.
-#     """
-#     if "data" in obj and isinstance(obj["data"], dict):
-#         merged = dict(obj["data"])
-#         # 루트에 잘못 나온 키들을 흡수
-#         for k in ("case_id_override", "round_no", "guidance"):
-#             if k in obj and k not in merged:
-#                 merged[k] = obj[k]
-#         return merged
-#     return obj
+    return obj
 
 def _post_api_simulate(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -138,26 +165,24 @@ def make_mcp_tools():
         description="MCP 서버의 POST /api/simulate 를 호출해 두-봇 시뮬레이션을 실행합니다."
     )
     def simulator_run(data: Any) -> Dict[str, Any]:
-        # ---------- 1) 입력 언랩 + 통짜 프롬프트 자동 구성 ----------
+        # ---------- 1) 입력 언랩 ----------
         payload = _unwrap(data)
 
+        if isinstance(payload, dict) and "payload_key" in payload:
+            stored = load_payload(payload["payload_key"])
+            if not isinstance(stored, dict):
+                return {"ok": False, "error": "payload_key_not_found", "hint": "expired or missing"}
+            payload = stored
 
         # case_id 별칭 지원
         if "case_id" in payload and "case_id_override" not in payload:
             payload["case_id_override"] = payload["case_id"]
 
-        # compose_prompts 결과 자동 합치기(있을 때만)
+        # (혼선 방지) combined_prompt 자동 생성/전달 제거
         ap = payload.get("attacker_prompt")
         vp = payload.get("victim_prompt")
-        if ap and vp and "combined_prompt" not in payload:
-            payload["combined_prompt"] = f"[ATTACKER]\n{ap}\n[/ATTACKER]\n[VICTIM]\n{vp}\n[/VICTIM]"
-
-        # 라운드1 가드: case_id 없이 guidance가 오면 무시
-        round_no = payload.get("round_no")
-        case_id = payload.get("case_id_override")
-        if payload.get("guidance") and not case_id and (round_no is None or int(round_no) <= 1):
-            logger.info("[mcp.simulator_run] guidance before first run → ignored")
-            payload.pop("guidance", None)
+        # if ap and vp and "combined_prompt" not in payload:
+        #     payload["combined_prompt"] = f"[ATTACKER]\n{ap}\n[/ATTACKER]\n[VICTIM]\n{vp}\n[/VICTIM]"
 
         # ---------- 2) 1회만 검증 ----------
         try:
@@ -169,7 +194,7 @@ def make_mcp_tools():
                 "pydantic_errors": json.loads(ve.json()),
             }
 
-        # ---------- 3) 모델 키 정규화 (attacker_model/victim_model → models.attacker/victim) ----------
+        # ---------- 3) 모델 키 정규화 ----------
         eff_models: Dict[str, str] = {}
         if isinstance(model.models, dict):
             eff_models.update({k: v for k, v in model.models.items() if isinstance(v, str) and v})
@@ -180,44 +205,89 @@ def make_mcp_tools():
         if eff_models:
             logger.info(f"[MCP] using explicit models: {eff_models}")
 
-        # ---------- 4) 서버 스키마에 맞게 arguments 구성 ----------
+        # ---------- 4) prompts.py 빌더로 system 문자열 생성 ----------
+        atk_system = payload.get("attacker_prompt") or None
+        vic_system = payload.get("victim_prompt") or None
+
+        if not atk_system:
+            try:
+                atk_system = render_attacker_system_string(
+                    scenario=model.scenario or {},
+                    current_step="",
+                    guidance=(model.guidance.model_dump() if model.guidance else None),
+                )
+            except Exception as e:
+                logger.warning(f"[MCP] render_attacker_system_string failed: {e}")
+                atk_system = None  # 폴백 필요
+
+        if not vic_system:
+            try:
+                vic_system = render_victim_system_string(
+                    victim_profile=model.victim_profile or {},
+                    round_no=int(model.round_no or 1),
+                    previous_experience="",
+                    is_convinced_prev=None,
+                )
+            except Exception as e:
+                logger.warning(f"[MCP] render_victim_system_string failed: {e}")
+                vic_system = None  # 폴백 필요
+
+        # 🔐 최종 폴백: 호출자가 준 templates(짧은 기본문구)라도 넣어서 비는 일 방지
+        if atk_system is None:
+            atk_system = model.templates.attacker
+        if vic_system is None:
+            vic_system = model.templates.victim
+
+        # 디버깅용: 실제 전송되는 system 머리만 로그
+        def _head(s: str, n: int = 140) -> str:
+            try:
+                return (s[:n] + ("..." if len(s) > n else ""))
+            except Exception:
+                return "<non-str>"
+
+        logger.info("[MCP] attacker system head: %s", _head(atk_system))
+        logger.info("[MCP] victim   system head: %s", _head(vic_system))
+
+        templates_payload = {"attacker": atk_system, "victim": vic_system}
+
+        # ---------- 5) 서버 스키마에 맞게 arguments 구성 ----------
         args: Dict[str, Any] = {
             "offender_id": model.offender_id,
             "victim_id": model.victim_id,
             "scenario": model.scenario,
             "victim_profile": model.victim_profile,
-            "templates": {"attacker": model.templates.attacker, "victim": model.templates.victim},
+            "templates": templates_payload,  # ← 우리가 만든 system 문자열만 전달
             "max_turns": model.max_turns,
         }
         if model.guidance:
-            # 서버가 guidance 키를 'kind'로 요구한다면 아래 한 줄만 바꾸면 됨:
-            # args["guidance"] = {"kind": model.guidance.type, "text": model.guidance.text}
             args["guidance"] = {"type": model.guidance.type, "text": model.guidance.text}
         if model.case_id_override:
             args["case_id_override"] = model.case_id_override
         if model.round_no:
             args["round_no"] = model.round_no
-        if model.combined_prompt:
-            args["combined_prompt"] = model.combined_prompt
-        # ★ 개별 프롬프트도 같이 전달(서버가 최우선 사용)
-        if ap and vp:
-            args["attacker_prompt"] = ap
-            args["victim_prompt"] = vp
+        # combined_prompt 전달 금지 (혼선 방지)
+        # if model.combined_prompt:
+        #     args["combined_prompt"] = model.combined_prompt
+
+        # 개별 attacker_prompt/victim_prompt 전달 금지 (혼선 방지)
+        # if ap and vp:
+        #     args["attacker_prompt"] = ap
+        #     args["victim_prompt"] = vp
+
         # 모델 전달(선택)
         if eff_models:
             args["models"] = eff_models
 
         logger.info(f"[MCP] POST /api/simulate keys={list(args.keys())} base={MCP_BASE_URL}")
 
-        # ---------- 5) 호출 ----------
+        # ---------- 6) 호출 ----------
         res = _post_api_simulate(args)
 
         # 서버가 실패 형식으로 주는 경우 그대로 반환
         if isinstance(res, dict) and res.get("ok") is False:
             return res
 
-        # ---------- 6) 응답 평탄화(핵심) ----------
-        # 서버 응답은 대개 {"result": {...}} 또는 {"raw": {"result": {...}}} 형태일 수 있다.
+        # ---------- 7) 응답 평탄화 ----------
         result = None
         if isinstance(res, dict):
             if isinstance(res.get("result"), dict):
@@ -246,7 +316,6 @@ def make_mcp_tools():
         )
 
         if not cid:
-            # 과거 코드에서는 이 지점에서 ok: False를 반환했기 때문에 항상 실패처럼 보였을 수 있음
             return {"ok": False, "error": "missing_conversation_id", "raw": result}
 
         turns = result.get("turns") or []
@@ -254,7 +323,7 @@ def make_mcp_tools():
         ended_by = result.get("ended_by")
         meta = result.get("meta") or {}
 
-        # ---------- 7) 표준화된 성공 응답 ----------
+        # ---------- 8) 표준화된 성공 응답 ----------
         return {
             "ok": True,
             "case_id": cid,
@@ -262,8 +331,12 @@ def make_mcp_tools():
             "stats": stats,
             "ended_by": ended_by,
             "meta": meta,
-            "log": result,        # ★ admin 판단에 그대로 넘길 전체 로그
+            "log": result,
             "total_turns": stats.get("turns"),
+            "debug_templates": {          # 👈 추가
+                "attacker": atk_system,
+                "victim":   vic_system,
+            },
         }
 
     return [simulator_run]

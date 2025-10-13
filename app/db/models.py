@@ -16,7 +16,7 @@ class PhishingOffender(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     profile: Mapped[dict] = mapped_column(JSONB, default=dict)
-    source: Mapped[dict | None] = mapped_column(JSONB, default=dict)
+    source: Mapped[dict | None] = mapped_column(JSONB, default=dict, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))

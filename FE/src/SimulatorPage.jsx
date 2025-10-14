@@ -1,4 +1,4 @@
-// // src/SimulatorPage.jsx
+// src/SimulatorPage.jsx
 import { useState, useMemo, useEffect, useRef } from "react";
 import HudBar from "./HudBar";
 import MessageBubble from "./MessageBubble";
@@ -6,7 +6,7 @@ import SpinnerMessage from "./SpinnerMessage";
 import InvestigationBoard from "./InvestigationBoard";
 import TerminalLog from "./components/TerminalLog";
 import TTSModal from "./components/TTSModal";
-import { FileBarChart2 } from "lucide-react";
+import { FileBarChart2, Home } from "lucide-react";
 
 const SimulatorPage = ({
   COLORS,
@@ -69,12 +69,15 @@ const SimulatorPage = ({
     return () => clearInterval(timer);
   }, [agentLogText]);
 
-  /* 🔄 리셋 함수 */
-  const resetLogsAndResult = () => {
+  /* 🔄 리셋 + 홈으로 이동 */
+  const handleGoHome = () => {
     setDisplayedAgentLogText("");
     logIndexRef.current = 0;
     setSessionResult(null);
+    setSelectedScenario(null);
+    setSelectedCharacter(null);
     setProgress(0);
+    setCurrentPage("landing"); // ✅ 홈으로 이동
   };
 
   /* 🧩 4. 백엔드 로그(sessionResult.log.turns) → MessageBubble 호환 메시지 변환 */
@@ -90,7 +93,6 @@ const SimulatorPage = ({
         try {
           parsed = JSON.parse(t.text);
           content = parsed.dialogue || t.text;
-          // 🔹 is_convinced(0~10)을 퍼센트(0~100)로 변환
           if (typeof parsed.is_convinced === "number") {
             convincedPct = Math.round((parsed.is_convinced / 10) * 100);
           }
@@ -100,7 +102,7 @@ const SimulatorPage = ({
       }
 
       return {
-        sender: t.role, // "victim" or "offender"
+        sender: t.role,
         content,
         convincedPct,
         type: "chat",
@@ -125,49 +127,29 @@ const SimulatorPage = ({
         className="flex items-center justify-between px-6 py-4 border-b"
         style={{ borderColor: COLORS.border }}
       >
+        {/* 좌측 상태 표시 */}
         <div className="flex items-center gap-3">
           <span>{selectedScenario ? selectedScenario.name : "시나리오 미선택"}</span>
           <span>{selectedCharacter ? selectedCharacter.name : "캐릭터 미선택"}</span>
         </div>
 
+        {/* 우측 버튼들 */}
         <div className="flex gap-2">
-          {/* 시나리오 다시 선택 */}
-          {selectedScenario && (
-            <button
-              onClick={() => {
-                setSelectedScenario(null);
-                resetLogsAndResult();
-              }}
-              className="px-3 py-2 rounded-md text-sm font-medium border"
-              style={{
-                backgroundColor: COLORS.panel,
-                borderColor: COLORS.border,
-                color: COLORS.sub,
-              }}
-            >
-              ← 시나리오 다시 선택
-            </button>
-          )}
+          {/* 🏠 홈으로 버튼 */}
+          <button
+            onClick={handleGoHome}
+            className="px-3 py-2 rounded-md text-sm font-medium flex items-center gap-2 border"
+            style={{
+              backgroundColor: COLORS.panel,
+              borderColor: COLORS.border,
+              color: COLORS.sub,
+            }}
+          >
+            <Home size={16} />
+            홈으로
+          </button>
 
-          {/* 캐릭터 다시 선택 */}
-          {selectedCharacter && (
-            <button
-              onClick={() => {
-                setSelectedCharacter(null);
-                resetLogsAndResult();
-              }}
-              className="px-3 py-2 rounded-md text-sm font-medium border"
-              style={{
-                backgroundColor: COLORS.panel,
-                borderColor: COLORS.border,
-                color: COLORS.sub,
-              }}
-            >
-              ← 캐릭터 다시 선택
-            </button>
-          )}
-
-          {/* 리포트 보기 */}
+          {/* 📊 리포트 보기 */}
           {progress >= 100 && (
             <button
               onClick={() => setCurrentPage("report")}
@@ -189,18 +171,55 @@ const SimulatorPage = ({
       <div className="flex flex-row h-[80vh]">
         {/* 왼쪽: 대화창 */}
         <div className="flex-1 overflow-y-auto p-6">
-          {parsedMessages.length === 0 ? (
-            <SpinnerMessage simulationState={simulationState} COLORS={COLORS} />
+          {sessionResult?.log?.turns?.length > 0 ? (
+            sessionResult.log.turns.map((turn, i) => {
+              // ---- 1️⃣ 기본값 초기화 ----
+              let speechText = turn.text;
+              let thoughtText = null;
+              let convincedPct = null;
+
+              // ---- 2️⃣ 피해자 메시지(JSON 파싱) ----
+              if (turn.role === "victim") {
+                try {
+                  const parsed = JSON.parse(turn.text);
+                  speechText = parsed.dialogue || "";
+                  thoughtText = parsed.thoughts || null;
+                  convincedPct =
+                    typeof parsed.is_convinced === "number"
+                      ? Math.round((parsed.is_convinced / 10) * 100)
+                      : null;
+                } catch {
+                  speechText = turn.text;
+                }
+              }
+
+              // ---- 3️⃣ 메시지 객체 생성 ----
+              const message = {
+                sender: turn.role, // victim | offender
+                speechText,
+                thoughtText,
+                convincedPct,
+                variant: thoughtText ? "combined" : "speech",
+                type: "chat",
+                timestamp: new Date().toLocaleTimeString("ko-KR", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+              };
+
+              // ---- 4️⃣ 렌더링 ----
+              return (
+                <MessageBubble
+                  key={i}
+                  message={message}
+                  selectedCharacter={selectedCharacter}
+                  victimImageUrl={selectedCharacter?.imageUrl}
+                  COLORS={COLORS}
+                />
+              );
+            })
           ) : (
-            parsedMessages.map((m, i) => (
-              <MessageBubble
-                key={i}
-                message={m}
-                selectedCharacter={selectedCharacter}
-                victimImageUrl={selectedCharacter?.imageUrl}
-                COLORS={COLORS}
-              />
-            ))
+            <SpinnerMessage simulationState={simulationState} COLORS={COLORS} />
           )}
         </div>
 
@@ -221,6 +240,41 @@ const SimulatorPage = ({
           </div>
         </div>
       </div>
+      {/*
+      //이런 식으로 데이터를 받아와야 하단의 컴포넌트에서 잘 작동함
+      <InvestigationBoard
+          COLORS={COLORS}
+          delaySec={5}
+          insightsList={[
+            {
+              run_no: 1,
+              phishing: false,
+              evidence: "피해자는 대출 신청을 하지 않았다며 의심을 표했고...",
+              risk: {
+                score: 10,
+                level: "low",
+                rationale: "피해자가 금융 정보를 제공하지 않아 피해 가능성이 낮음.",
+              },
+              victim_vulnerabilities: [
+                "대출 여부에 당황함",
+                "끈질긴 재촉 시 스트레스",
+                "권위적 말투에 압도 가능",
+              ],
+            },
+            {
+              run_no: 2,
+              phishing: true,
+              evidence: "피해자가 송금 의사를 보이며 계좌를 확인함.",
+              risk: {
+                score: 82,
+                level: "high",
+                rationale: "금전 이동 발화 및 송금 승인 확인됨.",
+              },
+              victim_vulnerabilities: ["불안감에 판단력 저하", "권위적 언행에 순응"],
+            },
+          ]}
+        />
+      */}
 
       {/* 하단 진행률 */}
       <div
@@ -248,6 +302,7 @@ const SimulatorPage = ({
 };
 
 export default SimulatorPage;
+
 
 // import { useState, useMemo, useEffect, useRef } from "react";
 // import { Play, Clock, Check, AlertTriangle } from "lucide-react";

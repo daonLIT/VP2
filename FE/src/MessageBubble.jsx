@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 function getRiskColors(pct) {
   const v = Math.max(0, Math.min(100, Number(pct) || 0));
   if (v >= 70) {
@@ -33,6 +35,18 @@ const MessageBubble = ({ message, selectedCharacter, victimImageUrl, COLORS }) =
   const isAnalysis = message.type === "analysis";
   const isSpinner  = isSystem && String(message.content || "").includes("🔄");
 
+  // ✅ 추가: 부드러운 설득도 변화용 state
+  const [animatedConvinced, setAnimatedConvinced] = useState(0);
+
+  useEffect(() => {
+    if (typeof message?.convincedPct === "number") {
+      const timer = setTimeout(() => {
+        setAnimatedConvinced(message.convincedPct);
+      }, 150);
+      return () => clearTimeout(timer);
+    }
+  }, [message?.convincedPct]);
+
   // 합쳐진 카드 여부 및 텍스트 분리
   const isCombined  = message.variant === "combined" || !!message.thoughtText;
   const thoughtText = message.thoughtText || (message.variant === "thought" ? message.content : null);
@@ -42,8 +56,8 @@ const MessageBubble = ({ message, selectedCharacter, victimImageUrl, COLORS }) =
 
   // 설득도(%)
   const convincedPct =
-    typeof message?.convincedPct === "number"
-      ? Math.max(0, Math.min(100, message.convincedPct))
+    typeof animatedConvinced === "number"
+      ? Math.max(0, Math.min(100, animatedConvinced))
       : null;
 
   // ===== 버블 배경/글자색 규칙 =====
@@ -143,7 +157,7 @@ const MessageBubble = ({ message, selectedCharacter, victimImageUrl, COLORS }) =
                 <div className="flex items-center gap-1 min-w-[140px] max-w-[220px]">
                   <div className="flex-1 h-2 bg-[#e5e7eb] rounded overflow-hidden">
                     <div
-                      className="h-full transition-all"
+                      className="h-full transition-all duration-1000 ease-in-out"
                       style={{
                         width: `${convincedPct}%`,
                         backgroundColor:
@@ -162,45 +176,48 @@ const MessageBubble = ({ message, selectedCharacter, victimImageUrl, COLORS }) =
         )}
 
         {/* ===== 본문 ===== */}
-        {!isCombined ? (
-          thoughtText ? (
-            <div style={innerBoxStyle} className="mb-1.5">
-              <p className="whitespace-pre-line text-base leading-relaxed" style={innerTextStyle}>
-                {thoughtText}
-              </p>
-              <div
-                className="inline-block mt-1 px-1.5 py-0.5 text-[11px] rounded"
-                style={{ color: innerTextStyle.color, backgroundColor: risk.tagBg }}
-              >
-                속마음
-              </div>
-            </div>
-          ) : (
-            <p className="whitespace-pre-line text-base leading-relaxed">
-              {isSpinner ? String(speechText || "").replace("🔄 ", "") : speechText}
+        {thoughtText && (
+          <div
+            style={{
+              border: `1px dashed ${risk.border}`,
+              backgroundColor: risk.bg,
+              borderRadius: "12px",
+              padding: "12px 14px",
+              marginBottom: "10px",
+            }}
+          >
+            <p
+              className="text-base leading-relaxed whitespace-pre-line"
+              style={{ color: risk.text }}
+            >
+              💭 {thoughtText}
             </p>
-          )
-        ) : (
-          <>
-            {thoughtText && (
-              <div style={innerBoxStyle} className="mb-3">
-                <p className="whitespace-pre-line text-base leading-relaxed" style={innerTextStyle}>
-                  {thoughtText}
-                </p>
-                <div
-                  className="inline-block mt-1 px-1.5 py-0.5 text-[11px] rounded"
-                  style={{ color: innerTextStyle.color, backgroundColor: risk.tagBg }}
-                >
-                  속마음
-                </div>
-              </div>
-            )}
-            {speechText && (
-              <p className="whitespace-pre-line text-base leading-relaxed">
-                {speechText}
-              </p>
-            )}
-          </>
+            <div
+              className="inline-block mt-2 px-2 py-0.5 text-[11px] rounded-full"
+              style={{
+                backgroundColor: risk.tagBg,
+                color: risk.text,
+                fontWeight: "500",
+              }}
+            >
+              속마음
+            </div>
+          </div>
+        )}
+
+        {speechText && (
+          <div
+            style={{
+              backgroundColor: isVictim ? COLORS.white : "#313338",
+              color: isVictim ? COLORS.black : COLORS.text,
+              borderRadius: "14px",
+              padding: "10px 14px",
+              lineHeight: "1.6",
+              boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
+            }}
+          >
+            💬 {speechText}
+          </div>
         )}
 
         {/* 타임스탬프 */}

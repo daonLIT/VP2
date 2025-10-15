@@ -13,7 +13,7 @@ from app.routers import health, offenders, victims, conversations, admin_cases
 from app.routers import conversations_read, simulator as simulator_router
 from app.routers import agent as agent_router
 from app.routers.personalized import router as personalized_router
-
+from app.routers import react_agent_stream_router
 # React Agent 라우터만 추가
 from app.routers import react_agent_router
 
@@ -66,6 +66,7 @@ app.include_router(agent_router.router, prefix=settings.API_PREFIX)
 # React Agent 시스템 (MCP는 여기서 동적 호출)
 app.include_router(react_agent_router.router, prefix=settings.API_PREFIX)
 
+app.include_router(react_agent_stream_router.router, prefix=settings.API_PREFIX)
 # app.include_router(tts_router.router, prefix=settings.API_PREFIX)
 
 

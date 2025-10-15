@@ -71,39 +71,76 @@ async function getConversationBundle(caseId) {
 }
 
 // ✅ SSE 스트리밍
-async function* streamReactSimulation(payload) {
-  const response = await fetch(`${API_ROOT}/react-agent/simulation/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+export async function* streamReactSimulation(payload = {}) {
+  // 1) 쿼리스트링 구성 (GET은 body 사용 불가)
+  const params = new URLSearchParams();
+  Object.entries(payload).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) params.set(k, String(v));
   });
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
+  // 2) SSE URL 구성
+  const base = typeof API_ROOT === "string" ? API_ROOT : "";
+  const url = `${base}/react-agent/simulation/stream?${params.toString()}`;
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  // 3) EventSource로 연결
+  const es = new EventSource(url);
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  // 4) async generator를 위한 간단 큐
+  const queue = [];
+  let notify;
+  let done = false;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+  const push = (data) => {
+    queue.push(data);
+    if (notify) { notify(); notify = undefined; }
+  };
 
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        try {
-          const data = JSON.parse(line.slice(6));
-          yield data;
-        } catch (e) {
-          console.warn("SSE 파싱 실패:", line);
+  // (A) 기본 message 이벤트
+  es.onmessage = (e) => {
+    try { push(JSON.parse(e.data)); }
+    catch { push(e.data); }
+  };
+
+  // (B) 라우터가 보내는 커스텀 이벤트들 구독
+  const eventTypes = [
+    "run_start","log","agent_action","tool_observation","agent_finish",
+    "result","run_end","ping","error"
+  ];
+  eventTypes.forEach((t) => {
+    es.addEventListener(t, (e) => {
+      try { push(JSON.parse(e.data)); }
+      catch { push(e.data); }
+      if (t === "run_end" || t === "error") {
+        done = true;
+        es.close();
+      }
+    });
+  });
+
+  // (C) 네트워크/연결 에러
+  es.addEventListener("error", (e) => {
+    push({ type: "error", message: "SSE connection error" });
+    done = true;
+    es.close();
+  });
+
+  try {
+    while (!done) {
+      if (queue.length === 0) {
+        await new Promise((r) => (notify = r));
+      }
+      while (queue.length) {
+        const ev = queue.shift();
+        yield ev; // 기존 for-await 사용 그대로 가능
+        if (ev?.type === "run_end" || ev?.type === "error") {
+          done = true;
+          es.close();
+          break;
         }
       }
     }
+  } finally {
+    es.close();
   }
 }
 

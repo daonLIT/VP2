@@ -1,5 +1,3 @@
-# app/services/agent/orchestrator_react.py
-
 from __future__ import annotations
 from typing import Dict, Any, List, Tuple, Optional
 from dataclasses import dataclass, field
@@ -31,13 +29,86 @@ from app.services.prompt_integrator_db import build_prompt_package_from_payload
 logger = get_logger(__name__)
 
 # ─────────────────────────────────────────────────────────
-# 전역 설정 / 헬퍼 (★ 추가)
+# (SSE 추가) 전역 설정 / 헬퍼
 # ─────────────────────────────────────────────────────────
 # 서버가 guidance 키로 무엇을 기대하는지 고정 ("type" 또는 "kind")
 EXPECT_GUIDANCE_KEY = "type"   # ← 서버가 kind를 요구하면 "kind"로 변경
 
 # mcp.simulator_run은 Action Input 최상위 언랩을 사용
 EXPECT_MCP_DATA_WRAPPER = False  # True면 {"data": {...}} 래핑, False면 언랩
+
+# (SSE) 필요한 모듈
+import asyncio, logging, uuid, contextvars, contextlib
+from typing import AsyncGenerator
+from starlette.responses import StreamingResponse
+from fastapi import APIRouter, status
+
+# (SSE) run별 큐 보관소와 컨텍스트 stream_id
+_SSE_QUEUES: dict[str, asyncio.Queue] = {}
+_current_stream_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("_current_stream_id", default=None)
+
+def _get_queue(stream_id: str) -> asyncio.Queue:
+    q = _SSE_QUEUES.get(stream_id)
+    if q is None:
+        q = asyncio.Queue()
+        _SSE_QUEUES[stream_id] = q
+    return q
+
+async def _sse_event_generator(stream_id: str) -> AsyncGenerator[bytes, None]:
+    queue = _get_queue(stream_id)
+
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(15)
+            try:
+                await queue.put({"type": "heartbeat", "ts": datetime.now().isoformat()})
+            except Exception:
+                break
+
+    hb_task = asyncio.create_task(heartbeat())
+    try:
+        while True:
+            msg = await queue.get()
+            payload = json.dumps(msg, ensure_ascii=False)
+            yield f"data: {payload}\n\n".encode("utf-8")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        hb_task.cancel()
+        try:
+            _SSE_QUEUES.pop(stream_id, None)
+        except Exception:
+            pass
+
+def _emit_to_stream(kind: str, content: Any):
+    stream_id = _current_stream_id.get()
+    if not stream_id:
+        return
+    try:
+        q = _get_queue(stream_id)
+        q.put_nowait({"type": kind, "content": _truncate(content, 2000), "ts": datetime.now().isoformat()})
+    except Exception:
+        pass
+
+class _LogToSSEHandler(logging.Handler):
+    """이 모듈 logger로 찍히는 로그를 SSE로 복제"""
+    def emit(self, record: logging.LogRecord):
+        try:
+            text = self.format(record)
+            _emit_to_stream("log", text)
+        except Exception:
+            pass
+
+_sse_log_handler = _LogToSSEHandler()
+_sse_log_handler.setLevel(logging.INFO)
+_sse_log_handler.setFormatter(logging.Formatter("%(message)s"))
+
+# (SSE) 라우터: /api/sse/agent/{stream_id}
+router = APIRouter(prefix="/api/sse", tags=["sse"])
+
+@router.get("/agent/{stream_id}")
+async def sse_agent_stream(stream_id: str):
+    return StreamingResponse(_sse_event_generator(stream_id), media_type="text/event-stream", status_code=status.HTTP_200_OK)
 
 
 def _truncate(obj: Any, max_len: int = 800) -> Any:
@@ -282,6 +353,8 @@ class ThoughtCapture(BaseCallbackHandler):
             rec["tool"],
             _truncate(rec["tool_input"]),
         )
+        # (SSE) 에이전트 액션 전달
+        _emit_to_stream("agent_action", {"tool": rec["tool"], "input": rec["tool_input"]})
 
     def on_tool_end(self, output: Any, **kwargs):
         self.events.append({
@@ -290,10 +363,14 @@ class ThoughtCapture(BaseCallbackHandler):
             "output": output,
         })
         logger.info("[ToolObservation] Tool=%s | Output=%s", self.last_tool, _truncate(output, 1200))
+        # (SSE) 툴 관찰 전달
+        _emit_to_stream("tool_observation", {"tool": self.last_tool, "output": output})
 
     def on_agent_finish(self, finish, **kwargs):
         self.events.append({"type": "finish", "log": finish.log})
         logger.info("[AgentFinish] %s", _truncate(finish.log, 1200))
+        # (SSE) 에이전트 종료 전달
+        _emit_to_stream("agent_finish", {"log": getattr(finish, "log", "")})
 
 
 # ─────────────────────────────────────────────────────────
@@ -417,6 +494,12 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
 # 메인 오케스트레이션
 # ─────────────────────────────────────────────────────────
 def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # (SSE) 스트림 컨텍스트 시작: 프론트가 전달한 stream_id 사용(없으면 내부 생성)
+    stream_id = str(payload.get("stream_id") or uuid.uuid4())
+    token = _current_stream_id.set(stream_id)
+    logger.addHandler(_sse_log_handler)
+    _emit_to_stream("run_start", {"stream_id": stream_id, "payload_hint": _truncate(payload, 400)})
+
     req = SimulationStartRequest(**payload)
     ex, mcp_manager = build_agent_and_tools(db, use_tavily=req.use_tavily)
 
@@ -567,10 +650,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                     logger.warning("[ToolInputCheckError] %s", e)
 
             # Observation 파싱
+            # Observation 파싱
             sim_obs = _last_observation(cap, "mcp.simulator_run")
             sim_dict = _loose_parse_json(sim_obs)
 
-            # 에이전트가 data 래핑을 하거나, top-level missing 패턴이면 → 툴 직접 호출 폴백
+            # (1) 휴리스틱 기반 1차 폴백: agent가 data로 감쌌거나 top-level missing이면 언랩 직접 호출
             bad_top = _looks_like_missing_top_fields_error(sim_dict)
             sent_wrapped = (cap.last_tool_input == {"data": sim_payload})
             if (not sim_dict.get("ok") and bad_top) or sent_wrapped:
@@ -578,8 +662,43 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                 tool = _get_tool(ex, "mcp.simulator_run")
                 if not tool:
                     raise HTTPException(500, detail="mcp.simulator_run tool not found")
-                tool_res = tool.invoke(sim_payload)  # ★ 언랩 직접 호출
+                tool_res = tool.invoke(sim_payload)  # 언랩 직접 호출
                 sim_dict = _loose_parse_json(tool_res)
+
+            # (2) 여전히 실패면, '반대 형태'로 무조건 1회 더 시도(래핑 ↔ 언랩 스위치)
+            if not sim_dict.get("ok"):
+                _emit_to_stream("debug", {"where": "mcp.simulator_run", "hint": "first_shape_failed_try_opposite"})
+                tool = _get_tool(ex, "mcp.simulator_run")
+                if not tool:
+                    raise HTTPException(500, detail="mcp.simulator_run tool not found")
+
+                try:
+                    # EXPECT_MCP_DATA_WRAPPER 기준의 '반대' 형태로 재시도
+                    if EXPECT_MCP_DATA_WRAPPER:
+                        # 현재 기본이 래핑이라면 → 언랩으로 재시도
+                        tool_res2 = tool.invoke(_clean_payload(sim_payload, allow_extras=False, allowed_keys=list(sim_payload.keys())))
+                    else:
+                        # 현재 기본이 언랩이라면 → 래핑으로 재시도
+                        tool_res2 = tool.invoke({"data": sim_payload})
+
+                    sim_dict2 = _loose_parse_json(tool_res2)
+
+                    # 어떤 결과든 SSE로도 노출
+                    _emit_to_stream("tool_observation", {"tool": "mcp.simulator_run(retry-opposite)", "output": _truncate(sim_dict2, 1000)})
+
+                    if sim_dict2.get("ok"):
+                        sim_dict = sim_dict2
+                    else:
+                        _emit_to_stream("debug", {
+                            "where": "mcp.simulator_run",
+                            "retry_opposite_failed": True,
+                            "first_shape": "wrapped" if EXPECT_MCP_DATA_WRAPPER else "unwrapped",
+                            "second_shape": "unwrapped" if EXPECT_MCP_DATA_WRAPPER else "wrapped",
+                            "err_first": _truncate(sim_dict, 800),
+                            "err_second": _truncate(sim_dict2, 800),
+                        })
+                except Exception as e:
+                    _emit_to_stream("debug", {"where": "mcp.simulator_run", "retry_opposite_exception": str(e)})
 
             # 최종 실패 처리
             if not sim_dict.get("ok"):
@@ -588,7 +707,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                     _truncate(sim_dict, 800),
                     json.dumps(sim_payload, ensure_ascii=False),
                 )
+                _emit_to_stream("error", {"where": "mcp.simulator_run", "error": _truncate(sim_dict, 800)})
                 raise HTTPException(status_code=500, detail=f"simulator_run failed: {sim_dict.get('error') or 'unknown'}")
+
 
             # case_id 확정/검증
             if round_no == 1:
@@ -787,8 +908,75 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
             "personalized_prevention": prevention_obj,  # ★ 최종예방책 포함
         }
     finally:
+        # (SSE) run 종료 이벤트 + 정리
+        try:
+            _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
+        except Exception:
+            pass
+        try:
+            _current_stream_id.reset(token)
+        except Exception:
+            pass
+        try:
+            logger.removeHandler(_sse_log_handler)
+        except Exception:
+            pass
         try:
             if mcp_manager and getattr(mcp_manager, "is_running", False):
                 mcp_manager.stop_mcp_server()
         except Exception:
             pass
+
+
+# orchestrator_react.py 안에 추가
+# (import 는 파일 상단에 이미 있음: asyncio, uuid, Optional, AsyncGenerator 등)
+
+async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
+    """
+    라우터에서 직접 호출하는 SSE 제너레이터.
+    - 라우터는 이 제너레이터가 내보내는 dict 이벤트를 받아
+      text/event-stream 포맷으로 감싸 전송함.
+    - 기존 run_orchestrated()를 백그라운드에서 돌리고,
+      이 파일의 logger/콜백에서 나오는 로그를 큐를 통해 실시간으로 전달.
+    """
+    # 1) 이 스트림 전용 stream_id와 큐 준비
+    stream_id = str(payload.get("stream_id") or uuid.uuid4())
+    q = _get_queue(stream_id)
+
+    # 2) run_orchestrated를 쓰레드에서 동기 실행
+    async def _runner():
+        try:
+            # run_orchestrated는 동기함수이므로 to_thread로 실행
+            res = await asyncio.to_thread(run_orchestrated, db, {**payload, "stream_id": stream_id})
+            # 최종 결과도 하나 더 흘려주면 프론트에서 편함
+            _emit_to_stream("result", res)
+        except Exception as e:
+            _emit_to_stream("error", {"message": str(e)})
+
+    task = asyncio.create_task(_runner())
+
+    try:
+        # 3) 큐에서 이벤트를 하나씩 꺼내 제너레이터로 내보냄
+        while True:
+            ev = await q.get()
+            # 라우터 쪽에서 event/data로 감쌀 것이므로 dict 그대로 yield
+            yield ev
+
+            # run_end 또는 error 이후, 백그라운드 작업이 종료되면 루프 종료
+            if ev.get("type") in ("run_end", "error"):
+                if task.done():
+                    break
+
+            # 컨텍스트 스위치 (긴 연산 중 다른 코루틴에 양보)
+            await asyncio.sleep(0)
+
+    finally:
+        # 4) 정리: 큐 제거 + 태스크 안전 종료
+        try:
+            _SSE_QUEUES.pop(stream_id, None)
+        except Exception:
+            pass
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task

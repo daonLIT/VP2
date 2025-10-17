@@ -26,6 +26,11 @@ export const API_ROOT = `${API_BASE}${API_PREFIX}`;
 console.log("VITE_API_URL =", import.meta.env.VITE_API_URL);
 console.log("API_ROOT =", API_ROOT);
 
+// ---- SSE 단일 연결 보장용 ----
+const uuid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+let __activeES = null;          // 현재 열려있는 EventSource
+let __activeStreamId = null;    // 현재 실행 stream_id (재연결/중복 클릭 방지)
+
 /* ================== API 헬퍼 ================== */
 async function fetchWithTimeout(
   url,
@@ -72,14 +77,21 @@ async function getConversationBundle(caseId) {
 
 // ✅ SSE 스트리밍
 export async function* streamReactSimulation(payload = {}) {
+  // ① stream_id 고정(한 번의 실행 동안 유지)
+  const streamId = payload.stream_id ?? (__activeStreamId || (__activeStreamId = uuid()));
+  const withId = { ...payload, stream_id: streamId };
+
   const params = new URLSearchParams();
-  Object.entries(payload).forEach(([k, v]) => {
+  Object.entries(withId).forEach(([k, v]) => {
     if (v !== undefined && v !== null) params.set(k, String(v));
   });
 
   const base = typeof API_ROOT === "string" ? API_ROOT : "";
   const url = `${base}/react-agent/simulation/stream?${params.toString()}`;
+  // ② 기존 열린 SSE가 있으면 닫기(중복 연결 방지)
+  if (__activeES) { try { __activeES.close(); } catch {} }
   const es = new EventSource(url);
+  __activeES = es;
 
   const queue = [];
   let notify;
@@ -107,16 +119,20 @@ export async function* streamReactSimulation(payload = {}) {
       catch { push(e.data); }
       if (t === "run_end" || t === "error") {
         done = true;
-        es.close();
+        try { es.close(); } catch {}
+        __activeES = null;
       }
     });
   });
 
-  es.addEventListener("error", (e) => {
+  // ③ 브라우저의 자동 재연결 루프 차단(여기서 닫고 끝내기)
+  es.onerror = () => {
     push({ type: "error", message: "SSE connection error" });
     done = true;
-    es.close();
-  });
+    try { es.close(); } catch {}
+    __activeES = null;
+  };
+
 
   try {
     while (!done) {
@@ -128,13 +144,16 @@ export async function* streamReactSimulation(payload = {}) {
         yield ev;
         if (ev?.type === "run_end" || ev?.type === "error") {
           done = true;
-          es.close();
+          try { es.close(); } catch {}
+          __activeES = null;
           break;
         }
       }
     }
   } finally {
-    es.close();
+    try { es.close(); } catch {}
+    __activeES = null;
+    __activeStreamId = null; // 실행 종료 시 stream_id 해제
   }
 }
 
@@ -184,6 +203,7 @@ const App = () => {
   // refs
   const scrollContainerRef = useRef(null);
   const simIntervalRef = useRef(null);
+  const streamingRef = useRef(false);
 
   // 중복 턴 방지용
   const seenTurnsRef = useRef(new Set());
@@ -277,8 +297,15 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
 
   /* ✅ startSimulation - SSE 스트리밍 */
   const startSimulation = async () => {
+    if (streamingRef.current) {
+      addSystem("이미 시뮬레이션이 진행 중입니다.");
+      return;
+    }
+    streamingRef.current = true;
+
     if (!selectedScenario || !selectedCharacter) {
       addSystem("시나리오와 캐릭터를 먼저 선택해주세요.");
+      streamingRef.current = false;
       return;
     }
 
@@ -306,6 +333,7 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
         use_tavily: false,
         max_turns: 15,
         round_limit: 5,
+        // stream_id는 generator에서 자동 부여(유지)
       };
 
       let caseId = null;
@@ -316,6 +344,10 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
         console.log("[SSE Event]", event);
 
         if (event.type === "error") {
+          // 서버의 409 메시지면 부드럽게 안내
+          if ((event.message || "").includes("duplicated simulation run detected")) {
+            addSystem("이미 실행 중인 시뮬레이션이 있습니다. 잠시 후 다시 시도해주세요.");
+          }
           throw new Error(event.message || "시뮬레이션 오류");
         }
 
@@ -459,6 +491,8 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
       console.error("SSE 스트리밍 실패:", err);
       addSystem(`시뮬레이션 실패: ${err.message}`);
       setSimulationState("IDLE");
+    } finally {
+      streamingRef.current = false;
     }
   };
 
@@ -484,6 +518,9 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
         clearInterval(simIntervalRef.current);
         simIntervalRef.current = null;
       }
+    if (__activeES) { try { __activeES.close(); } catch {} }
+    __activeES = null;
+    __activeStreamId = null;
     };
   }, []);
 

@@ -1,7 +1,7 @@
 # app/services/agent/tools_admin.py
 
 from __future__ import annotations
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from uuid import UUID
 
 import os
@@ -114,6 +114,25 @@ class _MakePreventionInput(BaseModel):
     guidances: List[Dict[str, Any]] = Field(default_factory=list)
     # 포맷은 고정적으로 personalized_prevention을 기대
     format: str = Field("personalized_prevention")
+
+# ─────────────────────────────────────────────────────────
+# 터미널 조건(라운드5 또는 critical) 판단 헬퍼
+# ─────────────────────────────────────────────────────────
+def _is_terminal_case(rounds: int, judgements: List[Dict[str, Any]]) -> Tuple[bool, str]:
+    """
+    rounds 가 5 이상이거나, judgements 중 risk.level == 'critical' 이 하나라도 있으면 터미널로 간주.
+    return: (is_terminal, reason)  # reason in {"round5", "critical", "not_terminal"}
+    """
+    try:
+        if rounds >= 5:
+            return True, "round5"
+        for j in judgements or []:
+            lvl = str(((j.get("risk") or {}).get("level") or "")).lower()
+            if lvl == "critical":
+                return True, "critical"
+    except Exception:
+        pass
+    return False, "not_terminal"
 
 # ─────────────────────────────────────────────────────────
 # MCP에서 대화 턴(JSON) 가져오기
@@ -275,7 +294,7 @@ def _persist_verdict(
         # AdminCaseSummary 업서트가 성공했다면 그걸로도 persisted=True로 인정
         return bool(success)
 
-def _read_persisted_verdict(db: Session, *, case_id: UUID, run_no: int) -> Optional[Dict[str, Any]]:
+def _read_persisted_verdict(db: Session, *, case_id: UUID, run_no: int) -> Optional[Dict[str, Any]]:  # noqa: E501
     # 1) AdminCaseSummary 우선
     try:
         if hasattr(m, "AdminCaseSummary"):
@@ -478,7 +497,6 @@ def make_admin_tools(db: Session, guideline_repo):
             "message": "저장된 라운드 판정이 없습니다. admin.make_judgement를 먼저 호출하세요."
         }
 
-
     # ★★ 신규(2안): 동적 공격 지침 생성 - DynamicGuidanceGenerator 사용
     @tool(
         "admin.generate_guidance",
@@ -493,7 +511,7 @@ def make_admin_tools(db: Session, guideline_repo):
         payload = _unwrap_data(data)
         case_id = payload.get("case_id")
         run_no = int(payload.get("run_no") or payload.get("round_no") or 1)
-        
+
         try:
             case_uuid = UUID(str(case_id))
         except Exception:
@@ -553,6 +571,17 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"MakePreventionInput 검증 실패: {e}")
 
+        # ★ 정책 게이트: 라운드5 도달 또는 위험도 critical일 때만 생성 허용
+        is_term, reason = _is_terminal_case(pi.rounds, pi.judgements)
+        if not is_term:
+            return {
+                "ok": False,
+                "error": "not_terminal",
+                "message": "prevention can be generated only at round 5 or when risk is critical",
+                "rounds": pi.rounds,
+            }
+
+        # LLM은 게이트 통과 후 생성
         llm = agent_chat(temperature=0.2)
 
         # 스키마 힌트
@@ -620,6 +649,24 @@ def make_admin_tools(db: Session, guideline_repo):
             spi = _SavePreventionInput(**payload)
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"SavePreventionInput 검증 실패: {e}")
+
+        # ★ 중복 저장 방지: 동일 case_id로 이미 활성 예방책이 있으면 그 id 반환
+        try:
+            q = (
+                db.query(m.PersonalizedPrevention)
+                  .filter(m.PersonalizedPrevention.case_id == spi.case_id,
+                          m.PersonalizedPrevention.is_active == True)  # noqa: E712
+            )
+            if hasattr(m.PersonalizedPrevention, "created_at"):
+                q = q.order_by(m.PersonalizedPrevention.created_at.desc())
+            else:
+                q = q.order_by(m.PersonalizedPrevention.id.desc())
+            existing = q.first()
+            if existing:
+                return str(existing.id)
+        except Exception:
+            # 조회 실패는 저장을 막지 않음
+            pass
 
         obj = m.PersonalizedPrevention(
             case_id=spi.case_id,

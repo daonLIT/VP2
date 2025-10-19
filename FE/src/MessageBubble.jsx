@@ -38,6 +38,29 @@ const MessageBubble = ({ message, selectedCharacter, victimImageUrl, COLORS }) =
   // ✅ 추가: 부드러운 설득도 변화용 state
   const [animatedConvinced, setAnimatedConvinced] = useState(0);
 
+  // ✅ 실시간 텍스트 표시용 state
+ const [displayText, setDisplayText] = useState("");
+
+  useEffect(() => {
+    if (!message?.content) return;
+    const full = String(message.content);
+    // 이미 완성된 문장이라면 바로 표시
+    if (full.length < 5) {
+      setDisplayText(full);
+      return;
+    }
+
+    setDisplayText(""); // reset
+    let i = 0;
+    const interval = setInterval(() => {
+      setDisplayText((prev) => prev + full[i]);
+      i++;
+      if (i >= full.length) clearInterval(interval);
+    }, 20); // 20ms 간격으로 한 글자씩
+
+    return () => clearInterval(interval);
+  }, [message && message.content]);
+
   useEffect(() => {
     if (typeof message?.convincedPct === "number") {
       const timer = setTimeout(() => {
@@ -216,7 +239,10 @@ const MessageBubble = ({ message, selectedCharacter, victimImageUrl, COLORS }) =
               boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
             }}
           >
-            💬 {speechText}
+            💬 {displayText}
+            {displayText.length < (message.content?.length ?? 0) && (
+              <span className="animate-pulse">▋</span>
+            )}
           </div>
         )}
 

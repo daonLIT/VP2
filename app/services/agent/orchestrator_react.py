@@ -39,6 +39,7 @@ EXPECT_MCP_DATA_WRAPPER = False  # True면 {"data": {...}} 래핑, False면 언�
 
 # (SSE) 필요한 모듈
 import asyncio, logging, uuid, contextvars, contextlib, sys
+from threading import Event as ThreadEvent
 from starlette.responses import StreamingResponse
 from fastapi import APIRouter, status
 
@@ -756,7 +757,7 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
 # ─────────────────────────────────────────────────────────
 # 메인 오케스트레이션
 # ─────────────────────────────────────────────────────────
-def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
+def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[ThreadEvent] = None) -> Dict[str, Any]:  
     # (SSE) 스트림 컨텍스트 시작: 프론트가 전달한 stream_id 사용(없으면 내부 생성)
     stream_id = str(payload.get("stream_id") or uuid.uuid4())
 
@@ -787,8 +788,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
     req = None
     ex = None
     mcp_manager = None
+    _emitted_run_end = False  # run_end 중복 방지 플래그
 
     try:
+        # 즉시 중단 체크(라우터에서 이미 stop 신호가 온 경우)
+        if _stop and _stop.is_set():
+            return {"status": "cancelled"}
         with contextlib.redirect_stdout(tee_out), contextlib.redirect_stderr(tee_err):
             req = SimulationStartRequest(**payload)
             ex, mcp_manager = build_agent_and_tools(db, use_tavily=req.use_tavily)
@@ -822,9 +827,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
             offender_id = int(req.offender_id or 0)
             victim_id = int(req.victim_id or 0)
 
-            # 라운드 정책: 최소 2, 최대 5. 종료는 오직 critical 또는 라운드5 도달 시에만.
+            # 라운드 정책: 최소 2, 최대 req.round_limit(기본 5). 종료는 오직 critical 또는 max_rounds 도달 시.
             min_rounds = 2
-            max_rounds = 5
+            try:
+                max_rounds = int(getattr(req, "round_limit", 5) or 5)
+            except Exception:
+                max_rounds = 5
+            if max_rounds < min_rounds:
+                max_rounds = min_rounds
 
             guidance_kind: Optional[str] = None
             guidance_text: Optional[str] = None
@@ -844,6 +854,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
             }
 
             for round_no in range(1, max_rounds + 1):
+                # 라운드 시작 시 중단 체크
+                if _stop and _stop.is_set():
+                    logger.info("[StopToken] client_disconnected → stop at round=%s", round_no)
+                    return {"status": "cancelled", "case_id": case_id or "", "rounds": rounds_done}
                 # ---- (A) 시뮬레이션 실행 ----
                 sim_payload: Dict[str, Any] = dict(base_payload)
 
@@ -917,6 +931,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                             f"Action Input: {action_input}"
                         )
                     }
+                    # 중단 체크 후 LLM/툴 호출
+                    if _stop and _stop.is_set():
+                        raise HTTPException(status_code=499, detail="client_disconnected")
                     res = ex.invoke(llm_call, callbacks=[cap])
                     used_tools.append("mcp.simulator_run")
                     return res
@@ -955,6 +972,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                     tool = _get_tool(ex, "mcp.simulator_run")
                     if not tool:
                         raise HTTPException(500, detail="mcp.simulator_run tool not found")
+                    if _stop and _stop.is_set():
+                        raise HTTPException(status_code=499, detail="client_disconnected")
                     tool_res = tool.invoke(sim_payload)  # 언랩 직접 호출
                     sim_dict = _loose_parse_json(tool_res)
 
@@ -966,6 +985,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                         raise HTTPException(500, detail="mcp.simulator_run tool not found")
 
                     try:
+                        if _stop and _stop.is_set():
+                            raise HTTPException(status_code=499, detail="client_disconnected")
                         if EXPECT_MCP_DATA_WRAPPER:
                             tool_res2 = tool.invoke(_clean_payload(sim_payload, allow_extras=False, allowed_keys=list(sim_payload.keys())))
                         else:
@@ -1055,6 +1076,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                         "turns": turns
                     }
                 }
+                if _stop and _stop.is_set():
+                    raise HTTPException(status_code=499, detail="client_disconnected")
                 res_make = ex.invoke(
                     {"input": "admin.make_judgement 호출.\n" + json.dumps(make_payload, ensure_ascii=False)},
                     callbacks=[cap],
@@ -1092,6 +1115,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                 persisted = bool(judgement.get("persisted"))
                 if not persisted:
                     logger.info("[PersistGuard] persisted==false → admin.make_judgement 재호출")
+                    if _stop and _stop.is_set():
+                        raise HTTPException(status_code=499, detail="client_disconnected")
                     res_make2 = ex.invoke(
                         {"input": "admin.make_judgement 호출(재시도).\n" + json.dumps(make_payload, ensure_ascii=False)},
                         callbacks=[cap],
@@ -1135,7 +1160,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
 
                 # ── (C) 종료 조건: critical / 최대라운드 ──
                 stop_on_critical = (risk_lvl == "critical")
-                hit_round5       = (round_no >= max_rounds)  # max_rounds는 5로 고정됨
+                hit_round5       = (round_no >= max_rounds)  # max_rounds 기준
                 will_stop_now = (stop_on_critical or hit_round5)
 
                 if will_stop_now:
@@ -1163,6 +1188,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                             "previous_judgements": judgements_history
                         }
                     }
+                    if _stop and _stop.is_set():
+                        raise HTTPException(status_code=499, detail="client_disconnected")
                     res_gen = ex.invoke(
                         {"input": "admin.generate_guidance 호출.\n" + json.dumps(gen_payload, ensure_ascii=False)},
                         callbacks=[cap],
@@ -1193,11 +1220,18 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                             "format": "personalized_prevention"
                         }
                     }
-                    res_prev = ex.invoke(
-                        {"input": "admin.make_prevention 호출.\n" + json.dumps(prevention_payload, ensure_ascii=False)},
-                        callbacks=[cap],
-                    )
-                    used_tools.append("admin.make_prevention")
+                    if _stop and _stop.is_set():
+                        raise HTTPException(status_code=499, detail="client_disconnected")
+                    # 중복 호출 방지 재확인
+                    if prevention_created:
+                        logger.info("[Prevention] already created -> skipping admin.make_prevention")
+                        res_prev = {}
+                    else:
+                        res_prev = ex.invoke(
+                            {"input": "admin.make_prevention 호출.\n" + json.dumps(prevention_payload, ensure_ascii=False)},
+                            callbacks=[cap],
+                        )
+                        used_tools.append("admin.make_prevention")
 
                     prev_obs = _last_observation(cap, "admin.make_prevention")
                     prev_dict = _loose_parse_json(prev_obs) or _loose_parse_json(res_prev)
@@ -1220,13 +1254,25 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                                 "steps": steps
                             }
                         }
+                        if _stop and _stop.is_set():
+                            raise HTTPException(status_code=499, detail="client_disconnected")
                         ex.invoke(
                             {"input": "admin.save_prevention 호출.\n" + json.dumps(save_payload, ensure_ascii=False)},
                             callbacks=[cap],
                         )
                         used_tools.append("admin.save_prevention")
+                        prevention_created = True
+                        logger.info("[Prevention] prevention_created set True for case_id=%s", case_id)
 
-            return {
+            # (정상 종료 전 정리) MCP 서버 중지 보장 + run_end 즉시 알림
+            try:
+                if mcp_manager and getattr(mcp_manager, "is_running", False):
+                    mcp_manager.stop_mcp_server()
+                    logger.info("[MCP] stop_mcp_server called before return for case_id=%s", case_id)
+            except Exception:
+                logger.exception("[MCP] stop_mcp_server failed in return-cleanup")
+
+            result_obj = {
                 "status": "success",
                 "case_id": case_id,
                 "rounds": rounds_done,
@@ -1237,6 +1283,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
                 "tavily_used": tavily_used,
                 "personalized_prevention": prevention_obj,  # ★ 최종예방책 포함
             }
+            with contextlib.suppress(Exception):
+                _emit_to_stream("run_end", {"case_id": case_id, "rounds": rounds_done, "status": "success"})
+                _emitted_run_end = True
+            return result_obj
 
     finally:
 
@@ -1252,9 +1302,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
         with contextlib.suppress(Exception):
             _unpatch_print()
 
-        # (SSE) run 종료 이벤트 + 정리
+        # (SSE) run 종료 이벤트 + 정리 (이미 보냈다면 생략)
         with contextlib.suppress(Exception):
-            _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
+            if not _emitted_run_end:
+                _emit_to_stream("run_end", {"case_id": locals().get("case_id", ""), "rounds": locals().get("rounds_done", 0)})
         with contextlib.suppress(Exception):
             _current_stream_id.reset(token)
         with contextlib.suppress(Exception):
@@ -1271,7 +1322,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any]) -> Dict[str, Any]:
 # 스트림/런 상태 캐시
 _RUN_TASKS: dict[str, asyncio.Task] = {}          # stream_id -> 백그라운드 런 task
 _STREAM_CONN_COUNT: dict[str, int] = {}           # stream_id -> 현재 구독자 수(연결수)
-async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
+async def run_orchestrated_stream(db: Session, payload: Dict[str, Any], stop_event: Optional[asyncio.Event] = None):
     """
     라우터에서 직접 호출하는 SSE 제너레이터.
     - 동일 stream_id로 재접속이 와도 기존 런에 '구독'만 붙고, 새 런은 만들지 않는다.
@@ -1282,16 +1333,45 @@ async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
     _ensure_stream(stream_id)
     main_q = _get_main_queue(stream_id)
 
+    # asyncio.Event → ThreadEvent 브릿지 (to_thread 대상용)
+    thread_stop = ThreadEvent()
+
+    async def _bridge_cancel():
+        if stop_event is None:
+            return
+        await stop_event.wait()
+        thread_stop.set()
+
+    bridge_task = None
+    if stop_event is not None:
+        bridge_task = asyncio.create_task(_bridge_cancel())
+
     # 2) 기존 런(task) 재사용: 없거나 종료된 경우에만 새로 시작
     async def _runner():
         try:
-            res = await asyncio.to_thread(run_orchestrated, db, {**payload, "stream_id": stream_id})
+            def _work():
+                # 워커 스레드 내에서 세션 생성/종료
+                from app.db.session import SessionLocal
+                with SessionLocal() as thread_db:
+                    return run_orchestrated(thread_db, {**payload, "stream_id": stream_id}, thread_stop)
+            res = await asyncio.to_thread(_work)
             ev = {"type": "result", "content": res, "ts": datetime.now().isoformat()}
             loop = _get_loop(stream_id)
             loop.call_soon_threadsafe(main_q.put_nowait, ev)
         except Exception as e:
             loop = _get_loop(stream_id)
-            loop.call_soon_threadsafe(main_q.put_nowait, {"type": "error", "message": str(e)})
+            # 499는 정상 취소로 간주하여 result 이벤트로 통일
+            try:
+                from fastapi import HTTPException as _HTTPEx
+                if isinstance(e, _HTTPEx) and getattr(e, "status_code", None) == 499:
+                    loop.call_soon_threadsafe(
+                        main_q.put_nowait,
+                        {"type": "result", "content": {"status": "cancelled"}, "ts": datetime.now().isoformat()},
+                    )
+                else:
+                    loop.call_soon_threadsafe(main_q.put_nowait, {"type": "error", "message": str(e)})
+            except Exception:
+                loop.call_soon_threadsafe(main_q.put_nowait, {"type": "error", "message": str(e)})
 
     task = _RUN_TASKS.get(stream_id)
     if task is None or task.done():
@@ -1325,6 +1405,8 @@ async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
         # 5) 이 커넥션 정리: (런 task는 취소하지 않는다 — 다른 구독자가 있을 수 있음)
         #    마지막 구독자라면 자원 정리
         if _STREAM_CONN_COUNT.get(stream_id, 0) == 0:
+            # 마지막 구독자면 백엔드 런 중단 신호
+            thread_stop.set()
             # 스트림 큐/상태 제거
             _STREAMS.pop(stream_id, None)
 
@@ -1332,3 +1414,6 @@ async def run_orchestrated_stream(db: Session, payload: Dict[str, Any]):
             t = _RUN_TASKS.get(stream_id)
             if t and t.done():
                 _RUN_TASKS.pop(stream_id, None)
+        if bridge_task:
+            with contextlib.suppress(Exception):
+                bridge_task.cancel()

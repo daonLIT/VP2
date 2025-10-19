@@ -1,3 +1,4 @@
+// src/components/TerminalLog.jsx
 import React, { useEffect, useMemo, useRef } from "react";
 
 const DEFAULT_THEME = {
@@ -5,56 +6,67 @@ const DEFAULT_THEME = {
   panel: "#1f1f23",
   border: "#2a2a2e",
   text: "#d4d4d4",
-  purple: "#C586C0",  // Action
-  cyan: "#4FC1FF",    // Action Input
-  green: "#6A9955",   // JSON
-  gray: "#9CA3AF",    // 일반 텍스트
+  purple: "#C586C0", // Action
+  cyan: "#4FC1FF",   // Action Input
+  green: "#6A9955",  // JSON
+  gray: "#9CA3AF",   // 일반 텍스트
   dim: "#555",
   black: "#000",
 };
 
+/**
+ * props:
+ * - logs: string[] (SSE로 실시간 들어오는 로그 배열)
+ * - COLORS: 테마
+ */
 export default function TerminalLog({
-  logText, // 전체 로그 문자열
-  height = 500,
+  logs = [],
   COLORS,
   autoScroll = true,
+  height = 500,
   className = "",
 }) {
   const theme = { ...DEFAULT_THEME, ...(COLORS || {}) };
   const wrapRef = useRef(null);
 
-  // 🧩 문자열 -> 라인 단위 분리 및 색상 분류
+  /** 
+   * 🧩 실시간 라인 분류
+   * logs는 문자열 배열 (SSE 이벤트별 content)
+   * 각 라인을 색상 구분해서 렌더링
+   */
   const parsedLines = useMemo(() => {
-    if (!logText) return [];
-
-    const rawLines = logText.split(/\r?\n/);
-    return rawLines.map((line) => {
-      const trimmed = line.trimStart();
-
-      // 분류 규칙
-      if (trimmed.startsWith("Action:")) {
-        return { type: "action", text: line };
-      }
-      if (trimmed.startsWith("Action Input:")) {
-        return { type: "input", text: line };
-      }
-      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-        return { type: "json", text: line };
-      }
-      if (trimmed.startsWith("---") || trimmed.startsWith("===")) {
-        return { type: "divider", text: line };
-      }
-      return { type: "plain", text: line };
+    const lines = [];
+    logs.forEach((entry) => {
+      if (!entry) return;
+      const text = typeof entry === "string" ? entry : JSON.stringify(entry);
+      const split = text.split(/\r?\n/);
+      split.forEach((line) => {
+        const trimmed = line.trimStart();
+        if (!trimmed) return;
+        if (trimmed.startsWith("Action:")) {
+          lines.push({ type: "action", text: line });
+        } else if (trimmed.startsWith("Action Input:")) {
+          lines.push({ type: "input", text: line });
+        } else if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+          lines.push({ type: "json", text: line });
+        } else if (trimmed.startsWith("---") || trimmed.startsWith("===")) {
+          lines.push({ type: "divider", text: line });
+        } else {
+          lines.push({ type: "plain", text: line });
+        }
+      });
     });
-  }, [logText]);
+    return lines;
+  }, [logs]);
 
-  // 자동 스크롤
+  /** 🧭 자동 스크롤 */
   useEffect(() => {
     if (!autoScroll) return;
     const el = wrapRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [parsedLines.length, autoScroll]);
 
+  /** 🖌️ 타입별 색상 */
   const getStyle = (type) => {
     switch (type) {
       case "action":
@@ -105,21 +117,23 @@ export default function TerminalLog({
           style={{
             color: theme.dim,
             fontSize: 12,
-            fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Courier New', monospace",
+            fontFamily:
+              "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Courier New', monospace",
           }}
         >
           agent • terminal-stream
         </span>
       </div>
 
-      {/* 로그 본문 */}
+      {/* 본문 */}
       <div
         ref={wrapRef}
         className="px-4 py-3 overflow-auto"
         style={{
           height,
           color: theme.text,
-          fontFamily: "monospace",
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Courier New', monospace",
           fontSize: 13,
           lineHeight: 1.5,
         }}
@@ -137,6 +151,146 @@ export default function TerminalLog({
     </div>
   );
 }
+
+// import React, { useEffect, useMemo, useRef } from "react";
+
+// const DEFAULT_THEME = {
+//   bg: "#1e1e1e",
+//   panel: "#1f1f23",
+//   border: "#2a2a2e",
+//   text: "#d4d4d4",
+//   purple: "#C586C0",  // Action
+//   cyan: "#4FC1FF",    // Action Input
+//   green: "#6A9955",   // JSON
+//   gray: "#9CA3AF",    // 일반 텍스트
+//   dim: "#555",
+//   black: "#000",
+// };
+
+// export default function TerminalLog({
+//   logText, // 전체 로그 문자열
+//   height = 500,
+//   COLORS,
+//   autoScroll = true,
+//   className = "",
+// }) {
+//   const theme = { ...DEFAULT_THEME, ...(COLORS || {}) };
+//   const wrapRef = useRef(null);
+
+//   // 🧩 문자열 -> 라인 단위 분리 및 색상 분류
+//   const parsedLines = useMemo(() => {
+//     if (!logText) return [];
+
+//     const rawLines = logText.split(/\r?\n/);
+//     return rawLines.map((line) => {
+//       const trimmed = line.trimStart();
+
+//       // 분류 규칙
+//       if (trimmed.startsWith("Action:")) {
+//         return { type: "action", text: line };
+//       }
+//       if (trimmed.startsWith("Action Input:")) {
+//         return { type: "input", text: line };
+//       }
+//       if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+//         return { type: "json", text: line };
+//       }
+//       if (trimmed.startsWith("---") || trimmed.startsWith("===")) {
+//         return { type: "divider", text: line };
+//       }
+//       return { type: "plain", text: line };
+//     });
+//   }, [logText]);
+
+//   // 자동 스크롤
+//   useEffect(() => {
+//     if (!autoScroll) return;
+//     const el = wrapRef.current;
+//     if (el) el.scrollTop = el.scrollHeight;
+//   }, [parsedLines.length, autoScroll]);
+
+//   const getStyle = (type) => {
+//     switch (type) {
+//       case "action":
+//         return { color: theme.purple, fontWeight: 600 };
+//       case "input":
+//         return { color: theme.cyan };
+//       case "json":
+//         return {
+//           color: theme.green,
+//           fontFamily: "monospace",
+//           whiteSpace: "pre-wrap",
+//         };
+//       case "divider":
+//         return {
+//           color: theme.dim,
+//           fontStyle: "italic",
+//           borderBottom: `1px solid ${theme.border}`,
+//           margin: "6px 0",
+//         };
+//       default:
+//         return { color: theme.gray };
+//     }
+//   };
+
+//   return (
+//     <div
+//       className={`rounded-2xl border overflow-hidden shadow-lg ${className}`}
+//       style={{
+//         background: `linear-gradient(180deg, ${theme.bg} 0%, ${theme.panel} 100%)`,
+//         borderColor: theme.border,
+//         boxShadow: `0 8px 30px ${theme.black}55, inset 0 1px 0 ${theme.black}40`,
+//         display: "flex",
+//         flexDirection: "column",
+//         height: "100%",
+//       }}
+//     >
+//       {/* 헤더 */}
+//       <div
+//         className="flex items-center justify-between px-4 py-2 border-b"
+//         style={{ borderColor: theme.border, backgroundColor: theme.panel }}
+//       >
+//         <div className="flex items-center gap-2">
+//           <span style={{ background: "#ff5f56" }} className="w-3 h-3 rounded-full inline-block" />
+//           <span style={{ background: "#ffbd2e" }} className="w-3 h-3 rounded-full inline-block" />
+//           <span style={{ background: "#27c93f" }} className="w-3 h-3 rounded-full inline-block" />
+//         </div>
+//         <span
+//           style={{
+//             color: theme.dim,
+//             fontSize: 12,
+//             fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Courier New', monospace",
+//           }}
+//         >
+//           agent • terminal-stream
+//         </span>
+//       </div>
+
+//       {/* 로그 본문 */}
+//       <div
+//         ref={wrapRef}
+//         className="px-4 py-3 overflow-auto"
+//         style={{
+//           height,
+//           color: theme.text,
+//           fontFamily: "monospace",
+//           fontSize: 13,
+//           lineHeight: 1.5,
+//         }}
+//       >
+//         {parsedLines.length === 0 ? (
+//           <p style={{ color: theme.dim }}>No logs available</p>
+//         ) : (
+//           parsedLines.map((line, i) => (
+//             <div key={i} style={getStyle(line.type)}>
+//               {line.text || "\u00A0"}
+//             </div>
+//           ))
+//         )}
+//       </div>
+//     </div>
+//   );
+// }
 
 
 // // src/components/TerminalLog.jsx

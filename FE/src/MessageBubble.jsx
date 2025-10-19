@@ -2,251 +2,129 @@ import { useEffect, useState } from "react";
 
 function getRiskColors(pct) {
   const v = Math.max(0, Math.min(100, Number(pct) || 0));
-  if (v >= 70) {
-    // High risk - Red (70% 이상)
-    return {
-      border: "rgba(239,68,68,0.75)",  // red-500
-      bg:     "rgba(239,68,68,0.10)",
-      text:   "#EF4444",
-      tagBg:  "rgba(239,68,68,0.12)",
-    };
-  } else if (v >= 41) {
-    // Medium - Amber/Orange (41~69%)
-    return {
-      border: "rgba(245,158,11,0.75)", // amber-500
-      bg:     "rgba(245,158,11,0.10)",
-      text:   "#F59E0B",
-      tagBg:  "rgba(245,158,11,0.12)",
-    };
-  }
-  // Low - Emerald/Green (0~40%)
-  return {
-    border: "rgba(16,185,129,0.75)",   // emerald-500
-    bg:     "rgba(16,185,129,0.10)",
-    text:   "#10B981",
-    tagBg:  "rgba(16,185,129,0.12)",
-  };
+  if (v >= 70)
+    return { border: "rgba(239,68,68,0.75)", bg: "rgba(239,68,68,0.10)", text: "#EF4444", tagBg: "rgba(239,68,68,0.12)" };
+  if (v >= 41)
+    return { border: "rgba(245,158,11,0.75)", bg: "rgba(245,158,11,0.10)", text: "#F59E0B", tagBg: "rgba(245,158,11,0.12)" };
+  return { border: "rgba(16,185,129,0.75)", bg: "rgba(16,185,129,0.10)", text: "#10B981", tagBg: "rgba(16,185,129,0.12)" };
 }
 
 const MessageBubble = ({ message, selectedCharacter, victimImageUrl, COLORS }) => {
-  const isVictim   = message.sender === "victim";
-  const isScammer  = message.sender === "offender";
-  const isSystem   = message.type === "system";
+  const isVictim = message.sender === "victim";
+  const isScammer = message.sender === "offender";
+  const isSystem = message.type === "system";
   const isAnalysis = message.type === "analysis";
-  const isSpinner  = isSystem && String(message.content || "").includes("🔄");
+  const isSpinner = isSystem && String(message.content || "").includes("🔄");
 
-  // ✅ 추가: 부드러운 설득도 변화용 state
   const [animatedConvinced, setAnimatedConvinced] = useState(0);
-
-  // ✅ 실시간 텍스트 표시용 state
- const [displayText, setDisplayText] = useState("");
-
-  useEffect(() => {
-    if (!message?.content) return;
-    const full = String(message.content);
-    // 이미 완성된 문장이라면 바로 표시
-    if (full.length < 5) {
-      setDisplayText(full);
-      return;
-    }
-
-    setDisplayText(""); // reset
-    let i = 0;
-    const interval = setInterval(() => {
-      setDisplayText((prev) => prev + full[i]);
-      i++;
-      if (i >= full.length) clearInterval(interval);
-    }, 20); // 20ms 간격으로 한 글자씩
-
-    return () => clearInterval(interval);
-  }, [message && message.content]);
-
   useEffect(() => {
     if (typeof message?.convincedPct === "number") {
-      const timer = setTimeout(() => {
-        setAnimatedConvinced(message.convincedPct);
-      }, 150);
-      return () => clearTimeout(timer);
+      const t = setTimeout(() => setAnimatedConvinced(message.convincedPct), 150);
+      return () => clearTimeout(t);
     }
   }, [message?.convincedPct]);
 
-  // 합쳐진 카드 여부 및 텍스트 분리
-  const isCombined  = message.variant === "combined" || !!message.thoughtText;
-  const thoughtText = message.thoughtText || (message.variant === "thought" ? message.content : null);
-  const speechText  =
-    message.speechText ??
-    (message.variant === "speech" ? message.content : (!isCombined ? message.content : ""));
+  // ✅ 백엔드 데이터에서 content/text/message 다 확인
+  const displayText = message?.content || message?.message || message?.text || "";
 
-  // 설득도(%)
   const convincedPct =
-    typeof animatedConvinced === "number"
-      ? Math.max(0, Math.min(100, animatedConvinced))
-      : null;
+    typeof animatedConvinced === "number" ? Math.max(0, Math.min(100, animatedConvinced)) : null;
 
-  // ===== 버블 배경/글자색 규칙 =====
+  // ✅ 테마 색상 기본값 안전하게 지정
+  const themeText = COLORS?.text || "#E5E7EB";
+  const themeBorder = COLORS?.border || "#3F4147";
+  const themePanel = COLORS?.panel || "#2B2D31";
+  const themeWhite = COLORS?.white || "#FFFFFF";
+
   const bubbleBg = isSystem
     ? "rgba(88,101,242,.12)"
     : isAnalysis
     ? "rgba(254,231,92,.12)"
-    : (isVictim ? COLORS.white : "#313338");
+    : isVictim
+    ? themeWhite
+    : themePanel;
 
   const bubbleTextColor = isSystem
-    ? COLORS.text
+    ? themeText
     : isAnalysis
-    ? COLORS.warn
-    : (isVictim ? COLORS.black : "#FFFFFF");
+    ? COLORS.warn || "#FEE75C"
+    : isVictim
+    ? "#111827"
+    : themeText;
 
-  const bubbleBorder = isSystem
-    ? "rgba(88,101,242,.35)"
-    : isAnalysis
-    ? "rgba(254,231,92,.35)"
-    : COLORS.border;
-
-  // 속마음(내부 박스) 색상(설득도 기반)
   const risk = getRiskColors(convincedPct ?? 0);
-  const innerBoxStyle = {
-    borderWidth: "1px",
-    borderStyle: "dashed",
-    borderColor: risk.border,
-    backgroundColor: risk.bg,
-    borderRadius: "12px",
-    padding: "12px",
-  };
-  const innerTextStyle = { color: risk.text };
 
   return (
-    <div className={`flex ${isVictim ? "justify-end" : "justify-start"}`}>
+    <div className={`flex ${isVictim ? "justify-end" : "justify-start"} mb-3`}>
       <div
-        className={[
-          "max-w-md lg:max-w-lg px-5 py-3 rounded-2xl border",
-          isSystem ? "mx-auto text-center" : "",
-          isSpinner ? "w-80 h-32 flex flex-col items-center justify-center" : "",
-        ].join(" ")}
+        className="max-w-md lg:max-w-lg px-5 py-3 rounded-2xl border"
         style={{
           backgroundColor: bubbleBg,
           color: bubbleTextColor,
-          border: `1px solid ${bubbleBorder}`,
+          border: `1px solid ${themeBorder}`,
         }}
       >
-        {/* 스피너 애니메이션 */}
+        {/* 🔄 스피너 */}
         {isSpinner && (
           <div className="flex space-x-1 mb-4">
             {[0, 0.1, 0.2, 0.3, 0.4].map((d, i) => (
-              <div
-                key={i}
-                className="w-1 h-8 bg-[#5865F2] animate-pulse"
-                style={{ animationDelay: `${d}s` }}
-              />
+              <div key={i} className="w-1 h-8 bg-[#5865F2] animate-pulse" style={{ animationDelay: `${d}s` }} />
             ))}
           </div>
         )}
 
-        {/* 공격자 헤더 */}
+        {/* 👤 피싱범 헤더 */}
         {isScammer && (
-          <div className="flex items-center mb-2" style={{ color: COLORS.warn }}>
-            <span className="mr-2">
-              <img
-                src={new URL("./assets/offender_profile.png", import.meta.url).href}
-                alt="피싱범"
-                className="w-8 h-8 rounded-full object-cover"
-              />
-            </span>
+          <div className="flex items-center mb-2">
+            <img
+              src={new URL("./assets/offender_profile.png", import.meta.url).href}
+              alt="피싱범"
+              className="w-8 h-8 rounded-full object-cover mr-2"
+            />
             <span className="text-sm font-medium" style={{ color: COLORS.sub }}>
               피싱범
             </span>
           </div>
         )}
 
-        {/* 피해자 헤더(프로필 + 설득도 바) */}
+        {/* 🙍‍♀️ 피해자 헤더 */}
         {isVictim && selectedCharacter && (
           <div className="flex items-center mb-2">
-            <span className="mr-2 text-lg">
-              {victimImageUrl ? (
-                <img
-                  src={victimImageUrl}
-                  alt={selectedCharacter.name}
-                  className="w-8 h-8 rounded-full object-cover"
-                />
-              ) : (
-                `👤${selectedCharacter.avatar || ""}`
-              )}
+            {victimImageUrl ? (
+              <img src={victimImageUrl} alt={selectedCharacter.name} className="w-8 h-8 rounded-full object-cover mr-2" />
+            ) : (
+              <span className="text-lg mr-2">{selectedCharacter.avatar || "👤"}</span>
+            )}
+            <span className="text-sm font-medium" style={{ color: "#6B7280" }}>
+              {selectedCharacter.name}
             </span>
-
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-medium" style={{ color: isVictim ? "#687078" : COLORS.sub }}>
-                {selectedCharacter.name}
-              </span>
-              {typeof convincedPct === "number" && (
-                <div className="flex items-center gap-1 min-w-[140px] max-w-[220px]">
-                  <div className="flex-1 h-2 bg-[#e5e7eb] rounded overflow-hidden">
-                    <div
-                      className="h-full transition-all duration-1000 ease-in-out"
-                      style={{
-                        width: `${convincedPct}%`,
-                        backgroundColor:
-                          convincedPct >= 70 ? "#EF4444" : convincedPct >= 41 ? "#F59E0B" : "#10B981",
-                      }}
-                      title={`설득도 ${convincedPct}%`}
-                    />
-                  </div>
-                  <span className="text-[10px] w-8 text-right" style={{ color: "#9ca3af" }}>
-                    {convincedPct}%
-                  </span>
+            {typeof convincedPct === "number" && (
+              <div className="flex items-center gap-1 min-w-[120px] ml-3">
+                <div className="flex-1 h-2 bg-[#e5e7eb] rounded overflow-hidden">
+                  <div
+                    className="h-full transition-all duration-1000 ease-in-out"
+                    style={{
+                      width: `${convincedPct}%`,
+                      backgroundColor:
+                        convincedPct >= 70 ? "#EF4444" : convincedPct >= 41 ? "#F59E0B" : "#10B981",
+                    }}
+                  />
                 </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ===== 본문 ===== */}
-        {thoughtText && (
-          <div
-            style={{
-              border: `1px dashed ${risk.border}`,
-              backgroundColor: risk.bg,
-              borderRadius: "12px",
-              padding: "12px 14px",
-              marginBottom: "10px",
-            }}
-          >
-            <p
-              className="text-base leading-relaxed whitespace-pre-line"
-              style={{ color: risk.text }}
-            >
-              💭 {thoughtText}
-            </p>
-            <div
-              className="inline-block mt-2 px-2 py-0.5 text-[11px] rounded-full"
-              style={{
-                backgroundColor: risk.tagBg,
-                color: risk.text,
-                fontWeight: "500",
-              }}
-            >
-              속마음
-            </div>
-          </div>
-        )}
-
-        {speechText && (
-          <div
-            style={{
-              backgroundColor: isVictim ? COLORS.white : "#313338",
-              color: isVictim ? COLORS.black : COLORS.text,
-              borderRadius: "14px",
-              padding: "10px 14px",
-              lineHeight: "1.6",
-              boxShadow: "0 2px 6px rgba(0,0,0,0.08)",
-            }}
-          >
-            💬 {displayText}
-            {displayText.length < (message.content?.length ?? 0) && (
-              <span className="animate-pulse">▋</span>
+                <span className="text-[10px] w-8 text-right text-gray-400">{convincedPct}%</span>
+              </div>
             )}
           </div>
         )}
 
-        {/* 타임스탬프 */}
+        {/* 💬 본문 */}
+        <div
+          className="leading-relaxed whitespace-pre-line text-[15px]"
+          style={{ color: bubbleTextColor }}
+        >
+          {displayText.trim() ? `💬 ${displayText}` : "(메시지 없음)"}
+        </div>
+
+        {/* 🕒 타임스탬프 */}
         <div className="text-xs mt-2 opacity-70" style={{ color: COLORS.sub }}>
           {message.timestamp}
         </div>

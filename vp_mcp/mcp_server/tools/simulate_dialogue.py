@@ -377,7 +377,16 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
             stats={"half_turns": turn_index, "turns": turn_index // 2},
             meta=meta_out,
         )
-        return result.model_dump()
+        out = result.model_dump()
+        # ✅ 최상위에 round_no 노출 (프론트/소비처가 meta를 안 파도 접근 가능)
+        try:
+            run_no_val = int(input_obj.round_no or 1)
+        except Exception:
+            run_no_val = int(meta_out.get("round_no") or 1)
+        # ✅ run_no 별칭도 같이 제공(다른 파일 수정 없이 run_no로 소비 가능)
+        out["run_no"] = run_no_val
+        out.pop("round_no", None)
+        return out
     finally:
         db.close()
 

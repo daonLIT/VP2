@@ -91,11 +91,9 @@ async function getConversationBundle(caseId) {
 
 // ✅ SSE 스트리밍
 export async function* streamReactSimulation(payload = {}) {
-  // ① stream_id 고정(한 번의 실행 동안 유지)
   const streamId = payload.stream_id ?? (__activeStreamId || (__activeStreamId = uuid()));
   const withId = { ...payload, stream_id: streamId };
 
-  // 종료 헬퍼
   const endStream = (reason = "finished_chain") => {
     if (__ended) return;
     __ended = true;
@@ -103,10 +101,8 @@ export async function* streamReactSimulation(payload = {}) {
     __activeES = null;
     __activeStreamId = null;
     done = true;
-    // 소비측에서 종료를 감지할 수 있도록 로컬 이벤트 하나 밀어줌
     push({ type: "run_end_local", content: { reason }, ts: new Date().toISOString() });
   };
-
 
   const params = new URLSearchParams();
   Object.entries(withId).forEach(([k, v]) => {
@@ -115,26 +111,36 @@ export async function* streamReactSimulation(payload = {}) {
 
   const base = typeof API_ROOT === "string" ? API_ROOT : "";
   const url = `${base}/react-agent/simulation/stream?${params.toString()}`;
-  // ② 기존 열린 SSE가 있으면 닫기(중복 연결 방지)
+  
+  // ✅ 디버깅 1: URL 확인
+  console.log('🚀 [streamReactSimulation] SSE 연결:', url);
+  
   if (__activeES) { try { __activeES.close(); } catch {} }
   const es = new EventSource(url);
   __activeES = es;
-  __ended = false; // 새 연결 시작이므로 해제
+  __ended = false;
 
   const queue = [];
   let notify;
   let done = false;
 
   const push = (data) => {
+    // ✅ 디버깅 2: push 확인
+    console.log('📥 [push] 큐에 추가:', data?.type || typeof data);
     queue.push(data);
     if (notify) { notify(); notify = undefined; }
   };
 
+  // ✅ 디버깅 3: 연결 상태 확인
+  es.onopen = () => {
+    console.log('✅ [EventSource] 연결 성공!');
+  };
+
   es.onmessage = (e) => {
+    console.log('📩 [onmessage]', e.type, '| data:', e.data?.substring(0, 100));
     try { 
       const parsed = JSON.parse(e.data);
       push(parsed);
-      // 일반 message 채널로 터미널 로그가 섞여 들어오는 경우도 방지
       const t = (parsed?.type || "").toLowerCase();
       const content = typeof parsed?.content === "string" ? parsed.content : (parsed?.content?.message ?? "");
       if (t === "terminal" || t === "log" || typeof parsed === "string") {
@@ -147,15 +153,14 @@ export async function* streamReactSimulation(payload = {}) {
     }
   };
 
-  // 백엔드에서 실제로 쏘는 이름들까지 포함
   const eventTypes = [
     "run_start",
     "log",
     "agent_action",
     "tool_observation",
     "agent_finish",
-    "new_message",        // ✅ 중요
-    "turn_event",         // (외부 sink fan-in)
+    "new_message",
+    "turn_event",
     "debug",
     "result",
     "run_end",
@@ -163,24 +168,37 @@ export async function* streamReactSimulation(payload = {}) {
     "heartbeat",
     "error",
     "terminal",
+    "conversation_log",  // ✅ 이미 있음
   ];
+  
+  // ✅ 디버깅 4: 등록 확인
+  console.log('🎯 [EventSource] 리스너 등록:', eventTypes);
+  
   eventTypes.forEach((t) => {
     es.addEventListener(t, (e) => {
+      // ✅ 디버깅 5: 각 이벤트 수신 확인
+      console.log(`📨 [${t}] 이벤트 수신! | data:`, e.data?.substring(0, 100) || e.data);
+      
       if (__ended) return;
       let data = null;
       try { data = JSON.parse(e.data); } catch { data = e.data; }
-      // type 채우기
+      
       if (data && typeof data === "object" && !data.type) data.type = t;
+      
+      // ✅ 디버깅 6: conversation_log 특별 표시
+      if (t === "conversation_log") {
+        console.log('🎯🎯🎯 [conversation_log] 감지!!!');
+        console.log('📦 data:', data);
+      }
+      
       push(data);
 
       const content = typeof data === "string"
         ? data
         : (typeof data?.content === "string" ? data.content : (data?.content?.message ?? ""));
 
-      // 명시 종료 이벤트
       if (t === "run_end") { endStream("run_end_event"); return; }
       if (t === "error")   { endStream("error"); return; }
-      // 터미널 로그에서 "Finished chain" 감지
       if ((t === "terminal" || t === "log") && containsFinishedChain(content || "")) {
         endStream("finished_chain");
         return;
@@ -188,24 +206,25 @@ export async function* streamReactSimulation(payload = {}) {
     });
   });
 
-  // ③ 브라우저의 자동 재연결 루프 차단(여기서 닫고 끝내기)
-  es.onerror = () => {
+  es.onerror = (e) => {
+    console.error('❌ [EventSource] 에러:', e);
     if (!__ended) {
       push({ type: "error", message: "SSE connection error" });
       endStream("error_or_server_closed");
     }
   };
 
-
   try {
+    console.log('🔄 [Generator] 이벤트 소비 시작');
     while (!done) {
       if (queue.length === 0) {
         await new Promise((r) => (notify = r));
       }
       while (queue.length) {
         const ev = queue.shift();
+        // ✅ 디버깅 7: yield 확인
+        console.log('⬆️ [yield] 이벤트 반환:', ev?.type);
         yield ev;
-        // 로컬 종료 신호 포함해 조기 종료
         if (ev?.type === "run_end" || ev?.type === "run_end_local" || ev?.type === "error") {
           endStream(ev?.type || "finished_chain");
           break;
@@ -213,10 +232,11 @@ export async function* streamReactSimulation(payload = {}) {
       }
     }
   } finally {
+    console.log('🛑 [Generator] 종료');
     try { if (__activeES) es.close(); } catch {}
     __activeES = null;
-    __activeStreamId = null; // 실행 종료 시 stream_id 해제
-    __ended = false;         // 다음 실행 대비 리셋
+    __activeStreamId = null;
+    __ended = false;
   }
 }
 

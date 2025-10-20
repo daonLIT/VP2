@@ -43,6 +43,8 @@ export async function* streamReactSimulation(payload = {}) {
   const withId = { ...payload, stream_id: streamId };
   const url = `${API_ROOT}/react-agent/simulation/stream?${buildQuery(withId)}`;
 
+  console.log('🚀 [streamReactSimulation] SSE 연결:', url);
+
   // ② 기존 열린 SSE가 있으면 닫기(중복 연결 방지)
   if (__activeES) { try { __activeES.close(); } catch {} }
   const es = new EventSource(url);
@@ -54,6 +56,7 @@ export async function* streamReactSimulation(payload = {}) {
   let done = false;
 
   const push = (data) => {
+    console.log('📥 [push] 큐에 추가:', data?.type || typeof data);
     queue.push(data);
     if (notify) { notify(); notify = undefined; }
   };
@@ -83,6 +86,7 @@ export async function* streamReactSimulation(payload = {}) {
     "round_start",
     "simulation_progress",
     "conversation_logs",
+    "conversation_log",
     "round_complete",
     "judgement",
     "guidance_generated",
@@ -94,6 +98,12 @@ export async function* streamReactSimulation(payload = {}) {
     "ping",
     "heartbeat",
   ];
+
+  console.log('🎯 [EventSource] 리스너 등록:', types);
+
+  es.onopen = () => {
+    console.log('✅ [EventSource] 연결 성공!');
+  };
 
   // 기본 message 채널도 받기(서버가 event: 를 명시 안할 수도 있음)
   es.onmessage = (e) => {
@@ -113,11 +123,18 @@ export async function* streamReactSimulation(payload = {}) {
 
   types.forEach((t) => {
     es.addEventListener(t, (e) => {
+      console.log(`📨 [${t}] 이벤트 수신!`);
       if (__ended) return;
       let data = null;
       try { data = JSON.parse(e.data); } catch { data = e.data; }
       // type 보정
       if (data && typeof data === "object" && !data.type) data.type = t;
+
+      // ✅ 디버깅 6: conversation_log 특별 표시
+      if (t === "conversation_log") {
+        console.log('🎯🎯🎯 [conversation_log] 감지!!!', data);
+      }
+
       push(data);
 
       const content = typeof data === "string"
@@ -150,6 +167,7 @@ export async function* streamReactSimulation(payload = {}) {
       }
       while (queue.length) {
         const ev = queue.shift();
+         console.log('⬆️ [yield] 이벤트 반환:', ev?.type);
         yield ev;
         // UI 반영 텀 (토큰/이벤트 과밀 시 렌더 몰림 방지)
         await new Promise((r) => setTimeout(r, 30));

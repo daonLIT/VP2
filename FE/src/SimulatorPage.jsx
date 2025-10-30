@@ -85,6 +85,9 @@ const SimulatorPage = ({
   const needScenario = !selectedScenario;
   const needCharacter = !selectedCharacter;
 
+  // ✅ [1] 시뮬레이션 버튼 표시 여부 제어용 상태 추가
+  const [showStartButton, setShowStartButton] = useState(true);
+
   const [selectedTag, setSelectedTag] = useState(null);
   const [showCustomModal, setShowCustomModal] = useState(false);
   const [customScenarios, setCustomScenarios] = useState([]);
@@ -107,19 +110,21 @@ const SimulatorPage = ({
   const [activeAgentTab, setActiveAgentTab] = useState("log");
   const [showBoardContent, setShowBoardContent] = useState(false);
 
-  // ✅ SSE 스트림 실행
+
+  // ✅ SSE 스트림 실행 + handleStartStream 실행 시 버튼 숨김 처리 추가
   const handleStartStream = useCallback(() => {
     try {
-    if (!selectedScenario || !selectedCharacter) return;
-    start({
-      offender_id: 1,
-      victim_id: selectedCharacter?.id ?? 1,
-      scenario_id: selectedScenario?.id ?? 1,
-    });
-  } catch (err) {
-    console.error("SimulatorPage 실행 중 오류:", err);
-  }
-}, [start, selectedCharacter, selectedScenario]);
+      if (!selectedScenario || !selectedCharacter) return;
+      setShowStartButton(false); // 시뮬레이션 시작 버튼 숨기기
+      start({
+        offender_id: 1,
+        victim_id: selectedCharacter?.id ?? 1,
+        scenario_id: selectedScenario?.id ?? 1,
+      });
+    } catch (err) {
+      console.error("SimulatorPage 실행 중 오류:", err);
+    }
+  }, [start, selectedCharacter, selectedScenario]);
 
   /* ✅ 새 메시지 들어올 때 자동 스크롤 유지 */
   // useEffect(() => {
@@ -138,8 +143,15 @@ const SimulatorPage = ({
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+    // 🎯 시나리오/캐릭터 선택 중에는 항상 맨 위로 고정
+    if (needScenario || needCharacter) {
+      el.scrollTop = 0;
+      return;
+    }
+
+    // 🎯 대화 중일 때만 아래로 자동 스크롤
     el.scrollTop = el.scrollHeight;
-  }, [messages]);
+  }, [messages, needScenario, needCharacter]);
 
   // json 출력
   const JsonBlock = ({ title = "", obj, theme }) => {
@@ -616,21 +628,23 @@ const SimulatorPage = ({
                     {/* 왼쪽: 대화 */}
                     <div className="flex-1 p-6 overflow-y-auto" ref={scrollRef}>
                       {/* ✅ 시뮬레이션 시작 버튼 (중앙 상단) */}
-                      <div className="flex justify-center mt-6">
-                        <button
-                          onClick={handleStartStream}
-                          disabled={running}
-                          className="px-8 py-3 rounded-lg font-semibold text-lg"
-                          style={{
-                            backgroundColor: THEME.blurple,
-                            color: THEME.white,
-                            boxShadow: "0 10px 24px rgba(0,0,0,.35)",
-                          }}
-                        >
-                          <Play className="inline mr-3" size={20} />
-                          {running ? "시뮬레이션 진행 중..." : "시뮬레이션 시작"}
-                        </button>
-                      </div>
+                      {showStartButton && (
+                        <div className="flex justify-center mt-6">
+                          <button
+                            onClick={handleStartStream}
+                            disabled={running}
+                            className="px-8 py-3 rounded-lg font-semibold text-lg"
+                            style={{
+                              backgroundColor: THEME.blurple,
+                              color: THEME.white,
+                              boxShadow: "0 10px 24px rgba(0,0,0,.35)",
+                            }}
+                          >
+                            <Play className="inline mr-3" size={20} />
+                            {running ? "시뮬레이션 진행 중..." : "시뮬레이션 시작"}
+                          </button>
+                        </div>
+                      )}
 
                       {/* 대화 렌더링 */}
                       {!messages?.length && (

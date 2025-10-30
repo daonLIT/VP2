@@ -1,4 +1,4 @@
-#VP\app\services\agent\orchestrator_react.py
+# VP\app\services\agent\orchestrator_react.py
 from __future__ import annotations
 from typing import Dict, Any, List, Tuple, Optional, Set, AsyncGenerator
 from dataclasses import dataclass, field
@@ -703,7 +703,7 @@ REACT_SYS = (
     "  Thought: 현재 판단/계획(간결히)\n"
     "  Action: [사용할_도구_이름]\n"
     "  Action Input: (툴별 규칙을 따른 JSON 한 줄)\n"
-    "  Observation: 도구 결과\n"
+    "  Observation: 도구 출력\n"
     "  ... 필요시 반복 ...\n"
     "  Final Answer: 최종 요약(최종 case_id, 총 라운드 수, 각 라운드 판정 요약 포함)\n"
 )
@@ -757,7 +757,7 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
 # ─────────────────────────────────────────────────────────
 # 메인 오케스트레이션
 # ─────────────────────────────────────────────────────────
-def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[ThreadEvent] = None) -> Dict[str, Any]:  
+def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[ThreadEvent] = None) -> Dict[str, Any]:
     # (SSE) 스트림 컨텍스트 시작: 프론트가 전달한 stream_id 사용(없으면 내부 생성)
     stream_id = str(payload.get("stream_id") or uuid.uuid4())
 
@@ -853,11 +853,70 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 "max_turns": req.max_turns,
             }
 
+            # ★★ added: sim.compose_prompts 직접 호출 헬퍼
+            def _compose_prompts_for_round(
+                round_no: int,
+                scenario: Dict[str, Any],
+                victim_profile: Dict[str, Any],
+                guidance: Optional[Dict[str, Any]],
+                case_id_for_round: Optional[str],
+            ) -> Dict[str, str]:
+                tool = None
+                for t in ex.tools:
+                    if t.name == "sim.compose_prompts":
+                        tool = t
+                        break
+                if not tool:
+                    raise HTTPException(status_code=500, detail="sim.compose_prompts tool not registered")
+
+                payload_obj = {
+                    "scenario": scenario,
+                    "victim_profile": victim_profile,
+                    "round_no": round_no,
+                }
+                if guidance:
+                    payload_obj["guidance"] = guidance
+                if case_id_for_round:
+                    payload_obj["case_id"] = case_id_for_round
+
+                # sim.* 계열은 {"data": {...}} 래핑 규칙
+                res_cp = tool.invoke({"data": payload_obj})
+                if isinstance(res_cp, str):
+                    try:
+                        res_cp = json.loads(res_cp)
+                    except Exception:
+                        res_cp = {}
+                if not isinstance(res_cp, dict):
+                    raise HTTPException(status_code=500, detail="sim.compose_prompts returned non-dict")
+
+                return res_cp
+
             for round_no in range(1, max_rounds + 1):
                 # 라운드 시작 시 중단 체크
                 if _stop and _stop.is_set():
                     logger.info("[StopToken] client_disconnected → stop at round=%s", round_no)
                     return {"status": "cancelled", "case_id": case_id or "", "rounds": rounds_done}
+
+                # ★★ added: 이번 라운드용 guidance 준비 (2라운드 이상일 때만)
+                round_guidance = None
+                if round_no >= 2 and guidance_kind and guidance_text:
+                    round_guidance = {"type": guidance_kind, "text": guidance_text}
+
+                # ★★ added: 이번 라운드용 prompt.py 기반 프롬프트 생성
+                composed_prompts = _compose_prompts_for_round(
+                    round_no=round_no,
+                    scenario=scenario_base,
+                    victim_profile=victim_profile_base,
+                    guidance=round_guidance,
+                    case_id_for_round=case_id if round_no >= 2 else None,
+                )
+                logger.info("[ComposePrompts] round=%s guidance=%s", round_no, round_guidance)
+                attacker_prompt = composed_prompts.get("attacker_prompt")
+                victim_prompt = composed_prompts.get("victim_prompt")
+                if not attacker_prompt or not victim_prompt:
+                    logger.error("[ComposePrompts] round=%s 프롬프트 생성 실패", round_no)
+                    raise HTTPException(status_code=500, detail="sim.compose_prompts failed to return prompts")
+
                 # ---- (A) 시뮬레이션 실행 ----
                 sim_payload: Dict[str, Any] = dict(base_payload)
 
@@ -879,9 +938,20 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             "text": normalized.get("text", "")
                         })
 
+                # ★★ added: 이번 라운드에서 만든 프롬프트를 실 payload에 직접 태운다
+                sim_payload["attacker_prompt"] = attacker_prompt
+                sim_payload["victim_prompt"] = victim_prompt
+                logger.info(
+                    "[SimPayloadPrompt] round=%s | attacker_head=%s",
+                    round_no,
+                    (attacker_prompt or "")[:160],
+                )
+
                 # forbid 대비: 허용키만 유지 + None 제거
                 allowed_keys = [
-                    "offender_id","victim_id","scenario","victim_profile","templates","max_turns",
+                    "offender_id","victim_id","scenario","victim_profile",
+                    "attacker_prompt","victim_prompt",  # ★★ added
+                    "templates","max_turns",
                     "case_id_override","round_no","guidance"
                 ]
                 sim_payload = _clean_payload(sim_payload, allow_extras=False, allowed_keys=allowed_keys)
@@ -896,6 +966,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     "guidance": sim_payload.get("guidance"),
                     "scenario": sim_payload.get("scenario"),
                     "victim_profile": sim_payload.get("victim_profile"),
+                    "attacker_prompt": (attacker_prompt[:120] + "…") if len(attacker_prompt or "") > 120 else attacker_prompt,
+                    "victim_prompt":   (victim_prompt[:120] + "…")   if len(victim_prompt   or "") > 120 else victim_prompt,
                     "templates": {
                         "attacker": sim_payload.get("templates", {}).get("attacker", ""),
                         "victim": sim_payload.get("templates", {}).get("victim", ""),
@@ -1200,6 +1272,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     gen_obs = _last_observation(cap, "admin.generate_guidance")
                     guidance_text = _extract_guidance_text(gen_obs) or _extract_guidance_text(res_gen) or "기본 예방 수칙을 따르세요."
                     logger.info("[GuidancePicked] round=%s | kind=%s | text=%s", round_no, guidance_kind, _truncate(guidance_text, 300))
+                    logger.info("[GuidanceSavedForNextRound] will_use_on_round=%s -> {%s, %s}",
+                            round_no + 1, guidance_kind, guidance_text)
 
             # ---- (F) 최종예방책: 모든 라운드 종료 후 단 한 번 호출 ----
             logger.info("[LoopSummary] rounds_done=%s max_rounds=%s finished_reason=%s", rounds_done, max_rounds, finished_reason)

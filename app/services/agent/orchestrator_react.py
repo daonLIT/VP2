@@ -778,7 +778,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
     token = _current_stream_id.set(stream_id)
 
     # (고급 SSE) 전역/외부 로거 핸들러 부착
-    logger.addHandler(_sse_log_handler)
+    # logger.addHandler(_sse_log_handler)
     _attach_global_sse_logging_handlers()
 
     # 콘솔 스트림 보장(중복 안전)

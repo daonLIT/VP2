@@ -16,15 +16,14 @@ from app.schemas.conversation import ConversationRunRequest
 SCENARIO: Dict[str, Any] = {
     "name": "기관 사칭형 2",
     "type": "기관 사칭형",
-    "purpose": "피해자에게 추가 피해를 막기 위한 것이라고 속여 현금을 편취",
+    "purpose": "검·경을 사칭해 ‘대포통장 연루’ 혐의를 조작하고 권위·불안을 이용해 녹취조사 명목으로 개인정보와 계좌 현황을 확보한 뒤 최종적으로 자금 이동에 협조하도록 유도한다",
     "steps": [
-        "보이스피싱조직 콜센터상담원이 검사와 수사관 사칭하여 피해자에게 전화(계좌가 범죄 이용되어 수사 필요)",
+        "자신과 사건 소개",
         "가상의 사건 인물과 관련한 사건 내용 설명(가상의 사건 인물과의 관계 물어봄)",
-        "일차적으로 유선 조사할 것이며, 혐의점 발견되면 소환 조사나 영장 발부될 수 있다고 겁을 줌",
-        "(가짜) 유선조사 진행(개인정보, 계좌개설 내역 및 예치금액 등 파악)",
-        "추가 피해 막기 위해 피해자 명의계좌의 모든 돈을 현금으로 인출하여 지정한 장소에 보관하도록 요구",
-        "피해자가 현금 인출하여 물품 보관함에 둠",
-        "현금수거책이 보관함에서 현금 가져감",
+        "피해자 연루 설명",
+        "통화 녹음·조사 강조",
+        "은행/계좌 확인 유도",
+        "출석/추가 지시 요구",
     ],
     # 필요하면 지침을 여기에 추가 가능:
     # "guideline": "긴급성·권위를 강조하고 절차 위주로 짧게 지시.",
@@ -145,6 +144,39 @@ def main():
                 selected_victim = victim_row
 
         victims: List[m.Victim] = [selected_victim]
+        # ────────────────────────────────────────────────
+        # ✅ 피해자 정보 로그 출력 (터미널용 브리핑)
+        print("\n=== 선택된 피해자 정보 ===")
+
+        # 안전한 접근: profile 컬럼이 없을 수 있으므로 getattr 사용.
+        # 1) 먼저 profile 전체 JSON 컬럼이 있는지 시도
+        vp = getattr(selected_victim, "profile", None)
+        if not vp:
+            # 2) profile이 없으면 개별 컬럼(meta, knowledge, traits)을 시도
+            meta = getattr(selected_victim, "meta", {}) or {}
+            traits = getattr(selected_victim, "traits", {}) or {}
+            knowledge = getattr(selected_victim, "knowledge", {}) or {}
+        else:
+            # profile이 있으면 내부 구조에서 꺼냄
+            meta = vp.get("meta", {}) if isinstance(vp, dict) else {}
+            traits = vp.get("traits", {}) if isinstance(vp, dict) else {}
+            knowledge = vp.get("knowledge", {}) if isinstance(vp, dict) else {}
+
+        # 출력: 안전한 기본값 사용
+        print(f"이름: {getattr(selected_victim, 'name', '정보없음')}")
+        print(f"나이: {meta.get('age', '?')}세,  성별: {meta.get('gender', '?')}")
+        print(f"지역: {meta.get('address', '정보없음')}, 학력: {meta.get('education', '정보없음')}")
+
+        print("\n[금융 이해 특성]")
+        for note in knowledge.get("comparative_notes", []) if isinstance(knowledge, dict) else []:
+            print(f" - {note}")
+
+        print("\n[취약 성향]")
+        for vn in traits.get("vulnerability_notes", []) if isinstance(traits, dict) else []:
+            print(f" - {vn}")
+
+        print("──────────────────────────────────────────\n")
+        # ────────────────────────────────────────────────
 
         CYCLES = args.cycles
         MAX_ROUNDS = args.max_rounds

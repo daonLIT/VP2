@@ -1,3 +1,4 @@
+// src/components/InvestigationBoard.jsx
 import React, { useEffect, useState, useMemo } from "react";
 import { Shield, Target, Lightbulb, TrendingUp } from "lucide-react";
 
@@ -175,10 +176,14 @@ function RoundBlock({ conv, theme }) {
 function GuidanceBlock({ guidance, theme }) {
   if (!guidance) return null;
 
-  const guidanceText = guidance.content || guidance.raw?.text;
-  const categories = guidance.categories || guidance.raw?.categories || [];
-  const reasoning = guidance.reasoning || guidance.raw?.reasoning;
-  const expectedEffect = guidance.expected_effect || guidance.raw?.expected_effect;
+  const normalized = guidance?.content
+    ? { text: guidance.content, ...guidance }
+    : guidance || {};
+
+  const guidanceText = normalized.text;
+  const categories = normalized.categories || [];
+  const reasoning = normalized.reasoning;
+  const expectedEffect = normalized.expected_effect;
 
   return (
     <div
@@ -190,7 +195,6 @@ function GuidanceBlock({ guidance, theme }) {
     >
       <Section icon={Lightbulb} title="공격 지침 (GuidanceGeneration)" color={theme.purple}>
         <div className="space-y-3">
-          {/* 카테고리 */}
           {categories.length > 0 && (
             <div className="flex flex-wrap gap-2 mb-3">
               {categories.map((cat, i) => (
@@ -209,12 +213,10 @@ function GuidanceBlock({ guidance, theme }) {
             </div>
           )}
 
-          {/* 본문 */}
           <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
             {guidanceText}
           </p>
 
-          {/* 추론 */}
           {reasoning && (
             <div
               className="p-3 rounded-lg"
@@ -232,7 +234,6 @@ function GuidanceBlock({ guidance, theme }) {
             </div>
           )}
 
-          {/* 예상 효과 */}
           {expectedEffect && (
             <div
               className="p-3 rounded-lg"
@@ -292,12 +293,11 @@ export default function InvestigationBoard({ COLORS, judgement, guidance, preven
 
   useEffect(() => {
     if (guidance) {
-      const data = guidance.content || guidance;
       const runNo =
-        data?.run_no ??
-        data?.meta?.round_no ??
+        guidance?.meta?.round_no ??
+        guidance?.run_no ??
         (roundData.length > 0 ? roundData[roundData.length - 1].run_no + 1 : 1);
-      mergeRoundData("guidance", { ...data, run_no: runNo });
+      mergeRoundData("guidance", { ...guidance, run_no: runNo });
     }
   }, [guidance]);
 
@@ -310,35 +310,18 @@ export default function InvestigationBoard({ COLORS, judgement, guidance, preven
 
   return (
     <div className="h-full overflow-y-auto p-6" style={{ backgroundColor: theme.bg }}>
-      {roundData.length > 0 ? (
-        <>
-          <div className="mb-6">
-            <h1 className="text-xl font-bold mb-1" style={{ color: theme.text }}>
-              피싱 판정 결과
-            </h1>
-            <p className="text-sm" style={{ color: theme.sub }}>
-              총 {roundData.length}개 라운드 분석 완료
+      {judgement && <RoundBlock conv={judgement} theme={theme} />}
+      {guidance && <GuidanceBlock guidance={guidance} theme={theme} />}
+      {prevention && (
+        <div
+          className="rounded-xl p-6 mb-6"
+          style={{ backgroundColor: theme.panelDark, border: `1px solid ${theme.border}` }}
+        >
+          <Section icon={Shield} title="예방 정보 (Prevention)" color={theme.success}>
+            <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
+              {JSON.stringify(prevention, null, 2)}
             </p>
-          </div>
-
-          {roundData.map((conv, idx) => (
-            <div key={idx}>
-              <RoundBlock conv={conv} theme={theme} />
-              <GuidanceBlock guidance={conv.guidance} theme={theme} />
-            </div>
-          ))}
-        </>
-      ) : (
-        <div className="flex flex-col items-center justify-center h-full gap-3">
-          <Shield size={48} color={theme.blurple} className="animate-pulse" />
-          <div className="text-center">
-            <p className="font-medium mb-1" style={{ color: theme.text }}>
-              분석 데이터 대기 중
-            </p>
-            <p className="text-sm" style={{ color: theme.sub }}>
-              시뮬레이션 결과가 표시됩니다
-            </p>
-          </div>
+          </Section>
         </div>
       )}
     </div>
@@ -346,6 +329,358 @@ export default function InvestigationBoard({ COLORS, judgement, guidance, preven
 }
 
 
+// // src/components/InvestigationBoard.jsx
+// import React, { useEffect, useState, useMemo } from "react";
+// import { Shield, Target, Lightbulb, TrendingUp } from "lucide-react";
+
+// /*== 색상 토큰 ==*/
+// const DEFAULT_THEME = {
+//   bg: "#030617",
+//   panel: "#061329",
+//   panelDark: "#04101f",
+//   border: "#A8862A",
+//   text: "#FFFFFF",
+//   sub: "#BFB38A",
+//   blurple: "#A8862A",
+//   success: "#10B981",
+//   warn: "#F59E0B",
+//   danger: "#EF4444",
+//   purple: "#A855F7",
+//   cyan: "#06B6D4",
+// };
+
+// /*== 위험도 스타일 ==*/
+// const getRiskStyle = (level) => {
+//   const lv = String(level || "").toLowerCase();
+//   if (lv === "critical") return { color: "#EF4444", label: "치명적", bg: "#EF444420" };
+//   if (lv === "high") return { color: "#F59E0B", label: "높음", bg: "#F59E0B20" };
+//   if (lv === "medium") return { color: "#06B6D4", label: "보통", bg: "#06B6D420" };
+//   if (lv === "low") return { color: "#10B981", label: "낮음", bg: "#10B98120" };
+//   return { color: "#6B7280", label: "알 수 없음", bg: "#6B728020" };
+// };
+
+// /*== 섹션 카드 ==*/
+// function Section({ icon: Icon, title, color, children, badge }) {
+//   return (
+//     <div className="mb-6">
+//       <div className="flex items-center justify-between mb-3">
+//         <div className="flex items-center gap-2">
+//           <Icon size={18} color={color} />
+//           <h3 className="text-sm font-semibold" style={{ color: "#FFFFFF" }}>
+//             {title}
+//           </h3>
+//         </div>
+//         {badge}
+//       </div>
+//       {children}
+//     </div>
+//   );
+// }
+
+// /*== 라운드별 피싱 판정 블록 ==*/
+// // function RoundBlock({ conv, theme }) {
+// //   const { run_no, phishing, evidence, risk, victim_vulnerabilities = [] } = conv || {};
+// //   const riskStyle = getRiskStyle(risk?.level);
+// //   const riskScore = risk?.score ?? 0;
+
+// //   return (
+// //     <div
+// //       className="rounded-xl p-6 mb-6"
+// //       style={{
+// //         backgroundColor: theme.panel,
+// //         border: `1px solid ${theme.border}`,
+// //       }}
+// //     >
+// //       {/* 헤더 */}
+// //       <div
+// //         className="flex items-center justify-between mb-6 pb-4"
+// //         style={{ borderBottom: `1px solid ${theme.border}40` }}
+// //       >
+// //         <div className="flex items-center gap-3">
+// //           <div
+// //             className="w-8 h-8 rounded-lg flex items-center justify-center font-bold"
+// //             style={{ backgroundColor: theme.blurple, color: "#000" }}
+// //           >
+// //             {run_no}
+// //           </div>
+// //           <span className="font-semibold" style={{ color: theme.text }}>
+// //             라운드 {run_no}
+// //           </span>
+// //         </div>
+
+// //         <div
+// //           className="px-4 py-1.5 rounded-full text-xs font-bold"
+// //           style={{
+// //             backgroundColor: phishing ? "#EF444420" : "#10B98120",
+// //             color: phishing ? "#EF4444" : "#10B981",
+// //             border: `1px solid ${phishing ? "#EF4444" : "#10B981"}`,
+// //           }}
+// //         >
+// //           {phishing ? "피싱 성공" : "피싱 실패"}
+// //         </div>
+// //       </div>
+
+// //       {/* 피싱 판정 결과 */}
+// //       <Section icon={Shield} title="피싱 판정 결과" color={theme.blurple}>
+// //         <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
+// //           {evidence || "근거 없음"}
+// //         </p>
+// //       </Section>
+
+// //       {/* 위험도 */}
+// //       {risk && (
+// //         <Section
+// //           icon={TrendingUp}
+// //           title="위험도"
+// //           color={riskStyle.color}
+// //           badge={
+// //             <div className="flex items-center gap-2">
+// //               <span
+// //                 className="px-3 py-1 rounded-full text-xs font-bold"
+// //                 style={{ backgroundColor: riskStyle.bg, color: riskStyle.color }}
+// //               >
+// //                 {riskStyle.label}
+// //               </span>
+// //               <span
+// //                 className="px-3 py-1 rounded-full text-xs font-mono font-bold"
+// //                 style={{ backgroundColor: riskStyle.bg, color: riskStyle.color }}
+// //               >
+// //                 {riskScore}점
+// //               </span>
+// //             </div>
+// //           }
+// //         >
+// //           <div className="space-y-3">
+// //             <div
+// //               className="w-full h-2 rounded-full overflow-hidden"
+// //               style={{ backgroundColor: theme.panelDark }}
+// //             >
+// //               <div
+// //                 className="h-2 transition-all duration-1000"
+// //                 style={{ width: `${riskScore}%`, backgroundColor: riskStyle.color }}
+// //               />
+// //             </div>
+// //             <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
+// //               {risk.rationale}
+// //             </p>
+// //           </div>
+// //         </Section>
+// //       )}
+
+// //       {/* 취약 요인 */}
+// //       {victim_vulnerabilities.length > 0 && (
+// //         <Section
+// //           icon={Target}
+// //           title="피해자 취약 요인"
+// //           color={theme.warn}
+// //           badge={
+// //             <span
+// //               className="px-2 py-0.5 rounded text-xs font-bold"
+// //               style={{ backgroundColor: "#F59E0B20", color: theme.warn }}
+// //             >
+// //               {victim_vulnerabilities.length}
+// //             </span>
+// //           }
+// //         >
+// //           <div className="space-y-2">
+// //             {victim_vulnerabilities.map((v, i) => (
+// //               <div key={i} className="flex gap-3">
+// //                 <span
+// //                   className="w-5 h-5 rounded flex items-center justify-center flex-shrink-0 text-xs font-bold"
+// //                   style={{ backgroundColor: "#F59E0B20", color: theme.warn }}
+// //                 >
+// //                   {i + 1}
+// //                 </span>
+// //                 <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
+// //                   {v}
+// //                 </p>
+// //               </div>
+// //             ))}
+// //           </div>
+// //         </Section>
+// //       )}
+// //     </div>
+// //   );
+// // }
+
+// /*== 라운드별 GuidanceGeneration 블록 ==*/
+// function GuidanceBlock({ guidance, theme }) {
+//   if (!guidance) return null;
+
+//   // ✅ 문자열 content + 객체형 병합 보정
+//   const normalized = guidance?.content
+//     ? { text: guidance.content, ...guidance }
+//     : guidance || {};
+
+//   const guidanceText = normalized.text;
+//   const categories = normalized.categories || [];
+//   const reasoning = normalized.reasoning;
+//   const expectedEffect = normalized.expected_effect;
+
+//   return (
+//     <div
+//       className="rounded-xl p-6 mb-10"
+//       style={{
+//         backgroundColor: theme.panelDark,
+//         border: `1px solid ${theme.border}`,
+//       }}
+//     >
+//       <Section icon={Lightbulb} title="공격 지침 (GuidanceGeneration)" color={theme.purple}>
+//         <div className="space-y-3">
+//           {/* 카테고리 */}
+//           {categories.length > 0 && (
+//             <div className="flex flex-wrap gap-2 mb-3">
+//               {categories.map((cat, i) => (
+//                 <span
+//                   key={i}
+//                   className="px-2 py-1 rounded text-xs font-mono font-bold"
+//                   style={{
+//                     backgroundColor: "#A855F720",
+//                     color: theme.purple,
+//                     border: `1px solid #A855F740`,
+//                   }}
+//                 >
+//                   {cat}
+//                 </span>
+//               ))}
+//             </div>
+//           )}
+
+//           {/* 본문 */}
+//           <p className="text-sm leading-relaxed" style={{ color: theme.sub }}>
+//             {guidanceText}
+//           </p>
+
+//           {/* 추론 */}
+//           {reasoning && (
+//             <div
+//               className="p-3 rounded-lg"
+//               style={{
+//                 backgroundColor: theme.panel,
+//                 borderLeft: `2px solid ${theme.cyan}`,
+//               }}
+//             >
+//               <div className="text-xs mb-1 font-medium" style={{ color: theme.cyan }}>
+//                 추론 과정
+//               </div>
+//               <p className="text-xs leading-relaxed" style={{ color: theme.sub }}>
+//                 {reasoning}
+//               </p>
+//             </div>
+//           )}
+
+//           {/* 예상 효과 */}
+//           {expectedEffect && (
+//             <div
+//               className="p-3 rounded-lg"
+//               style={{
+//                 backgroundColor: theme.panel,
+//                 borderLeft: `2px solid ${theme.success}`,
+//               }}
+//             >
+//               <div className="text-xs mb-1 font-medium" style={{ color: theme.success }}>
+//                 예상 효과
+//               </div>
+//               <p className="text-xs leading-relaxed" style={{ color: theme.sub }}>
+//                 {expectedEffect}
+//               </p>
+//             </div>
+//           )}
+//         </div>
+//       </Section>
+//     </div>
+//   );
+// }
+
+// /*== 메인 컴포넌트 ==*/
+// export default function InvestigationBoard({ COLORS, judgement, guidance, prevention }) {
+//   const theme = { ...DEFAULT_THEME, ...(COLORS || {}) };
+//   const [roundData, setRoundData] = useState([]);
+
+//   const mergeRoundData = (type, data) => {
+//     const runNo = data?.run_no ?? data?.meta?.round_no ?? 1;
+//     setRoundData((prev) => {
+//       const existing = prev.find((r) => r.run_no === runNo) || { run_no: runNo };
+//       const updated = {
+//         ...existing,
+//         run_no: runNo,
+//         phishing: data?.phishing ?? data?.content?.phishing ?? existing.phishing,
+//         evidence: data?.evidence ?? data?.content?.evidence ?? existing.evidence,
+//         risk: data?.risk ?? data?.content?.risk ?? existing.risk,
+//         victim_vulnerabilities:
+//           data?.victim_vulnerabilities ??
+//           data?.content?.victim_vulnerabilities ??
+//           existing.victim_vulnerabilities ??
+//           [],
+//         guidance: type === "guidance" ? data : existing.guidance,
+//         prevention: type === "prevention" ? data : existing.prevention,
+//       };
+//       const newList = prev.filter((r) => r.run_no !== runNo).concat(updated);
+//       return newList.sort((a, b) => (a.run_no ?? 0) - (b.run_no ?? 0));
+//     });
+//   };
+
+//   useEffect(() => {
+//     if (judgement) {
+//       const data = judgement.content || judgement;
+//       mergeRoundData("judgement", data);
+//     }
+//   }, [judgement]);
+
+//   // ✅ guidance 전체 객체 병합 (content만 쓰지 않음)
+//   useEffect(() => {
+//     if (guidance) {
+//       const runNo =
+//         guidance?.meta?.round_no ??
+//         guidance?.run_no ??
+//         (roundData.length > 0 ? roundData[roundData.length - 1].run_no + 1 : 1);
+//       mergeRoundData("guidance", { ...guidance, run_no: runNo });
+//     }
+//   }, [guidance]);
+
+//   useEffect(() => {
+//     if (prevention) {
+//       const data = prevention.content || prevention;
+//       mergeRoundData("prevention", data);
+//     }
+//   }, [prevention]);
+
+//   return (
+//     <div className="h-full overflow-y-auto p-6" style={{ backgroundColor: theme.bg }}>
+//       {roundData.length > 0 ? (
+//         <>
+//           <div className="mb-6">
+//             <h1 className="text-xl font-bold mb-1" style={{ color: theme.text }}>
+//               피싱 판정 결과
+//             </h1>
+//             <p className="text-sm" style={{ color: theme.sub }}>
+//               총 {roundData.length}개 라운드 분석 완료
+//             </p>
+//           </div>
+
+//           {roundData.map((conv, idx) => (
+//             <div key={idx}>
+//               <RoundBlock conv={conv} theme={theme} />
+//               <GuidanceBlock guidance={conv.guidance} theme={theme} />
+//             </div>
+//           ))}
+//         </>
+//       ) : (
+//         <div className="flex flex-col items-center justify-center h-full gap-3">
+//           <Shield size={48} color={theme.blurple} className="animate-pulse" />
+//           <div className="text-center">
+//             <p className="font-medium mb-1" style={{ color: theme.text }}>
+//               분석 데이터 대기 중
+//             </p>
+//             <p className="text-sm" style={{ color: theme.sub }}>
+//               시뮬레이션 결과가 표시됩니다
+//             </p>
+//           </div>
+//         </div>
+//       )}
+//     </div>
+//   );
+// }
 
 // import React, { useEffect, useState, useMemo } from "react";
 // import { Shield, AlertTriangle, Target, Lightbulb, TrendingUp } from "lucide-react";

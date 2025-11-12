@@ -86,8 +86,8 @@ const SimulatorPage = ({
     // 🔴 필수: 선택된 값 전달
     selectedScenario,
     selectedCharacter,
-  });     
-
+  });  
+  
   /* ----------------------------------------------------------
    🧩 상태
   ---------------------------------------------------------- */
@@ -118,8 +118,21 @@ const SimulatorPage = ({
   const localScrollContainerRef = useRef(null);
   const scrollRef = injectedScrollContainerRef ?? localScrollContainerRef;
   const [activeAgentTab, setActiveAgentTab] = useState("log");
+
   const [showBoardContent, setShowBoardContent] = useState(false);
 
+  // 1️⃣ 분석 데이터 준비 여부 체크
+  const hasJudgement = Boolean(judgement && (judgement.content ?? judgement));
+  const hasGuidance  = Boolean(guidance && (guidance.content ?? guidance));
+  const hasPrevention = Boolean(prevention && (prevention.content ?? prevention));
+  const hasAnyAgentData = hasJudgement || hasGuidance || hasPrevention;
+
+  // 2️⃣ 데이터가 오면 자동으로 보드 활성화
+  useEffect(() => {
+    if (hasAnyAgentData && !showBoardContent) {
+      setShowBoardContent(true);
+    }
+  }, [hasAnyAgentData, showBoardContent]);
 
   // ✅ SSE 스트림 실행 + handleStartStream 실행 시 버튼 숨김 처리 추가
   const handleStartStream = useCallback(() => {
@@ -757,70 +770,38 @@ const SimulatorPage = ({
                       </div>
 
                       <div className="flex-1 overflow-auto p-4">
-                        {activeAgentTab === "log" ? (
-                          <TerminalLog logs={logs} COLORS={THEME} />
-                        ) : showBoardContent ? (
-                          <div className="flex flex-col gap-4">
-                            {/* 기존 보드 */}
-                            <InvestigationBoard
-                              COLORS={THEME}
-                              judgement={judgement}
-                              guidance={appliedGuidance} 
-                              prevention={prevention}
-                            />
+  {activeAgentTab === "log" ? (
+    <TerminalLog logs={logs} COLORS={THEME} />
+  ) : showBoardContent && (judgement || guidance || prevention) ? (
+    <div className="flex flex-col gap-4">
+      {/* ✅ InvestigationBoard 단일 호출 */}
+      <InvestigationBoard
+        COLORS={THEME}
+        judgement={judgement}
+        guidance={guidance}
+        prevention={prevention}
+      />
 
-                            {/* 요약 카드 (빠른 확인용) */}
-                            {normalizedJudgement && (
-                              <div
-                                className="mt-2 p-4 rounded-xl border"
-                                style={{ borderColor: THEME.border, backgroundColor: THEME.panelDark }}
-                              >
-                                <div className="font-semibold mb-3" style={{ color: THEME.text }}>
-                                  ⚖️ 판정 요약 (Judgement)
-                                </div>
-                                <div className="text-sm space-y-2" style={{ color: THEME.sub }}>
-                                  <div><b style={{ color: THEME.text }}>case_id</b>: {normalizedJudgement.case_id}</div>
-                                  <div><b style={{ color: THEME.text }}>run_no</b>: {normalizedJudgement.run_no}</div>
-                                  <div>
-                                    <b style={{ color: THEME.text }}>phishing</b>: {String(normalizedJudgement.phishing)}
-                                  </div>
-                                  <div>
-                                    <b style={{ color: THEME.text }}>risk</b>: {normalizedJudgement?.risk?.level} (score: {normalizedJudgement?.risk?.score})
-                                  </div>
-                                  <div>
-                                    <b style={{ color: THEME.text }}>reason</b>: {normalizedJudgement?.continue?.reason}
-                                  </div>
-                                  <div>
-                                    <b style={{ color: THEME.text }}>evidence</b>: {normalizedJudgement?.evidence}
-                                  </div>
-                                  {Array.isArray(normalizedJudgement?.victim_vulnerabilities) && (
-                                    <div>
-                                      <b style={{ color: THEME.text }}>vulnerabilities</b>:
-                                      <ul className="list-disc pl-5">
-                                        {normalizedJudgement.victim_vulnerabilities.map((v, i) => (
-                                          <li key={i}>{v}</li>
-                                        ))}
-                                      </ul>
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            )}
-
-                            {/* Raw JSON (그대로 보고 싶을 때) */}
-                            <JsonBlock title="[SSE Event] judgement (raw)" obj={judgement} theme={THEME} />
-                            <JsonBlock title="[SSE Event] guidance  (raw)" obj={guidance}  theme={THEME} />
-                            <JsonBlock title="[SSE Event] prevention(raw)" obj={prevention} theme={THEME} />
-                          </div>
-                        ) : (
-                          <div
-                            className="p-4 text-sm opacity-70"
-                            style={{ color: THEME.sub }}
-                          >
-                            분석 데이터를 불러오는 중입니다...
-                          </div>
-                        )}
-                      </div>
+      {/* (선택) 원본 데이터 확인용 JSON 블록 */}
+      {judgement && (
+        <JsonBlock title="[SSE Event] judgement (raw)" obj={judgement} theme={THEME} />
+      )}
+      {guidance && (
+        <JsonBlock title="[SSE Event] guidance (raw)" obj={guidance} theme={THEME} />
+      )}
+      {prevention && (
+        <JsonBlock title="[SSE Event] prevention (raw)" obj={prevention} theme={THEME} />
+      )}
+    </div>
+  ) : (
+    <div
+      className="p-4 text-sm opacity-70"
+      style={{ color: THEME.sub }}
+    >
+      분석 데이터를 불러오는 중입니다...
+    </div>
+  )}
+</div>
                     </div>
                   </div>
                 </>

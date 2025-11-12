@@ -221,10 +221,41 @@ export function useSimStream(
             continue;
           }
 
-          // 2) 로그/터미널 (기존 유지)
+          // 2) 로그/터미널 (수정 버전)
           if (type === "log" || type === "terminal" || type === "agent_action") {
-            setLogs((p) => [...p, event.content ?? JSON.stringify(event)]);
-            
+            const content = event.content ?? "";
+            setLogs((p) => [...p, content]);
+
+            // ✅ [GuidanceGeneration] 로그 감지 (기존 guidance 대체)
+            if (typeof content === "string" && content.startsWith("[GuidanceGeneration]")) {
+              try {
+                const jsonStr = content.replace("[GuidanceGeneration]", "").trim();
+                const parsed = JSON.parse(jsonStr);
+                const g = parsed?.generated_guidance;
+
+                if (g) {
+                  setGuidance({
+                    type: "GuidanceGeneration",
+                    content: g.text,
+                    categories: g.categories,
+                    reasoning: g.reasoning,
+                    expected_effect: g.expected_effect,
+                    meta: {
+                      case_id: parsed.case_id,
+                      round_no: parsed.round_no,
+                      timestamp: parsed.timestamp,
+                      analysis_context: parsed.analysis_context,
+                    },
+                    raw: parsed,
+                  });
+
+                  console.log("✅ GuidanceGeneration에서 guidance 추출 성공:", g.text);
+                }
+              } catch (e) {
+                console.warn("⚠️ GuidanceGeneration 파싱 실패:", e, content);
+              }
+            }
+
             // [conversation_log] 문자열 형태 처리 (폴백)
             if (
               type === "log" &&
@@ -234,9 +265,10 @@ export function useSimStream(
               const parsed = parseConversationLogContent(event.content);
               if (parsed && parsed.turns?.length) {
                 // 위의 conversation_log 처리 로직과 동일
-                // (생략 - 필요시 위 코드 복사)
+                // (생략 가능)
               }
             }
+
             continue;
           }
 
@@ -259,13 +291,40 @@ export function useSimStream(
           }
 
           // 5) 판정/가이드
+          // if (type === "judgement") {
+          //   setJudgement(event);
+          //   addSystem?.(
+          //     `라운드 ${evt.round} 판정: ${evt.phishing ? "피싱 성공" : "피싱 실패"} - ${evt.reason}`
+          //   );
+          //   continue;
+          // }
+          // 5) 판정/가이드
           if (type === "judgement") {
             setJudgement(event);
+
+            // ✅ applied_guidance 자동 추출
+            const appliedGuidance =
+              evt?.meta?.scenario?.enhancement_info?.applied_guidance ??
+              evt?.enhancement_info?.applied_guidance ??
+              null;
+
+            if (appliedGuidance) {
+              setGuidance({
+                type: "guidance_extracted",
+                content: appliedGuidance,
+                source: "meta.scenario.enhancement_info.applied_guidance",
+              });
+              console.log("✅ applied_guidance 추출됨:", appliedGuidance);
+            }
+
             addSystem?.(
-              `라운드 ${evt.round} 판정: ${evt.phishing ? "피싱 성공" : "피싱 실패"} - ${evt.reason}`
+              `라운드 ${evt.round ?? "?"} 판정: ${
+                evt.phishing ? "피싱 성공" : "피싱 실패"
+              } - ${evt.reason ?? "N/A"}`
             );
             continue;
           }
+
           if (type === "guidance_generated") {
             setGuidance(event);
             addSystem?.(
@@ -273,6 +332,7 @@ export function useSimStream(
             );
             continue;
           }
+
           if (type === "prevention_tip") {
             setPrevention(event);
             continue;

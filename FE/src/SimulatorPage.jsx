@@ -77,8 +77,17 @@ const SimulatorPage = ({
   victimImageUrl,
 }) => {
   //SSE 이벤트 실행 트리거
-  const { logs, messages, start, running, judgement, guidance, prevention } = useSimStream(setMessages);
-     
+  const {
+    logs, messages, start, running, judgement, guidance, prevention
+  } = useSimStream(setMessages, {
+    // 필요 시 넣을 수 있는 콜백/상태 전달 (옵션)
+    addSystem,                 // 있으면 전달
+    setProgress,               // 있으면 전달
+    // 🔴 필수: 선택된 값 전달
+    selectedScenario,
+    selectedCharacter,
+  });     
+
   /* ----------------------------------------------------------
    🧩 상태
   ---------------------------------------------------------- */
@@ -99,6 +108,7 @@ const SimulatorPage = ({
     const ev = guidance?.event ?? guidance;
     return ev?.content ?? ev ?? null;
   }, [guidance]);
+
   const normalizedPrevention = useMemo(() => {
     const ev = prevention?.event ?? prevention;
     return ev?.content ?? ev ?? null;
@@ -113,18 +123,38 @@ const SimulatorPage = ({
 
   // ✅ SSE 스트림 실행 + handleStartStream 실행 시 버튼 숨김 처리 추가
   const handleStartStream = useCallback(() => {
-    try {
-      if (!selectedScenario || !selectedCharacter) return;
-      setShowStartButton(false); // 시뮬레이션 시작 버튼 숨기기
-      start({
-        offender_id: 1,
-        victim_id: selectedCharacter?.id ?? 1,
-        scenario_id: selectedScenario?.id ?? 1,
-      });
-    } catch (err) {
-      console.error("SimulatorPage 실행 중 오류:", err);
+  try {
+    // 1) 존재 검증
+    if (!selectedScenario || !selectedScenario.id) {
+      console.error("❌ 시나리오 미선택/ID 없음:", selectedScenario);
+      return;
     }
-  }, [start, selectedCharacter, selectedScenario]);
+    if (!selectedCharacter || !selectedCharacter.id) {
+      console.error("❌ 캐릭터 미선택/ID 없음:", selectedCharacter);
+      return;
+    }
+
+    // 2) 숫자 보정(백엔드가 int 기대 시)
+    const scenarioId = Number(selectedScenario.id);
+    const victimId   = Number(selectedCharacter.id);
+    if (!Number.isFinite(scenarioId) || !Number.isFinite(victimId)) {
+      console.error("❌ ID 타입이 숫자가 아님:", { scenarioId, victimId });
+      return;
+    }
+
+    setShowStartButton(false);
+
+    // 3) 절대 임의 기본값(1) 사용 금지: 정확한 JSON만 전송
+    start({
+      offender_id: 1,
+      victim_id: victimId,
+      scenario_id: scenarioId,
+    });
+  } catch (err) {
+    console.error("SimulatorPage 실행 중 오류:", err);
+  }
+}, [start, selectedScenario, selectedCharacter]);
+
 
   /* ✅ 새 메시지 들어올 때 자동 스크롤 유지 */
   // useEffect(() => {
@@ -196,6 +226,14 @@ const SimulatorPage = ({
       ok: raw.ok,
       persisted: raw.persisted,
     };
+  }, [judgement]);
+
+  // ✅ applied_guidance 추출
+  const appliedGuidance = useMemo(() => {
+    return (
+      judgement?.meta?.scenario?.enhancement_info?.applied_guidance ??
+      "지침 데이터 없음"
+    );
   }, [judgement]);
 
   // 진행률 계산에 쓰는 로컬 카운터(선언을 hasChatLog보다 위에 둠)
@@ -628,7 +666,7 @@ const SimulatorPage = ({
                     {/* 왼쪽: 대화 */}
                     <div className="flex-1 p-6 overflow-y-auto" ref={scrollRef}>
                       {/* ✅ 시뮬레이션 시작 버튼 (중앙 상단) */}
-                      {showStartButton && (
+                      {showStartButton ? (
                         <div className="flex justify-center mt-6">
                           <button
                             onClick={handleStartStream}
@@ -644,6 +682,11 @@ const SimulatorPage = ({
                             {running ? "시뮬레이션 진행 중..." : "시뮬레이션 시작"}
                           </button>
                         </div>
+                      ) : (
+                        // ✅ 버튼이 사라지고, 대화가 아직 안 나왔을 때만 Spinner 표시
+                        !messages?.length && (
+                          <SpinnerMessage simulationState="RUNNING" COLORS={THEME} />
+                        )
                       )}
 
                       {/* 대화 렌더링 */}
@@ -722,7 +765,7 @@ const SimulatorPage = ({
                             <InvestigationBoard
                               COLORS={THEME}
                               judgement={judgement}
-                              guidance={guidance}
+                              guidance={appliedGuidance} 
                               prevention={prevention}
                             />
 

@@ -13,17 +13,47 @@ from app.schemas.conversation import ConversationRunRequest
 # ─────────────────────────────────────────────────────────
 # 코드 상에 직접 정의하는 시나리오 (DB/CLI 미의존)
 # ─────────────────────────────────────────────────────────
+# SCENARIO: Dict[str, Any] = {
+#     "name": "기관 사칭형 2",
+#     "type": "기관 사칭형",
+#     "purpose": "검·경을 사칭해 ‘대포통장 연루’ 혐의를 조작하고 권위·불안을 이용해 녹취조사 명목으로 개인정보와 계좌 현황을 확보한 뒤 최종적으로 자금 이동에 협조하도록 유도한다",
+#     "steps": [
+#         "자신과 사건 소개",
+#         "가상의 사건 인물과 관련한 사건 내용 설명(가상의 사건 인물과의 관계 물어봄)",
+#         "피해자 연루 설명",
+#         "통화 녹음·조사 강조",
+#         "은행/계좌 확인 유도",
+#         "출석/추가 지시 요구",
+#     ],
+#     # 필요하면 지침을 여기에 추가 가능:
+#     # "guideline": "긴급성·권위를 강조하고 절차 위주로 짧게 지시.",
+#     # "guidance_type": "A",
+# }
+# SCENARIO: Dict[str, Any] = {
+#     "name": "대출사기형",
+#     "type": "대출사기형",
+#     "purpose": "저금리 대출 안내를 통하여 개인정보 탈취 및 문자를 통한 서류 제출 유도",
+#     "steps": [
+#         "자신 소개와 상담 신청 명분 제시",
+#         "통화 상대방이 본인인지 확인",
+#         "대출 가능성 강조 및 유리한 조건 제시",
+#         "개인정보 탈취 및 비대면 진행 이유 설명",
+#         "문자를 통해 링크·신청서·서류 제출 유도",
+#     ],
+#     # 필요하면 지침을 여기에 추가 가능:
+#     # "guideline": "긴급성·권위를 강조하고 절차 위주로 짧게 지시.",
+#     # "guidance_type": "A",
+# }
 SCENARIO: Dict[str, Any] = {
-    "name": "기관 사칭형 2",
-    "type": "기관 사칭형",
-    "purpose": "검·경을 사칭해 ‘대포통장 연루’ 혐의를 조작하고 권위·불안을 이용해 녹취조사 명목으로 개인정보와 계좌 현황을 확보한 뒤 최종적으로 자금 이동에 협조하도록 유도한다",
+    "name": "몸캠 피싱형",
+    "type": "몸캠 피싱형",
+    "purpose": "성매매 업소 방문 영상을 불법 촬영했으며 지인 연락처도 확보했다고 피해자를 속이고 협박하여, 영상 유포를 막는 대가로 금전적 합의를 뜯어내는 것",
     "steps": [
-        "자신과 사건 소개",
-        "가상의 사건 인물과 관련한 사건 내용 설명(가상의 사건 인물과의 관계 물어봄)",
-        "피해자 연루 설명",
-        "통화 녹음·조사 강조",
-        "은행/계좌 확인 유도",
-        "출석/추가 지시 요구",
+        "대상 확인 및 자신 소개",
+        "자신의 신분과 상황을 설정",
+        "사건·증거 제시(촬영·포착 사실 고지)",
+        "사건·증거로 확증·협박 강화",
+        "금전·추후 지시로 합의 요구",
     ],
     # 필요하면 지침을 여기에 추가 가능:
     # "guideline": "긴급성·권위를 강조하고 절차 위주로 짧게 지시.",
@@ -76,6 +106,7 @@ def run_one(
         last_victim="",
         last_offender="",
     )
+    print(f"[Scenario Source] run_cycle constant → name='{case_scenario.get('name','')}', type='{case_scenario.get('type','')}'")
 
     case_id, total_turns = run_two_bot_simulation(db, req)
     return str(case_id), total_turns
@@ -102,10 +133,18 @@ def main():
         # ----------------------------
 
         # 공격자(오펜더) 목록: 기존처럼 활성화된 모든 오펜더 사용
+        # offenders: List[m.PhishingOffender] = (
+        #     db.query(m.PhishingOffender)
+        #     .filter(m.PhishingOffender.is_active.is_(True))
+        #     .order_by(m.PhishingOffender.id)
+        #     .all()
+        # )
+        # 필요 시 한 명만 고정해서 혼동 최소화 (예: id=1)
         offenders: List[m.PhishingOffender] = (
             db.query(m.PhishingOffender)
             .filter(m.PhishingOffender.is_active.is_(True))
             .order_by(m.PhishingOffender.id)
+            .limit(1)  # ← 한 명만
             .all()
         )
 

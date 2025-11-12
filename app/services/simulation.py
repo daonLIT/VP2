@@ -117,28 +117,38 @@ def _hit_end(text: str) -> bool:
 
 def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UUID, int]:
     # ── 케이스 준비 ─────────────────────────────────────
-    case_id_override: Optional[UUID] = getattr(req, "case_id_override", None)
+    # case_id_override: Optional[UUID] = getattr(req, "case_id_override", None)
+    # incoming_scenario: Dict[str, Any] = (
+    #     getattr(req, "case_scenario", None)
+    #     or getattr(req, "scenario", None)
+    #     or {}
+    # )
+
+    # if case_id_override:
+    #     case = db.get(m.AdminCase, case_id_override)
+    #     if not case:
+    #         raise ValueError(f"AdminCase {case_id_override} not found")
+    #     scenario = (case.scenario or {}).copy()
+    #     scenario.update(incoming_scenario)
+    #     case.scenario = scenario
+    #     db.add(case)
+    #     db.commit()
+    #     db.refresh(case)
+    # else:
+    #     case = m.AdminCase(scenario=incoming_scenario)
+    #     db.add(case)
+    #     db.commit()
+    #     db.refresh(case)
+    # 항상 "요청에서 온 시나리오"만 사용 (DB 시나리오 병합/읽기 금지)
     incoming_scenario: Dict[str, Any] = (
         getattr(req, "case_scenario", None)
         or getattr(req, "scenario", None)
         or {}
     )
-
-    if case_id_override:
-        case = db.get(m.AdminCase, case_id_override)
-        if not case:
-            raise ValueError(f"AdminCase {case_id_override} not found")
-        scenario = (case.scenario or {}).copy()
-        scenario.update(incoming_scenario)
-        case.scenario = scenario
-        db.add(case)
-        db.commit()
-        db.refresh(case)
-    else:
-        case = m.AdminCase(scenario=incoming_scenario)
-        db.add(case)
-        db.commit()
-        db.refresh(case)
+    case = m.AdminCase(scenario=incoming_scenario)
+    db.add(case)
+    db.commit()
+    db.refresh(case)
 
     offender = db.get(m.PhishingOffender, req.offender_id)
     victim   = db.get(m.Victim,          req.victim_id)
@@ -149,22 +159,24 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
 
     use_agent: bool = bool(getattr(req, "use_agent", False))
 
-    run_no_attr = getattr(req, "run_no", None)
-    if run_no_attr is None:
-        run_no_attr = getattr(req, "round_no", None)
+    # run_no_attr = getattr(req, "run_no", None)
+    # if run_no_attr is None:
+    #     run_no_attr = getattr(req, "round_no", None)
 
-    if case_id_override:
-        if run_no_attr is None:
-            last_run = (
-                db.query(func.max(m.ConversationLog.run))
-                .filter(m.ConversationLog.case_id == case.id)
-                .scalar()
-            )
-            run_no = int((last_run or 0) + 1)
-        else:
-            run_no = int(run_no_attr)
-    else:
-        run_no = int(run_no_attr or 1)
+    # if case_id_override:
+    #     if run_no_attr is None:
+    #         last_run = (
+    #             db.query(func.max(m.ConversationLog.run))
+    #             .filter(m.ConversationLog.case_id == case.id)
+    #             .scalar()
+    #         )
+    #         run_no = int((last_run or 0) + 1)
+    #     else:
+    #         run_no = int(run_no_attr)
+    # else:
+    #     run_no = int(run_no_attr or 1)
+    run_no_attr = getattr(req, "run_no", None) or getattr(req, "round_no", None)
+    run_no = int(run_no_attr or 1)
 
     cs: Dict[str, Any] = getattr(req, "case_scenario", None) or getattr(req, "scenario", None) or {}
     guidance_dict: Dict[str, Any] | None = getattr(req, "guidance", None)
@@ -197,7 +209,9 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
     attacks = replies = 0
     turns_executed = 0
 
-    scenario_all = (getattr(req, "case_scenario", None) or getattr(req, "scenario", None) or {}) if not case_id_override else (case.scenario or {})
+    # scenario_all = (getattr(req, "case_scenario", None) or getattr(req, "scenario", None) or {}) if not case_id_override else (case.scenario or {})
+    # 위에서 case.scenario = incoming_scenario 로 저장했으므로 동일
+    scenario_all = incoming_scenario
     steps: List[str] = (scenario_all.get("steps") or [])
     if not steps:
         raise ValueError("시나리오 steps가 비어 있습니다. request.case_scenario.steps 를 지정하세요.")
@@ -367,7 +381,7 @@ def run_two_bot_simulation(db: Session, req: ConversationRunRequest) -> Tuple[UU
     summarize_case(db, case.id)
 
     # ── JSON 파일 저장 ─────────────────────────────────
-    out_dir = getattr(settings, "SIM_OUTPUT_DIR", "runs_4")
+    out_dir = getattr(settings, "SIM_OUTPUT_DIR", "runs_몸캠")
     os.makedirs(out_dir, exist_ok=True)
     fname = os.path.join(out_dir, f"sim_{case.id}_run{run_no}.json")
     with open(fname, "w", encoding="utf-8") as f:

@@ -135,51 +135,54 @@ export function useSimStream(
               setSimulationState?.("RUNNING");
 
               turns.forEach((turn, idx) => {
-                const role = (turn.role || "offender").toLowerCase();
-                const key = `conv:${Date.now()}:${idx}:${role}`;
+  const role = (turn.role || "offender").toLowerCase();
+  const key = `conv:${Date.now()}:${idx}:${role}`;
 
-                if (seenTurnsRef.current.has(key)) return;
-                seenTurnsRef.current.add(key);
+  if (seenTurnsRef.current.has(key)) return;
+  seenTurnsRef.current.add(key);
 
-                const raw = turn.text || "";
-                let text = "";
+  const raw = turn.text || "";
+  let text = "";
 
-                if (role === "victim") {
-                  try {
-                    const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
-                    const match = cleaned.match(/\{[\s\S]*\}/);
-                    if (match) {
-                      const parsed = JSON.parse(match[0]);
-                      text = parsed.dialogue || parsed.text || "";
-                    } else {
-                      text = raw;
-                    }
-                  } catch {
-                    text = raw;
-                  }
-                } else {
-                  text = raw;
-                }
+  if (role === "victim") {
+    try {
+      const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
+      const match = cleaned.match(/\{[\s\S]*\}/);
 
-                const side = role === "offender" ? "left" : "right";
-                const label =
-                  role === "offender"
-                    ? (selectedScenario?.name || "피싱범")
-                    : (selectedCharacter?.name || "피해자");
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        text = JSON.stringify(parsed);     // ⭐ JSON 전체 유지!!
+      } else {
+        text = raw;
+      }
+    } catch {
+      text = raw;
+    }
+  } else {
+    text = raw;
+  }
 
-                const newMsg = {
-                  type: "chat",
-                  sender: role,
-                  role,
-                  side,
-                  content: text,
-                  timestamp: new Date().toLocaleTimeString(),
-                  turn: idx,
-                };
+  const side = role === "offender" ? "left" : "right";
+  const label =
+    role === "offender"
+      ? (selectedScenario?.name || "피싱범")
+      : (selectedCharacter?.name || "피해자");
 
-                setLocalMessages((prev) => [...prev, newMsg]);
-                setMessages?.((prev) => [...prev, newMsg]);
-              });
+  const newMsg = {
+    type: "chat",
+    role,
+    sender: role,
+    side,
+    text: text,
+    content: text,
+    timestamp: new Date().toISOString(),
+    turn: idx,
+  };
+
+  setLocalMessages((prev) => [...prev, newMsg]);
+  setMessages?.((prev) => [...prev, newMsg]);
+});
+
 
               setProgress?.((p) => Math.min(100, (typeof p === "number" ? p : 0) + 10));
             }

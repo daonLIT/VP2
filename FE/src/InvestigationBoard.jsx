@@ -180,29 +180,30 @@ function GuidanceBlock({ guidance, theme }) {
   const expected_effect = guidance.expected_effect;
 
   const TOOLTIP_MAP = {
-    A: "어휘/어조 조절: 피해자 수준에 맞는 언어 사용",
-    B: "긴급성 강조: 시간 압박을 통한 판단력 흐림",
-    C: "감정적 접근: 두려움, 책임감, 걱정 자극",
-    D: "전문성 연출: 용어, 절차, 공식성 강조",
-    E: "점진적 요구: 단계별 정보 수집 전략",
-    F: "의심 무마: 보안 우려 해소, 정당성 강조",
-    G: "사칭 다변화: 인물/기관 변경으로 신뢰성 증대",
-    H: "수법 복합화: 여러 피싱 기법 조합 활용",
-    I: "심리적 압박: 위협, 협박을 통한 강제성",
-    J: "격리 및 통제: 외부 접촉 차단, 물리적/심리적 고립 유도",
-    K: "카드배송-검사사칭 연계형: 카드기사 사칭 → 가짜센터 연결 → 원격제어 앱 유도",
-    L: "납치빙자형 극단적 공포: 가족 음성 모방 + 협박으로 즉시 송금 유도",
-    M: "홈캠 해킹 협박형: 사생활 노출 위협 + 개인정보 활용",
-    N: "공신력 기관 사칭: 정부·시청·군부대 등 명분으로 선입금 유도",
-    O: "가족사칭 정보수집: 비밀번호 설정 도움 명목으로 정보 탈취",
-    P: "허위계약서 작성유도: 검사 사칭 → 계약서로 해제 유도",
-    Q: "국세청 사칭 세무협박: 세금 미납·포탈 위협으로 송금 유도",
-    R: "격리형 장기통제: 보호조사 명목으로 고립 및 통제",
-    S: "권위 편향 활용: 금융기관/전문가 신분으로 신뢰 유도",
-    T: "손실 회피 심리: 채무 해결/금리 인하 제시로 절박함 자극",
-    U: "희소성 효과 조성: ‘오늘만’ 등으로 즉흥 결정 유도",
-    V: "휴리스틱 의존 악용: 익숙한 절차·패턴으로 의심 차단",
-    W: "2차 피해 암시: 비협조 시 추가 피해 암시로 압박",
+     A: "어휘/어조 조절 - 피해자 수준에 맞는 언어 사용",
+    B: "긴급성 강조 - 시간 압박을 통한 판단력 흐림",
+    C: "감정적 접근 - 두려움, 책임감, 걱정 자극",
+    D: "전문성 연출 - 용어, 절차, 공식성 강조",
+    E: "점진적 요구 - 단계별 정보 수집 전략",
+    F: "의심 무마 - 보안 우려 해소, 정당성 강조",
+    G: "사칭 다변화 - 인물/기관 변경으로 신뢰성 증대",
+    H: "수법 복합화 - 여러 피싱 기법 조합 활용",
+    I: "심리적 압박 - 위협, 강제성 조성",
+    J: "격리 및 통제 - 외부 접촉 차단, 고립 유도",
+
+    K: "카드배송-검사사칭 연계형 - 가짜 기사 → 고객센터 사칭 → 원격제어 앱 → 검사청 확대",
+    L: "납치빙자형 극단적 공포 - 가족 음성 모방 + 협박으로 즉시 송금 유도",
+    M: "홈캠 해킹 협박형 - 영상·개인정보 노출 위협",
+    N: "공신력 기관 사칭 - 공적 명분 + 선입금 요구",
+    O: "가족사칭 정보수집 - 비밀번호 등 민감정보 수집",
+    P: "허위계약서 작성유도 - 검사 사칭 후 개인정보·계좌 동시 탈취",
+    Q: "국세청 사칭 세무협박 - 세금 불이행 위협",
+    R: "격리형 장기통제 - 고립 → 새폰 개통 → 원격제어",
+    S: "권위 편향 활용 - 정부/금융기관 권위로 설득",
+    T: "손실 회피 심리 - 금리 인하·혜택 강조",
+    U: "희소성 효과 - ‘오늘만 가능’ 등 시간 압박",
+    V: "휴리스틱 의존 악용 - 익숙한 절차로 속임",
+    W: "2차 피해 암시 - 협조 거부 시 추가 문제 암시",
   };
 
   return (
@@ -217,7 +218,7 @@ function GuidanceBlock({ guidance, theme }) {
               {categories.map((cat, i) => (
                 <span
                   key={i}
-                  className="relative group px-2 py-1 rounded text-xs font-mono font-bold"
+                  className="relative group px-2 py-1 rounded text-xs font-mono font-bold cursor-help"
                   style={{
                     backgroundColor: "#A855F720",
                     color: theme.purple,
@@ -225,16 +226,12 @@ function GuidanceBlock({ guidance, theme }) {
                   }}
                 >
                   {cat}
+
+                  {/* Tooltip */}
                   <div
-                    className="absolute hidden group-hover:block bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 rounded text-[11px]"
-                    style={{
-                      backgroundColor: theme.panel,
-                      color: theme.text,
-                      border: `1px solid ${theme.border}`,
-                      whiteSpace: "nowrap",
-                    }}
+                    className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 rounded-lg text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition bg-black bg-opacity-80 text-white z-50"
                   >
-                    {TOOLTIP_MAP[cat]}
+                    {TOOLTIP_MAP[cat] || "설명 없음"}
                   </div>
                 </span>
               ))}

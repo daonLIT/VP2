@@ -88,6 +88,47 @@ const SimulatorPage = ({
     selectedCharacter,
   });  
   
+  // ----------------------------------------------------------
+  // 🧩 메시지 정규화 유틸 (백엔드 turn → MessageBubble 형태로)
+  // ----------------------------------------------------------
+  // const convertTurnToMessage = (turn) => {
+  //   if (!turn) return null;
+
+  //   const sender =
+  //     turn.sender ||
+  //     turn.role ||
+  //     (turn.meta?.sender ?? "").toLowerCase() ||
+  //     "system";
+
+  //   let content = turn.text || turn.content || "";
+
+  //   // 🔥 피해자 메시지는 JSON일 수 있음 → 파싱 시도
+  //   if (sender === "victim") {
+  //     try {
+  //       const parsed = JSON.parse(content);
+  //       content = {
+  //         dialogue: parsed.dialogue ?? "",
+  //         thoughts: parsed.thoughts ?? null,
+  //         is_convinced: parsed.is_convinced ?? null,
+  //       };
+  //     } catch {
+  //       // JSON이 아닐 경우 text 그대로
+  //       content = { dialogue: content };
+  //     }
+  //   } else {
+  //     // 공격자/시스템 발화는 문자열로 처리
+  //     content = { dialogue: content };
+  //   }
+
+  //   return {
+  //     sender,
+  //     content,
+  //     timestamp: new Date().toISOString(),
+  //     type: "chat",
+  //     _kind: "chat",
+  //   };
+  // };
+
   /* ----------------------------------------------------------
    🧩 상태
   ---------------------------------------------------------- */
@@ -252,19 +293,59 @@ const SimulatorPage = ({
   const countChatMessagesLocal = (msgs = []) =>
     msgs.filter((m) => (m?.type ?? m?._kind) === "chat").length;
 
-  // 메시지 표준화 - 백엔드에서 받은 메시지 구조를 UI에서 쓰기 좋은 형태로 변환해주는 유틸 함수
-  const normalizeMessage = (m) => {
-    const role = (m?.sender || m?.role || "").toLowerCase();
-    return {
-      ...m,
-      sender: role,             // ← MessageBubble이 이걸 씀
-      role: role,
-      label:
-        role === "offender" ? "피싱범" : role === "victim" ? "피해자" : "시스템",
-      side: role === "offender" ? "left" : role === "victim" ? "right" : "center",
-      _kind: "chat",
-    };
+  // 🧩 SimulatorPage 내부에 넣을 normalizeMessage (완성형)
+const normalizeMessage = (m) => {
+  if (!m) return null;
+
+  // 1) role 통일
+  const role = (m.role || "").toLowerCase();
+
+  // 2) timestamp 보정
+  const timestamp = m.timestamp ?? new Date().toISOString();
+
+  // 3) raw text는 backend 구조 상 반드시 m.text
+  const raw = typeof m.text === "string" ? m.text : "";
+
+  let content = raw;
+
+  // 4) 피해자 메시지(JSON 문자열 처리)
+  if (role === "victim") {
+    const trimmed = raw.trim();
+
+    // JSON 여러 줄 대응 → 앞뒤 {}로만 체크
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+      try {
+        const p = JSON.parse(trimmed);
+        content = {
+          dialogue: p.dialogue ?? "",
+          thoughts: p.thoughts ?? null,
+          is_convinced: p.is_convinced ?? null,
+        };
+      } catch (err) {
+        console.warn("⚠ victim JSON parsing failed:", trimmed);
+        // 실패 시 그냥 문자열로 처리
+        content = raw;
+      }
+    }
+  }
+
+  return {
+    id: crypto.randomUUID(),
+    role,
+    sender: role,
+    timestamp,
+    _kind: "chat",
+
+    // UI가 사용하는 통일된 content 값
+    content,
+
+    side: role === "victim" ? "right" : role === "offender" ? "left" : "center",
+    label: role === "victim" ? "피해자" : role === "offender" ? "피싱범" : "시스템",
   };
+};
+
+
+
 
   const hasChatLog = useMemo(
     () => countChatMessagesLocal(messages) > 0,
@@ -709,13 +790,13 @@ const SimulatorPage = ({
                         />
                       )}
                       {messages
-                        ?.filter(m => {
+                        ?.filter((m) => {
                           const msgType = m?.type || m?._kind;
-                          // chat 타입만 표시 (system, log 등은 제외)
                           return msgType === "chat" || msgType === "message";
                         })
                         .map((m, idx) => {
                           const nm = normalizeMessage(m);
+                          
                           return (
                             <MessageBubble
                               key={`${nm.role ?? "unknown"}-${nm.timestamp ?? Date.now()}-${idx}`}
@@ -728,8 +809,7 @@ const SimulatorPage = ({
                               COLORS={THEME}
                             />
                           );
-                        })
-                      }
+                        })}
                     </div>
 
                     {/* 오른쪽: 로그 / 분석 */}

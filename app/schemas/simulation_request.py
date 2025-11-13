@@ -85,7 +85,7 @@ class SimulationStartRequest(BaseModel):
     max_turns: int = Field(default=15, ge=1, le=30)
 
     # 🔧 라운드/케이스 제어
-    round_limit: Optional[int] = 3              # 오케스트레이터가 2~5로 클램프
+    round_limit: Optional[int] = 3              # 오케스트레이터가 2~3로 클램프
     case_id_override: Optional[str] = None      # 같은 케이스로 이어갈 때 사용(2라운드~)
     round_no: Optional[int] = 1                 # 현재 라운드(로그/디버깅 목적)
 
@@ -145,7 +145,7 @@ class SimulationStartRequest(BaseModel):
 
         # 라운드 범위 클램프 (2~5)
         if self.round_limit is not None:
-            self.round_limit = max(2, min(int(self.round_limit), 5))
+            self.round_limit = max(2, min(int(self.round_limit), 3))
 
         if self.round_no is not None:
             self.round_no = max(1, int(self.round_no))

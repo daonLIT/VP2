@@ -793,103 +793,120 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             # ★★★ 전체 케이스 미션 구성 (동적 라운드)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             case_mission = f"""
-[보이스피싱 시뮬레이션 케이스 전체 실행]
-
-당신의 임무는 최대 {max_rounds}라운드까지의 보이스피싱 시뮬레이션 케이스를 완료하는 것이다.
+당신은 보이스피싱 시뮬레이션 케이스를 최대 {max_rounds}라운드까지 실행하는 에이전트입니다.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【라운드1 실행】
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. sim.fetch_entities 호출
-   - offender_id: {offender_id}
-   - victim_id: {victim_id}
-
-2. sim.compose_prompts 호출
-   - ★★★ Action Input 형식: {{"data": {{"scenario": "...", "victim_profile": "...", "round_no": 1}}}}
-   - ★ guidance 필드는 절대 포함하지 말 것 (라운드1이므로)
-   
-3. mcp.simulator_run 호출
-   - ★ 이 도구는 data 래핑 없이 최상위에 직접 필드를 넣음
-   - ★ guidance 필드는 절대 포함하지 말 것
-   - max_turns: {req.max_turns}
-   
-4. admin.make_judgement 호출
-   - ★★★ Action Input 형식: {{"data": {{"case_id": "...", "run_no": 1, "turns": [...]}}}}
-   - ★★★ run_no는 반드시 1이어야 함
-
-5. 라운드1 판정 결과 확인:
-   - risk.level == "critical" → 【케이스 종료】로 이동
-   - 그 외 → 6단계 진행
-
-6. admin.generate_guidance 호출 (라운드2용 가이던스 생성)
-   - ★★★ Action Input 형식: {{"data": {{"case_id": "...", "run_no": 1, "data.type": "A", ...}}}}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【라운드 2~{max_rounds} 반복 실행】
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-각 라운드 N (N = 2, 3, 4, 5...)에 대해 다음을 수행:
-
-7-N-1. sim.compose_prompts 호출
-   - ★★★ Action Input 형식: {{"data": {{"scenario": "...", "victim_profile": "...", "round_no": N, "guidance": {{"type": "A", "text": "..."}}}}}}
-   - case_id: (라운드1에서 받은 case_id)
-   - round_no: N (현재 라운드 번호)
-   - guidance: (이전 라운드에서 생성한 가이던스)
-   
-7-N-2. mcp.simulator_run 호출
-   - case_id_override: (라운드1 case_id)
-   - round_no: N
-   - guidance: (이전 라운드 가이던스)
-   
-7-N-3. admin.make_judgement 호출
-   - ★★★ Action Input 형식: {{"data": {{"case_id": "...", "run_no": N, "turns": [...]}}}}
-   - ★★★ run_no는 반드시 현재 라운드 번호 N과 일치해야 함
-   - 예: 라운드2면 run_no=2, 라운드3이면 run_no=3, 라운드4면 run_no=4, 라운드5면 run_no=5
-
-7-N-4. 판정 결과 확인:
-   - risk.level == "critical" → 【케이스 종료】로 이동
-   - 현재 라운드 N == {max_rounds} → 【케이스 종료】로 이동
-   - 그 외 → 7-N-5 진행
-
-7-N-5. admin.generate_guidance 호출 (다음 라운드용)
-   - ★★★ Action Input 형식: {{"data": {{"case_id": "...", "run_no": N, "data.type": "A", ...}}}}
-   - run_no: 현재 라운드 N
-   - 다음 라운드 N+1을 위한 가이던스 생성
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【케이스 종료】
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-8. admin.make_prevention 호출
-   - ★★★ Action Input 형식: {{"data": {{"case_id": "...", "rounds": N, "turns": [...], "judgements": [...], "guidances": [...]}}}}
-   - turns: 모든 라운드의 대화 내역을 하나의 배열로 통합
-   - judgements: 모든 라운드의 판정 결과 배열
-   - guidances: 사용된 모든 가이던스 배열
-   - ★ 도구 내부에서 자동으로 데이터 타입을 정규화하므로 형식 걱정 불필요
-
-9. admin.save_prevention 호출
-   - 8단계 결과 저장
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ 중요 규칙 (문제 1, 2 해결)
+【실행 단계】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-【문제 1 해결: Pydantic 에러 방지】
-- sim.compose_prompts 호출 시 반드시 {{"data": {{...}}}} 형식 사용
-- 라운드1: guidance 필드 절대 포함 금지
-- 라운드2~{max_rounds}: guidance 필드 필수 포함
+단계 1: 엔티티 가져오기
+- 도구: sim.fetch_entities
+- 입력: {{"data": {{"offender_id": {offender_id}, "victim_id": {victim_id}}}}}
+- 저장: scenario, victim_profile
 
-【문제 2 해결: run_no 정확성】
-- admin.make_judgement의 run_no는 해당 라운드 번호와 정확히 일치해야 함
-- 라운드1 → run_no=1
-- 라운드2 → run_no=2
-- 라운드3 → run_no=3
-- 라운드4 → run_no=4
-- 라운드5 → run_no=5
+단계 2: 프롬프트 생성 (라운드1)
+- 도구: sim.compose_prompts
+- 입력: {{"data": {{"scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>, "round_no": 1}}}}
+- 주의: guidance 필드 포함 금지
+- 저장: attacker_prompt, victim_prompt
 
-▼ 도구별 Action Input 규칙 요약
+단계 3: 시뮬레이션 실행 (라운드1)
+- 도구: mcp.simulator_run
+- 주의: data 래핑 없이 최상위 JSON만 사용
+- 입력 필드:
+  * offender_id: {offender_id}
+  * victim_id: {victim_id}
+  * scenario: <1단계 scenario>
+  * attacker_prompt: <2단계 결과>
+  * victim_prompt: <2단계 결과>
+  * max_turns: {req.max_turns}
+  * round_no: 1
+- 저장: case_id, turns
+
+단계 4: 판정 (라운드1)
+- 도구: admin.make_judgement
+- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": <3단계 turns>}}}}
+- 확인: risk.level이 "critical"이면 단계 8로 이동
+- 저장: 판정 결과
+
+단계 5: 가이던스 생성 (라운드2용)
+- 도구: admin.generate_guidance
+- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
+- 저장: guidance_round2
+
+단계 6: 프롬프트 생성 (라운드N, N=2~{max_rounds})
+- 도구: sim.compose_prompts
+- 입력: {{"data": {{"scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>, "round_no": N, "guidance": <이전단계 guidance>}}}}
+- 저장: attacker_prompt, victim_prompt
+
+단계 7: 시뮬레이션 실행 (라운드N)
+- 도구: mcp.simulator_run
+- 입력 필드:
+  * offender_id: {offender_id}
+  * victim_id: {victim_id}
+  * scenario: <1단계 scenario>
+  * attacker_prompt: <6단계 결과>
+  * victim_prompt: <6단계 결과>
+  * max_turns: {req.max_turns}
+  * round_no: N
+  * case_id_override: <3단계 case_id>
+  * guidance: <이전단계 guidance>
+- 저장: turns
+
+단계 8: 판정 (라운드N)
+- 도구: admin.make_judgement
+- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": N, "turns": <7단계 turns>}}}}
+- 확인: 
+  * risk.level == "critical" → 단계 10으로
+  * N == {max_rounds} → 단계 10으로
+  * 그 외 → 단계 9로
+
+단계 9: 가이던스 생성 (다음 라운드용)
+- 도구: admin.generate_guidance
+- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": N, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
+- 저장 후 단계 6으로
+
+단계 10: 예방책 생성
+- 도구: admin.make_prevention
+- 입력: {{"data": {{"case_id": <case_id>, "rounds": <완료라운드수>, "turns": <모든turns통합>, "judgements": <모든judgement>, "guidances": <모든guidance>}}}}
+
+단계 11: 예방책 저장
+- 도구: admin.save_prevention
+- 입력: {{"data": {{"case_id": <case_id>, "offender_id": {offender_id}, "victim_id": {victim_id}, "run_no": <마지막라운드>, "summary": <10단계결과>, "steps": <10단계결과>}}}}
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-- [mcp.simulator_run] 최상위 언랩 JSON (data 래핑 없음)
-- [admin.*] {{"data": {{...}}}} 래핑 필수
-- [sim.*] {{"data": {{...}}}} 래핑 필수
+【중요 규칙】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 변수 재사용
+   - 1단계의 scenario, victim_profile은 모든 라운드에서 동일하게 사용
+   - 3단계의 case_id는 모든 후속 단계에서 동일하게 사용
+
+2. run_no 규칙
+   - 라운드1 → run_no=1
+   - 라운드2 → run_no=2
+   - 라운드N → run_no=N
+
+3. 도구별 입력 형식
+   - mcp.simulator_run: data 래핑 없음 (최상위 JSON)
+   - 나머지 모든 도구: {{"data": {{...}}}} 형식
+
+4. Action Input 작성
+   - 반드시 한 줄로 작성
+   - 줄바꿈, 들여쓰기, 주석 금지
+   - 예: {{"data": {{"field": "value"}}}}
+
+5. attacker_prompt, victim_prompt 처리
+   - sim.compose_prompts 결과를 그대로 사용
+   - 따옴표 이스케이프 불필요 (도구가 자동 처리)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【실행 흐름】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+라운드1: 1→2→3→4→5
+라운드2~N: 6→7→8→9 (critical 아니고 max_rounds 미만이면 반복)
+종료: 10→11
 """
 
             logger.info("[CaseMission] 전체 케이스 미션 시작")

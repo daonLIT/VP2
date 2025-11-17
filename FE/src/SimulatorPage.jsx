@@ -188,10 +188,10 @@ const SimulatorPage = ({
     }
 
     // 2) 숫자 보정(백엔드가 int 기대 시)
-    const scenarioId = Number(selectedScenario.id);
+    const offenderId = Number(selectedScenario.id);
     const victimId   = Number(selectedCharacter.id);
-    if (!Number.isFinite(scenarioId) || !Number.isFinite(victimId)) {
-      console.error("❌ ID 타입이 숫자가 아님:", { scenarioId, victimId });
+    if (!Number.isFinite(offenderId) || !Number.isFinite(victimId)) {
+      console.error("❌ ID 타입이 숫자가 아님:", { offenderID, victimId });
       return;
     }
 
@@ -199,9 +199,8 @@ const SimulatorPage = ({
 
     // 3) 절대 임의 기본값(1) 사용 금지: 정확한 JSON만 전송
     start({
-      offender_id: 1,
+      offender_id: offenderId,
       victim_id: victimId,
-      scenario_id: scenarioId,
     });
   } catch (err) {
     console.error("SimulatorPage 실행 중 오류:", err);

@@ -1,3 +1,4 @@
+// src/SimulatorPage.jsx
 import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import {
   Play,
@@ -5,7 +6,6 @@ import {
   FileBarChart2,
   Terminal,
   Lightbulb,
-  Home,
 } from "lucide-react";
 import HudBar from "./HudBar";
 import Badge from "./Badge";
@@ -16,12 +16,12 @@ import SpinnerMessage from "./SpinnerMessage";
 import CustomCharacterCreate from "./CustomCharacterCreate";
 import TTSModal from "./components/TTSModal";
 import CustomScenarioButton from "./CustomScenarioButton";
-import CustomScenarioModal from "./CustomScenarioModal";
+// import CustomScenarioModal from "./CustomScenarioModal";
 import TerminalLog from "./components/TerminalLog";
 import InvestigationBoard from "./InvestigationBoard";
-//import InlinePhishingSummaryBox from "./InlinePhishingSummaryBox";
 import { THEME as BASE_THEME } from "./constants/colors";
-import { useSimStream } from "./hooks/useSimStream";
+// ❌ 더 이상 useSimStream 안 씀
+// import { useSimStream } from "./hooks/useSimStream";
 
 const SIMPLE_BOARD_MODE = false;
 
@@ -46,88 +46,49 @@ const countChatMessages = (messages = []) =>
 const SimulatorPage = ({
   COLORS,
   setCurrentPage,
+
   selectedScenario,
   setSelectedScenario,
   selectedCharacter,
   setSelectedCharacter,
+
   simulationState,
-  //messages,
-  setMessages, // ✅ 추가: 외부에서 messages state 관리 중
+  messages,          // ✅ App에서 올라온 messages 사용
+  setMessages,
+
   sessionResult,
   progress,
   setProgress,
-  //startSimulation,
-  startAgentRun,
-  declineAgentRun,
+
   scenarios,
   characters,
   scrollContainerRef: injectedScrollContainerRef,
   addSystem,
-  pendingAgentDecision,
+  // pendingAgentDecision,
   showReportPrompt,
   setShowReportPrompt,
   hasInitialRun,
-  hasAgentRun,
-  agentRunning,
-  agentVerbose,
-  setAgentVerbose,
+  // hasAgentRun,
+  // agentRunning,
+  // agentVerbose,
+  // setAgentVerbose,
   boardDelaySec = 3,
   intermissionSec = 3,
   logTickMs = 200,
   victimImageUrl,
+
+  // ✅ App(useSimStream)에서 내려주는 SSE 관련 props
+  streamStart,
+  streamStop,
+  streamRunning,
+  streamLogs,
+  judgements,
+  guidances,
+  preventions,
 }) => {
-  //SSE 이벤트 실행 트리거
-  const {
-    logs, messages, start, running, judgements, guidances, preventions
-  } = useSimStream(setMessages, {
-    // 필요 시 넣을 수 있는 콜백/상태 전달 (옵션)
-    addSystem,                 // 있으면 전달
-    setProgress,               // 있으면 전달
-    // 🔴 필수: 선택된 값 전달
-    selectedScenario,
-    selectedCharacter,
-  });  
-  
-  // ----------------------------------------------------------
-  // 🧩 메시지 정규화 유틸 (백엔드 turn → MessageBubble 형태로)
-  // ----------------------------------------------------------
-  // const convertTurnToMessage = (turn) => {
-  //   if (!turn) return null;
-
-  //   const sender =
-  //     turn.sender ||
-  //     turn.role ||
-  //     (turn.meta?.sender ?? "").toLowerCase() ||
-  //     "system";
-
-  //   let content = turn.text || turn.content || "";
-
-  //   // 🔥 피해자 메시지는 JSON일 수 있음 → 파싱 시도
-  //   if (sender === "victim") {
-  //     try {
-  //       const parsed = JSON.parse(content);
-  //       content = {
-  //         dialogue: parsed.dialogue ?? "",
-  //         thoughts: parsed.thoughts ?? null,
-  //         is_convinced: parsed.is_convinced ?? null,
-  //       };
-  //     } catch {
-  //       // JSON이 아닐 경우 text 그대로
-  //       content = { dialogue: content };
-  //     }
-  //   } else {
-  //     // 공격자/시스템 발화는 문자열로 처리
-  //     content = { dialogue: content };
-  //   }
-
-  //   return {
-  //     sender,
-  //     content,
-  //     timestamp: new Date().toISOString(),
-  //     type: "chat",
-  //     _kind: "chat",
-  //   };
-  // };
+  // logs / running 은 props로 받은 걸 로컬 변수로 정리
+  const logs = streamLogs ?? [];
+  const running = !!streamRunning;
 
   /* ----------------------------------------------------------
    🧩 상태
@@ -135,7 +96,7 @@ const SimulatorPage = ({
   const needScenario = !selectedScenario;
   const needCharacter = !selectedCharacter;
 
-  // ✅ [1] 시뮬레이션 버튼 표시 여부 제어용 상태 추가
+  // 시뮬레이션 시작 버튼 표시 여부
   const [showStartButton, setShowStartButton] = useState(true);
 
   const [selectedTag, setSelectedTag] = useState(null);
@@ -144,17 +105,6 @@ const SimulatorPage = ({
   const [customVictims, setCustomVictims] = useState([]);
   const [openTTS, setOpenTTS] = useState(false);
 
-  // guidance / prevention 도 동일 패턴으로 가드
-  const normalizedGuidance = useMemo(() => {
-    const ev = guidances?.event ?? guidances;
-    return ev?.content ?? ev ?? null;
-  }, [guidances]);
-
-  const normalizedPrevention = useMemo(() => {
-    const ev = preventions?.event ?? preventions;
-    return ev?.content ?? ev ?? null;
-  }, [preventions]);
-
   // 🎯 스크롤/탭/보드 상태
   const localScrollContainerRef = useRef(null);
   const scrollRef = injectedScrollContainerRef ?? localScrollContainerRef;
@@ -162,9 +112,9 @@ const SimulatorPage = ({
   const [showBoardContent, setShowBoardContent] = useState(false);
 
   // 1️⃣ 분석 데이터 준비 여부 체크
-  const hasJudgement = judgements.length > 0;
-  const hasGuidance = guidances.length > 0;
-  const hasPrevention = preventions.length > 0;
+  const hasJudgement = Array.isArray(judgements) && judgements.length > 0;
+  const hasGuidance = Array.isArray(guidances) && guidances.length > 0;
+  const hasPrevention = Array.isArray(preventions) && preventions.length > 0;
   const hasAnyAgentData = hasJudgement || hasGuidance || hasPrevention;
 
   // 2️⃣ 데이터가 오면 자동으로 보드 활성화
@@ -174,66 +124,49 @@ const SimulatorPage = ({
     }
   }, [hasAnyAgentData, showBoardContent]);
 
-  // ✅ SSE 스트림 실행 + handleStartStream 실행 시 버튼 숨김 처리 추가
+  // ✅ SSE 스트림 실행 + 버튼 숨김
   const handleStartStream = useCallback(() => {
-  try {
-    // 1) 존재 검증
-    if (!selectedScenario || !selectedScenario.id) {
-      console.error("❌ 시나리오 미선택/ID 없음:", selectedScenario);
-      return;
+    try {
+      if (!selectedScenario || !selectedScenario.id) {
+        console.error("❌ 시나리오 미선택/ID 없음:", selectedScenario);
+        return;
+      }
+      if (!selectedCharacter || !selectedCharacter.id) {
+        console.error("❌ 캐릭터 미선택/ID 없음:", selectedCharacter);
+        return;
+      }
+
+      const offenderId = Number(selectedScenario.id);
+      const victimId = Number(selectedCharacter.id);
+      if (!Number.isFinite(offenderId) || !Number.isFinite(victimId)) {
+        console.error("❌ ID 타입이 숫자가 아님:", { offenderId, victimId });
+        return;
+      }
+
+      setShowStartButton(false);
+
+      // ✅ 여기서는 로컬 useSimStream이 아니라 App의 streamStart 호출
+      streamStart?.({
+        offender_id: offenderId,
+        victim_id: victimId,
+      });
+    } catch (err) {
+      console.error("SimulatorPage 실행 중 오류:", err);
     }
-    if (!selectedCharacter || !selectedCharacter.id) {
-      console.error("❌ 캐릭터 미선택/ID 없음:", selectedCharacter);
-      return;
-    }
+  }, [streamStart, selectedScenario, selectedCharacter]);
 
-    // 2) 숫자 보정(백엔드가 int 기대 시)
-    const offenderId = Number(selectedScenario.id);
-    const victimId   = Number(selectedCharacter.id);
-    if (!Number.isFinite(offenderId) || !Number.isFinite(victimId)) {
-      console.error("❌ ID 타입이 숫자가 아님:", { offenderID, victimId });
-      return;
-    }
-
-    setShowStartButton(false);
-
-    // 3) 절대 임의 기본값(1) 사용 금지: 정확한 JSON만 전송
-    start({
-      offender_id: offenderId,
-      victim_id: victimId,
-    });
-  } catch (err) {
-    console.error("SimulatorPage 실행 중 오류:", err);
-  }
-}, [start, selectedScenario, selectedCharacter]);
-
-
-  /* ✅ 새 메시지 들어올 때 자동 스크롤 유지 */
-  // useEffect(() => {
-  //   const el = scrollRef.current;
-  //   if (!el) return;
-  //   // 🎯 시나리오/캐릭터 선택 중에는 항상 맨 위로
-  //   if (needScenario || needCharacter) {
-  //     el.scrollTop = 0;
-  //     return;
-  //   }
-  //   // 🎯 시뮬레이션 대화 중에는 맨 아래로 자동 이동
-  //   el.scrollTop = el.scrollHeight;
-  // }, [messages, needScenario, needCharacter]);
-
-  // 자동 스크롤 (간단 버전)
+  // 자동 스크롤
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    // 🎯 시나리오/캐릭터 선택 중에는 항상 맨 위로 고정
+
     if (needScenario || needCharacter) {
       el.scrollTop = 0;
       return;
     }
 
-    // 🎯 대화 중일 때만 아래로 자동 스크롤
     el.scrollTop = el.scrollHeight;
-  }, [messages, needScenario, needCharacter]);
+  }, [messages, needScenario, needCharacter, scrollRef]);
 
   // json 출력
   const JsonBlock = ({ title = "", obj, theme }) => {
@@ -251,10 +184,7 @@ const SimulatorPage = ({
         }}
       >
         {title && (
-          <div
-            className="font-semibold mb-2"
-            style={{ color: theme.sub }}
-          >
+          <div className="font-semibold mb-2" style={{ color: theme.sub }}>
             {title}
           </div>
         )}
@@ -262,93 +192,59 @@ const SimulatorPage = ({
       </div>
     );
   };
-  // judgement 구조가 {type:'judgement', event:{...}} 일 수도/아닐 수도 있으니 통합
-  const normalizedJudgement = useMemo(() => {
-    const ev = judgements?.event ?? judgements;
-    const raw = ev?.content ?? ev;
-    if (!raw || typeof raw !== "object") return null;
-    return {
-      case_id: raw.case_id,
-      run_no: raw.run_no,
-      phishing: raw.phishing,
-      risk: raw.risk,                 // { score, level, rationale }
-      continue: raw["continue"],         // { recommendation, reason }
-      evidence: raw.evidence,         // string
-      victim_vulnerabilities: raw.victim_vulnerabilities, // string[]
-      ok: raw.ok,
-      persisted: raw.persisted,
-    };
-  }, [judgements]);
 
-  // ✅ applied_guidance 추출
-  const appliedGuidance = useMemo(() => {
-    return (
-      judgements?.meta?.scenario?.enhancement_info?.applied_guidance ??
-      "지침 데이터 없음"
-    );
-  }, [judgements]);
-
-  // 진행률 계산에 쓰는 로컬 카운터(선언을 hasChatLog보다 위에 둠)
+  // 진행률 계산에 쓰는 로컬 카운터
   const countChatMessagesLocal = (msgs = []) =>
     msgs.filter((m) => (m?.type ?? m?._kind) === "chat").length;
 
-  // 🧩 SimulatorPage 내부에 넣을 normalizeMessage (완성형)
-const normalizeMessage = (m) => {
-  if (!m) return null;
+  // 🧩 Message 정규화
+  const normalizeMessage = (m) => {
+    if (!m) return null;
 
-  // 1) role 통일
-  const role = (m.role || "").toLowerCase();
+    const role = (m.role || "").toLowerCase();
+    const timestamp = m.timestamp ?? new Date().toISOString();
+    const raw = typeof m.text === "string" ? m.text : m.content ?? "";
 
-  // 2) timestamp 보정
-  const timestamp = m.timestamp ?? new Date().toISOString();
+    let content = raw;
 
-  // 3) raw text는 backend 구조 상 반드시 m.text
-  const raw = typeof m.text === "string" ? m.text : "";
-
-  let content = raw;
-
-  // 4) 피해자 메시지(JSON 문자열 처리)
-  if (role === "victim") {
-    const trimmed = raw.trim();
-
-    // JSON 여러 줄 대응 → 앞뒤 {}로만 체크
-    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-      try {
-        const p = JSON.parse(trimmed);
-        content = {
-          dialogue: p.dialogue ?? "",
-          thoughts: p.thoughts ?? null,
-          is_convinced: p.is_convinced ?? null,
-        };
-      } catch (err) {
-        console.warn("⚠ victim JSON parsing failed:", trimmed);
-        // 실패 시 그냥 문자열로 처리
-        content = raw;
+    if (role === "victim") {
+      const trimmed = String(raw || "").trim();
+      if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        try {
+          const p = JSON.parse(trimmed);
+          content = {
+            dialogue: p.dialogue ?? "",
+            thoughts: p.thoughts ?? null,
+            is_convinced: p.is_convinced ?? null,
+          };
+        } catch (err) {
+          console.warn("⚠ victim JSON parsing failed:", trimmed);
+          content = raw;
+        }
       }
     }
-  }
 
-  return {
-    id: crypto.randomUUID(),
-    role,
-    sender: role,
-    timestamp,
-    _kind: "chat",
-
-    // UI가 사용하는 통일된 content 값
-    content,
-
-    side: role === "victim" ? "right" : role === "offender" ? "left" : "center",
-    label: role === "victim" ? "피해자" : role === "offender" ? "피싱범" : "시스템",
+    return {
+      id: crypto.randomUUID(),
+      role,
+      sender: role,
+      timestamp,
+      _kind: "chat",
+      content,
+      side:
+        role === "victim" ? "right" : role === "offender" ? "left" : "center",
+      label:
+        role === "victim"
+          ? "피해자"
+          : role === "offender"
+          ? "피싱범"
+          : "시스템",
+    };
   };
-};
-
-
-
 
   const hasChatLog = useMemo(
-    () => countChatMessagesLocal(messages) > 0,
-    [messages]
+    () => countChatMessagesLocal(messages || []) > 0,
+    [messages],
   );
 
   /* ----------------------------------------------------------
@@ -368,12 +264,12 @@ const normalizeMessage = (m) => {
     warn: "#facc15",
   };
 
-  // 진행률 계산
+  // 진행률 계산 (단순 10턴 기준)
   useEffect(() => {
     if (typeof setProgress !== "function") return;
     const pct = Math.min(
       100,
-      Math.round((countChatMessagesLocal(messages) / 10) * 100)
+      Math.round((countChatMessagesLocal(messages || []) / 10) * 100),
     );
     setProgress(pct);
   }, [messages, setProgress]);
@@ -385,16 +281,6 @@ const normalizeMessage = (m) => {
   }, []);
 
   /* ----------------------------------------------------------
-   🏠 홈버튼 (초기화)
-  ---------------------------------------------------------- */
-  const handleGoHome = () => {
-    setSelectedScenario(null);
-    setSelectedCharacter(null);
-    setProgress(0);
-    setCurrentPage("landing");
-  };
-
-  /* ----------------------------------------------------------
    🎯 시나리오 필터링 + 커스텀 통합
   ---------------------------------------------------------- */
   const filteredScenarios = useMemo(() => {
@@ -402,7 +288,7 @@ const normalizeMessage = (m) => {
     return scenarios.filter(
       (s) =>
         s.type === selectedTag ||
-        (Array.isArray(s.tags) && s.tags.includes(selectedTag))
+        (Array.isArray(s.tags) && s.tags.includes(selectedTag)),
     );
   }, [selectedTag, scenarios]);
 
@@ -420,7 +306,7 @@ const normalizeMessage = (m) => {
   };
 
   /* ----------------------------------------------------------
-   🧠 에이전트 로그 (점진 표시)
+   🧠 에이전트 로그 (sessionResult.agentLogs → 텍스트 점진 표시)
   ---------------------------------------------------------- */
   const computedAgentLogText = useMemo(() => {
     if (!sessionResult?.agentLogs) return "";
@@ -435,7 +321,7 @@ const normalizeMessage = (m) => {
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean),
-    [computedAgentLogText]
+    [computedAgentLogText],
   );
   const [displayedAgentLogText, setDisplayedAgentLogText] = useState("");
   const logIndexRef = useRef(0);
@@ -443,11 +329,12 @@ const normalizeMessage = (m) => {
   useEffect(() => {
     if (!agentLogLines.length) return;
     const timer = setInterval(() => {
-      if (logIndexRef.current >= agentLogLines.length) return clearInterval(timer);
+      if (logIndexRef.current >= agentLogLines.length)
+        return clearInterval(timer);
       setDisplayedAgentLogText((prev) =>
         prev
           ? `${prev}\n${agentLogLines[logIndexRef.current]}`
-          : agentLogLines[logIndexRef.current]
+          : agentLogLines[logIndexRef.current],
       );
       logIndexRef.current++;
     }, logTickMs);
@@ -455,7 +342,7 @@ const normalizeMessage = (m) => {
   }, [agentLogLines, logTickMs]);
 
   /* ----------------------------------------------------------
-   ⏳ 분석 보드 지연 표시
+   ⏳ 분석 보드 지연 표시 (채팅 없으면 숨김)
   ---------------------------------------------------------- */
   useEffect(() => {
     if (!hasChatLog) return setShowBoardContent(false);
@@ -476,32 +363,25 @@ const normalizeMessage = (m) => {
           {/* 상단 HUD */}
           <HudBar COLORS={THEME} />
 
-          {/* 상단 상태 + 홈버튼 */}
+          {/* 상단 상태 */}
           <div
             className="px-6 py-4 flex items-center justify-between border-b"
             style={{ borderColor: THEME.border }}
           >
             <div className="flex items-center gap-3">
-              <Badge tone={selectedScenario ? "primary" : "neutral"} COLORS={THEME}>
+              <Badge
+                tone={selectedScenario ? "primary" : "neutral"}
+                COLORS={THEME}
+              >
                 {selectedScenario ? selectedScenario.name : "시나리오 미선택"}
               </Badge>
-              <Badge tone={selectedCharacter ? "success" : "neutral"} COLORS={THEME}>
+              <Badge
+                tone={selectedCharacter ? "success" : "neutral"}
+                COLORS={THEME}
+              >
                 {selectedCharacter ? selectedCharacter.name : "캐릭터 미선택"}
               </Badge>
             </div>
-
-            {/* <button
-              onClick={handleGoHome}
-              className="px-3 py-2 rounded-md text-sm font-medium flex items-center gap-2 border"
-              style={{
-                backgroundColor: THEME.panelDark,
-                borderColor: THEME.border,
-                color: THEME.sub,
-              }}
-            >
-              <Home size={16} />
-              홈으로
-            </button> */}
           </div>
 
           {/* 메인 */}
@@ -510,7 +390,10 @@ const normalizeMessage = (m) => {
             style={{ backgroundColor: THEME.bg }}
           >
             {/* 왼쪽: 시나리오 / 캐릭터 / 대화 */}
-            <div className="flex flex-col flex-1 overflow-y-auto" ref={scrollRef}>
+            <div
+              className="flex flex-col flex-1 overflow-y-auto"
+              ref={scrollRef}
+            >
               {/* 1️⃣ 시나리오 선택 */}
               {needScenario && (
                 <SelectedCard
@@ -550,7 +433,9 @@ const normalizeMessage = (m) => {
                         }}
                       >
                         <div className="flex items-center justify-between mb-2">
-                          <span className="font-semibold text-lg">{s.name}</span>
+                          <span className="font-semibold text-lg">
+                            {s.name}
+                          </span>
                           <Badge
                             tone={s.type === "커스텀" ? "secondary" : "primary"}
                             COLORS={THEME}
@@ -575,7 +460,7 @@ const normalizeMessage = (m) => {
                     onCreated={(v) => {
                       setCustomVictims((p) => [...p, v]);
                       setSelectedCharacter(v);
-                      addSystem(`커스텀 캐릭터 생성: ${v.name}`);
+                      addSystem?.(`커스텀 캐릭터 생성: ${v.name}`);
                     }}
                   />
 
@@ -594,7 +479,7 @@ const normalizeMessage = (m) => {
                             className="w-full h-44 bg-cover bg-center"
                             style={{
                               backgroundImage: `url(${getVictimImage(
-                                c.photo_path
+                                c.photo_path,
                               )})`,
                             }}
                           />
@@ -643,7 +528,9 @@ const normalizeMessage = (m) => {
                               </span>
                             </div>
                             <div className="flex justify-between items-center">
-                              <span className="text-[12px] opacity-70">성별</span>
+                              <span className="text-[12px] opacity-70">
+                                성별
+                              </span>
                               <span
                                 className="font-medium"
                                 style={{ color: THEME.text }}
@@ -652,7 +539,9 @@ const normalizeMessage = (m) => {
                               </span>
                             </div>
                             <div className="flex justify-between items-center">
-                              <span className="text-[12px] opacity-70">거주지</span>
+                              <span className="text-[12px] opacity-70">
+                                거주지
+                              </span>
                               <span
                                 className="font-medium truncate ml-2"
                                 style={{ color: THEME.text }}
@@ -660,8 +549,10 @@ const normalizeMessage = (m) => {
                                 {c.meta.address}
                               </span>
                             </div>
-                            <div className="flex justify-between items-center">
-                              <span className="text-[12px] opacity-70">학력</span>
+                            <div className="flex justify-between items=center">
+                              <span className="text-[12px] opacity-70">
+                                학력
+                              </span>
                               <span
                                 className="font-medium truncate ml-2"
                                 style={{ color: THEME.text }}
@@ -681,19 +572,24 @@ const normalizeMessage = (m) => {
                             </span>
                             <div className="space-y-1">
                               {Array.isArray(
-                                c?.knowledge?.comparative_notes
+                                c?.knowledge?.comparative_notes,
                               ) && c.knowledge.comparative_notes.length > 0 ? (
-                                c.knowledge.comparative_notes.map((note, idx) => (
-                                  <div
-                                    key={idx}
-                                    className="text-sm font-medium leading-relaxed"
-                                    style={{ color: THEME.text }}
-                                  >
-                                    • {note}
-                                  </div>
-                                ))
+                                c.knowledge.comparative_notes.map(
+                                  (note, idx) => (
+                                    <div
+                                      key={idx}
+                                      className="text-sm font-medium leading-relaxed"
+                                      style={{ color: THEME.text }}
+                                    >
+                                      • {note}
+                                    </div>
+                                  ),
+                                )
                               ) : (
-                                <div className="text-sm" style={{ color: THEME.sub }}>
+                                <div
+                                  className="text-sm"
+                                  style={{ color: THEME.sub }}
+                                >
                                   비고 없음
                                 </div>
                               )}
@@ -709,38 +605,44 @@ const normalizeMessage = (m) => {
                               성격
                             </span>
                             <div className="space-y-1">
-                              {c?.traits?.ocean && typeof c.traits.ocean === "object" ? (
-                                Object.entries(c.traits.ocean).map(([key, val]) => {
-                                  const labelMap = {
-                                    openness: "개방성",
-                                    neuroticism: "신경성",
-                                    extraversion: "외향성",
-                                    agreeableness: "친화성",
-                                    conscientiousness: "성실성",
-                                  };
-                                  const label = labelMap[key] ?? key;
-                                  return (
-                                    <div
-                                      key={key}
-                                      className="flex justify-between items-center"
-                                    >
-                                      <span
-                                        className="text-[12px] opacity-70"
-                                        style={{ color: THEME.sub }}
+                              {c?.traits?.ocean &&
+                              typeof c.traits.ocean === "object" ? (
+                                Object.entries(c.traits.ocean).map(
+                                  ([key, val]) => {
+                                    const labelMap = {
+                                      openness: "개방성",
+                                      neuroticism: "신경성",
+                                      extraversion: "외향성",
+                                      agreeableness: "친화성",
+                                      conscientiousness: "성실성",
+                                    };
+                                    const label = labelMap[key] ?? key;
+                                    return (
+                                      <div
+                                        key={key}
+                                        className="flex justify-between items-center"
                                       >
-                                        {label}
-                                      </span>
-                                      <span
-                                        className="text-sm font-medium"
-                                        style={{ color: THEME.text }}
-                                      >
-                                        {val}
-                                      </span>
-                                    </div>
-                                  );
-                                })
+                                        <span
+                                          className="text-[12px] opacity-70"
+                                          style={{ color: THEME.sub }}
+                                        >
+                                          {label}
+                                        </span>
+                                        <span
+                                          className="text-sm font-medium"
+                                          style={{ color: THEME.text }}
+                                        >
+                                          {val}
+                                        </span>
+                                      </div>
+                                    );
+                                  },
+                                )
                               ) : (
-                                <div className="text-sm" style={{ color: THEME.sub }}>
+                                <div
+                                  className="text-sm"
+                                  style={{ color: THEME.sub }}
+                                >
                                   성격 정보 없음
                                 </div>
                               )}
@@ -759,7 +661,7 @@ const normalizeMessage = (m) => {
                   <div className="flex flex-1 min-h-0">
                     {/* 왼쪽: 대화 */}
                     <div className="flex-1 p-6 overflow-y-auto" ref={scrollRef}>
-                      {/* ✅ 시뮬레이션 시작 버튼 (중앙 상단) */}
+                      {/* 시뮬레이션 시작 버튼 */}
                       {showStartButton ? (
                         <div className="flex justify-center mt-6">
                           <button
@@ -773,13 +675,17 @@ const normalizeMessage = (m) => {
                             }}
                           >
                             <Play className="inline mr-3" size={20} />
-                            {running ? "시뮬레이션 진행 중..." : "시뮬레이션 시작"}
+                            {running
+                              ? "시뮬레이션 진행 중..."
+                              : "시뮬레이션 시작"}
                           </button>
                         </div>
                       ) : (
-                        // ✅ 버튼이 사라지고, 대화가 아직 안 나왔을 때만 Spinner 표시
                         !messages?.length && (
-                          <SpinnerMessage simulationState="RUNNING" COLORS={THEME} />
+                          <SpinnerMessage
+                            simulationState="RUNNING"
+                            COLORS={THEME}
+                          />
                         )
                       )}
 
@@ -797,10 +703,11 @@ const normalizeMessage = (m) => {
                         })
                         .map((m, idx) => {
                           const nm = normalizeMessage(m);
-                          
                           return (
                             <MessageBubble
-                              key={`${nm.role ?? "unknown"}-${nm.timestamp ?? Date.now()}-${idx}`}
+                              key={`${nm.role ?? "unknown"}-${
+                                nm.timestamp ?? Date.now()
+                              }-${idx}`}
                               message={nm}
                               label={nm.label}
                               side={nm.side}
@@ -828,7 +735,9 @@ const normalizeMessage = (m) => {
                         <div className="flex gap-4">
                           <button
                             className={`flex items-center gap-2 text-sm font-semibold ${
-                              activeAgentTab === "log" ? "opacity-100" : "opacity-60"
+                              activeAgentTab === "log"
+                                ? "opacity-100"
+                                : "opacity-60"
                             }`}
                             onClick={() => setActiveAgentTab("log")}
                             style={{ color: THEME.text }}
@@ -852,9 +761,9 @@ const normalizeMessage = (m) => {
                       <div className="flex-1 overflow-auto p-4">
                         {activeAgentTab === "log" ? (
                           <TerminalLog logs={logs} COLORS={THEME} />
-                        ) : showBoardContent && (hasJudgement || hasGuidance || hasPrevention) ? (
+                        ) : showBoardContent &&
+                          (hasJudgement || hasGuidance || hasPrevention) ? (
                           <div className="flex flex-col gap-4">
-                            {/* ✅ InvestigationBoard 단일 호출 */}
                             <InvestigationBoard
                               COLORS={THEME}
                               judgements={judgements}
@@ -862,15 +771,27 @@ const normalizeMessage = (m) => {
                               preventions={preventions}
                             />
 
-                            {/* (선택) 원본 데이터 확인용 JSON 블록 */}
-                            {judgements && (
-                              <JsonBlock title="[SSE Event] judgements (raw)" obj={judgements} theme={THEME} />
+                            {/* (옵션) 원본 JSON 확인 */}
+                            {judgements && judgements.length > 0 && (
+                              <JsonBlock
+                                title="[SSE Event] judgements (raw)"
+                                obj={judgements}
+                                theme={THEME}
+                              />
                             )}
-                            {guidances && (
-                              <JsonBlock title="[SSE Event] guidances (raw)" obj={guidances} theme={THEME} />
+                            {guidances && guidances.length > 0 && (
+                              <JsonBlock
+                                title="[SSE Event] guidances (raw)"
+                                obj={guidances}
+                                theme={THEME}
+                              />
                             )}
-                            {preventions && (
-                              <JsonBlock title="[SSE Event] preventions (raw)" obj={preventions} theme={THEME} />
+                            {preventions && preventions.length > 0 && (
+                              <JsonBlock
+                                title="[SSE Event] preventions (raw)"
+                                obj={preventions}
+                                theme={THEME}
+                              />
                             )}
                           </div>
                         ) : (
@@ -881,7 +802,7 @@ const normalizeMessage = (m) => {
                             분석 데이터를 불러오는 중입니다...
                           </div>
                         )}
-                    </div>
+                      </div>
                     </div>
                   </div>
                 </>
@@ -937,14 +858,6 @@ const normalizeMessage = (m) => {
         onClose={() => setOpenTTS(false)}
         COLORS={THEME}
       />
-
-      {/* <CustomScenarioModal
-        open={showCustomModal}
-        onClose={() => setShowCustomModal(false)}
-        onSave={handleSaveCustomScenario}
-        COLORS={THEME}
-        selectedTag={selectedTag}
-      /> */}
     </div>
   );
 };

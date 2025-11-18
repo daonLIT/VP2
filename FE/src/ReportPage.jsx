@@ -2,29 +2,12 @@
 import {
   User,
   Bot,
-  Terminal,
   ExternalLink,
   Shield,
   AlertTriangle,
 } from "lucide-react";
-import { useEffect, useState, useMemo } from "react";
+import { useMemo } from "react";
 import Badge from "./Badge";
-
-async function fetchWithTimeout(url, { timeout = 15000, ...opts } = {}) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    const res = await fetch(url, { ...opts, signal: ctrl.signal });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status} ${res.statusText} ${txt}`);
-    }
-    const txt = await res.text();
-    return txt ? JSON.parse(txt) : null;
-  } finally {
-    clearTimeout(id);
-  }
-}
 
 const ReportPage = ({
   COLORS,
@@ -34,9 +17,16 @@ const ReportPage = ({
   defaultCaseData,
   selectedScenario,
   selectedCharacter,
-  currentCaseId,
   victimImageUrl,
-  preventions = [],
+  // 🔴 SSE에서 바로 오는 데이터들
+  preventions = null,   // 마지막 prevention 이벤트 or 배열
+  judgements = null,    // (선택) judgement SSE 이벤트
+
+  // 🔹 아래 네 개는 있으면 쓰고, 없으면 무시하도록 기본값 no-op
+  setSelectedScenario = () => {},
+  setSelectedCharacter = () => {},
+  setMessages = () => {},
+  setProgress = () => {},
 }) => {
   const THEME = {
     ...COLORS,
@@ -55,73 +45,81 @@ const ReportPage = ({
     danger: COLORS?.danger ?? "#ED4245",
   };
 
-  const [adminCase, setAdminCase] = useState(null);
-  const [adminCaseLoading, setAdminCaseLoading] = useState(false);
-  const [adminCaseError, setAdminCaseError] = useState(null);
+  // 🧠 1) judgement SSE 정규화
+  const normalizedJudgement = useMemo(() => {
+    if (!judgements) return null;
 
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
-      if (!currentCaseId) return;
-      setAdminCaseLoading(true);
-      setAdminCaseError(null);
-      try {
-        const data = await fetchWithTimeout(
-          `/api/admin-cases/${encodeURIComponent(currentCaseId)}`,
-          { timeout: 15000 }
-        );
-        if (!mounted) return;
-        setAdminCase(data || null);
-      } catch (e) {
-        if (!mounted) return;
-        setAdminCaseError(e.message || String(e));
-      } finally {
-        if (mounted) setAdminCaseLoading(false);
-      }
-    })();
-    return () => {
-      mounted = false;
+    const ev = judgements?.event ?? judgements;
+    const raw = ev?.content ?? ev;
+    if (!raw || typeof raw !== "object") return null;
+
+    return {
+      case_id: raw.case_id,
+      run_no: raw.run_no,
+      phishing: raw.phishing,
+      risk: raw.risk,                 // { score, level, rationale }
+      evidence: raw.evidence,         // string
+      victim_vulnerabilities: raw.victim_vulnerabilities, // string[]
+      ok: raw.ok,
+      persisted: raw.persisted,
     };
-  }, [currentCaseId]);
+  }, [judgements]);
 
+  // 🧠 2) 피싱 여부 계산 (judgement → sessionResult 우선순위)
   const casePhishing = useMemo(() => {
-    const fromAdmin =
-      typeof adminCase?.phishing === "boolean" ? adminCase.phishing : undefined;
-    const fromDefault =
-      typeof defaultCaseData?.case?.phishing === "boolean"
-        ? defaultCaseData.case.phishing
+    const fromJudgement =
+      typeof normalizedJudgement?.phishing === "boolean"
+        ? normalizedJudgement.phishing
         : undefined;
+
     const fromSessionPhishing =
       typeof sessionResult?.phishing === "boolean"
         ? sessionResult.phishing
         : undefined;
+
     const fromSessionIs =
       typeof sessionResult?.isPhishing === "boolean"
         ? sessionResult.isPhishing
         : undefined;
 
-    return (
-      fromAdmin ?? fromDefault ?? fromSessionPhishing ?? fromSessionIs ?? false
-    );
-  }, [adminCase, defaultCaseData, sessionResult]);
+    return fromJudgement ?? fromSessionPhishing ?? fromSessionIs ?? false;
+  }, [normalizedJudgement, sessionResult]);
 
+  // 🧠 3) 피싱 근거 계산 (judgement → defaultCaseData → sessionResult)
   const caseEvidence = useMemo(() => {
     return (
-      adminCase?.evidence ??
+      normalizedJudgement?.evidence ??
       defaultCaseData?.case?.evidence ??
       sessionResult?.case?.evidence ??
       sessionResult?.evidence ??
       ""
     );
-  }, [adminCase, defaultCaseData, sessionResult]);
+  }, [normalizedJudgement, defaultCaseData, sessionResult]);
 
+  // 🧠 4) SSE 이벤트 / 배열 형태 모두 지원하는 개인화 예방법 정규화
   const latestPrevention = useMemo(() => {
-    if (!Array.isArray(preventions) || preventions.length === 0) {
-      return null;
+    if (!preventions) return null;
+
+    // 1) SSE 단일 이벤트 객체 형태
+    //    ex) { type: "prevention", event: { content: { ... }, meta: { ... } } }
+    if (!Array.isArray(preventions)) {
+      const ev = preventions?.event ?? preventions;
+      if (!ev) return null;
+
+      if (ev.content) return ev;      // { content: {...}, meta: ... }
+      return { content: ev };         // content 없이 바로 들어온 경우
     }
-    return preventions[preventions.length - 1];
+
+    // 2) 배열인 경우 (마지막 원소 사용)
+    if (preventions.length === 0) return null;
+    const last = preventions[preventions.length - 1];
+    if (!last) return null;
+
+    if (last.content) return last;
+    return { content: last };
   }, [preventions]);
 
+  // 🧠 5) 피해자 정보 구성 (selectedCharacter → sessionResult → 기본값)
   const victimFromSession = sessionResult
     ? {
         name: sessionResult.victimName ?? "알 수 없음",
@@ -145,7 +143,8 @@ const ReportPage = ({
       }
     : null;
 
-  const victim = selectedCharacter ??
+  const victim =
+    selectedCharacter ??
     victimFromSession ?? {
       name: "알 수 없음",
       meta: { age: "-", gender: "-", address: "-", education: "-", job: "-" },
@@ -176,36 +175,10 @@ const ReportPage = ({
   const phishingTypeText =
     selectedScenario?.type ??
     (Array.isArray(scenarios)
-      ? (scenarios[0]?.type ?? "피싱 유형")
+      ? scenarios[0]?.type ?? "피싱 유형"
       : "피싱 유형");
 
-  const rawAgentLogs = useMemo(() => {
-    return (
-      sessionResult?.agentLogs ??
-      defaultCaseData?.agent_logs ??
-      defaultCaseData?.agentLogs ??
-      defaultCaseData?.agent?.logs ??
-      adminCase?.agent_logs ??
-      adminCase?.agentLogs ??
-      []
-    );
-  }, [sessionResult, defaultCaseData, adminCase]);
-
-  const filteredAgentLogs = useMemo(() => {
-    if (!Array.isArray(rawAgentLogs)) return [];
-    return rawAgentLogs.filter((l) => {
-      if (typeof l === "string") return true;
-      const v =
-        l?.use_agent ??
-        l?.useAgent ??
-        l?.use_agent_flag ??
-        l?.use_agent_value ??
-        undefined;
-      if (v === true || v === "true" || v === 1 || v === "1") return true;
-      return false;
-    });
-  }, [rawAgentLogs]);
-
+  // 🔹 위험도 뱃지
   function RiskBadge({ level }) {
     const lv = String(level || "").toLowerCase();
     let toneBg = THEME.border;
@@ -223,28 +196,32 @@ const ReportPage = ({
     );
   }
 
+  const hasAnyData = !!sessionResult || !!latestPrevention;
+
   return (
     <div
       style={{ backgroundColor: THEME.bg, color: THEME.text }}
       className="min-h-screen"
     >
       <div className="mx-auto min-h-screen p-6 md:p-10 xl:p-12 flex flex-col">
+        {/* 헤더 */}
         <div className="flex items-center justify-between mb-10">
           <h1 className="text-4xl font-bold">시뮬레이션 리포트</h1>
           <div className="flex gap-3">
             <button
               onClick={() => setCurrentPage("simulator")}
               className="px-6 py-3 rounded-lg text-lg font-medium"
-              style={{ 
-                backgroundColor: THEME.panelDark, 
+              style={{
+                backgroundColor: THEME.panelDark,
                 color: THEME.text,
-                border: `1px solid ${THEME.border}`
+                border: `1px solid ${THEME.border}`,
               }}
             >
               대화 보기
             </button>
             <button
               onClick={() => {
+                // 🔹 상위에서 props를 안 넘겨줬어도 에러 안 나게 no-op 기본값 지정해 둠
                 setSelectedScenario(null);
                 setSelectedCharacter(null);
                 setMessages([]);
@@ -259,12 +236,14 @@ const ReportPage = ({
           </div>
         </div>
 
-        {sessionResult || (preventions && preventions.length > 0) ? (
+        {hasAnyData ? (
           <div className="flex gap-10 flex-1 overflow-hidden">
+            {/* 왼쪽 패널: 유형 / 피해자 / 에이전트 */}
             <div
               className="w-full lg:w-1/3 flex-shrink-0 space-y-8 pr-6"
               style={{ borderRight: `1px solid ${THEME.border}` }}
             >
+              {/* 피싱 유형 */}
               <div
                 className="rounded-2xl p-8"
                 style={{
@@ -287,6 +266,7 @@ const ReportPage = ({
                 </div>
               </div>
 
+              {/* 피해자 정보 */}
               <div
                 className="rounded-2xl p-8"
                 style={{
@@ -415,6 +395,7 @@ const ReportPage = ({
                 </div>
               </div>
 
+              AI 에이전트
               <div
                 className="rounded-2xl p-8"
                 style={{
@@ -440,7 +421,9 @@ const ReportPage = ({
               </div>
             </div>
 
+            {/* 오른쪽: 판정 결과 / 예방법 / 출처 */}
             <div className="flex-1 min-h-0 overflow-y-auto space-y-8 pr-2">
+              {/* 피싱 판정 결과 */}
               <div
                 className="rounded-2xl p-8"
                 style={{
@@ -467,17 +450,6 @@ const ReportPage = ({
                   </div>
                 </div>
 
-                {adminCaseLoading && (
-                  <div className="mb-3 text-sm" style={{ color: THEME.sub }}>
-                    근거 불러오는 중…
-                  </div>
-                )}
-                {adminCaseError && (
-                  <div className="mb-3 text-sm" style={{ color: THEME.warn }}>
-                    근거 조회 실패: {adminCaseError}
-                  </div>
-                )}
-
                 <div
                   className="mt-2 p-4 rounded"
                   style={{
@@ -498,6 +470,7 @@ const ReportPage = ({
                 </div>
               </div>
 
+              {/* 개인화 예방법 */}
               <div
                 className="rounded-2xl p-8"
                 style={{
@@ -623,6 +596,7 @@ const ReportPage = ({
                 )}
               </div>
 
+              {/* 사례 출처 및 참고자료 */}
               <div
                 className="rounded-2xl p-8"
                 style={{

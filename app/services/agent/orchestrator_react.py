@@ -37,6 +37,8 @@ MIN_ROUNDS = 2
 MAX_ROUNDS_DEFAULT = 5
 MAX_ROUNDS_UI_LIMIT = 3
 
+_PROMPT_CACHE: Dict[str, Dict[str, str]] = {}
+
 # SSE 모듈
 import asyncio, logging, uuid, contextvars, contextlib, sys
 from threading import Event as ThreadEvent
@@ -624,6 +626,184 @@ def _extract_case_id_from_agent_output(result: Any, cap: ThoughtCapture) -> Opti
     
     return None
 
+def _wrap_sim_compose_prompts(original_tool):
+    """sim.compose_prompts를 래핑하여 프롬프트를 캐시하고 ID만 반환"""
+    from langchain_core.tools import tool
+    from typing import Any
+
+    @tool
+    def sim_compose_prompts_cached(data: Any) -> dict:
+        """프롬프트 생성 후 캐시에 저장하고 prompt_id만 반환"""
+
+        # 1) 문자열 → JSON
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = _loose_parse_json(data)
+        else:
+            parsed = data
+
+        if not isinstance(parsed, dict):
+            return {
+                "ok": False,
+                "error": f"sim.compose_prompts 입력 data는 dict여야 합니다. got={type(parsed).__name__}",
+            }
+
+        # 2) {"data": {...}} / {...} 둘 다 지원
+        if "data" in parsed and isinstance(parsed["data"], dict):
+            inner = parsed["data"]
+            if "round_no" in parsed and "round_no" not in inner:
+                inner["round_no"] = parsed["round_no"]
+        else:
+            inner = parsed
+
+        payload = {"data": inner}
+
+        # 3) 원본 도구 호출
+        result = original_tool.invoke(payload)
+
+        # 4) 결과 파싱
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                result = _loose_parse_json(result)
+
+        if not isinstance(result, dict):
+            return {"ok": False, "error": "sim.compose_prompts 결과가 dict가 아닙니다"}
+
+        attacker_prompt = result.get("attacker_prompt", "")
+        victim_prompt = result.get("victim_prompt", "")
+
+        if not attacker_prompt or not victim_prompt:
+            return {"ok": False, "error": "프롬프트가 비어있습니다"}
+
+        # ★ 여기서 fetch_entities에서 넘어온 scenario/victim_profile을 그대로 저장
+        scenario = inner.get("scenario")
+        victim_profile = inner.get("victim_profile")
+
+        round_no = inner.get("round_no", 1)
+        prompt_id = f"prompts_round_{round_no}_{id(result)}"
+
+        _PROMPT_CACHE[prompt_id] = {
+            "attacker_prompt": attacker_prompt,
+            "victim_prompt": victim_prompt,
+            "scenario": scenario,
+            "victim_profile": victim_profile,
+        }
+
+        logger.info(f"[PromptCache] 저장: {prompt_id} (round={round_no})")
+
+        return {
+            "ok": True,
+            "prompt_id": prompt_id,
+            "message": f"프롬프트가 {prompt_id}에 저장되었습니다. mcp.simulator_run 호출 시 이 ID를 사용하세요.",
+        }
+
+    sim_compose_prompts_cached.name = "sim.compose_prompts"
+    sim_compose_prompts_cached.description = (
+        "시나리오와 피해자 프로필로 공격자/피해자 프롬프트를 생성합니다. "
+        "결과로 prompt_id를 받아서 mcp.simulator_run에 전달하세요."
+    )
+
+    return sim_compose_prompts_cached
+
+def _wrap_mcp_simulator_run(original_tool):
+    """mcp.simulator_run을 래핑하여 prompt_id로 캐시된 프롬프트 사용"""
+    from langchain_core.tools import tool
+    from typing import Any
+
+    @tool
+    def mcp_simulator_run_cached(data: Any) -> dict:
+        """시뮬레이션 실행 (캐시된 프롬프트 사용)"""
+
+        # 1) 문자열 → JSON
+        if isinstance(data, str):
+            try:
+                parsed = json.loads(data)
+            except Exception:
+                parsed = _loose_parse_json(data)
+        else:
+            parsed = data
+
+        if not isinstance(parsed, dict):
+            return {
+                "ok": False,
+                "error": f"mcp.simulator_run 입력 data는 dict여야 합니다. got={type(parsed).__name__}",
+            }
+
+        # 2) {"data": {...}} / {...} 둘 다 허용
+        params = parsed["data"] if isinstance(parsed.get("data"), dict) else parsed
+
+        # 3) 필수 필드 파싱
+        try:
+            offender_id = int(params["offender_id"])
+            victim_id = int(params["victim_id"])
+            prompt_id = params["prompt_id"]
+            max_turns = int(params["max_turns"])
+            round_no = int(params["round_no"])
+        except KeyError as e:
+            return {"ok": False, "error": f"mcp.simulator_run 필수 필드 누락: {e.args[0]}"}
+        except ValueError as e:
+            return {"ok": False, "error": f"숫자 필드(offender_id/victim_id/max_turns/round_no) 파싱 실패: {e}"}
+
+        case_id_override = params.get("case_id_override")
+        guidance = params.get("guidance")
+
+        # 4) prompt_id 기반 캐시 로드 (여기서 scenario/victim_profile까지 같이 가져옴)
+        if prompt_id not in _PROMPT_CACHE:
+            return {
+                "ok": False,
+                "error": f"프롬프트 {prompt_id}를 캐시에서 찾을 수 없습니다. sim.compose_prompts를 먼저 호출하세요.",
+            }
+
+        cache_entry = _PROMPT_CACHE[prompt_id]
+        attacker_prompt = cache_entry.get("attacker_prompt", "")
+        victim_prompt = cache_entry.get("victim_prompt", "")
+        scenario = cache_entry.get("scenario")
+        victim_profile = cache_entry.get("victim_profile")
+
+        logger.info(f"[PromptCache] 로드: {prompt_id}")
+
+        # ★ victim_profile은 반드시 있어야 함
+        if victim_profile is None:
+            return {
+                "ok": False,
+                "error": "missing_victim_profile",
+                "message": "victim_profile이 캐시에 없습니다. sim.compose_prompts 호출 시 scenario/victim_profile이 제대로 전달되었는지 확인하세요.",
+            }
+
+        # 5) MCP에 넘길 payload 구성
+        payload = {
+            "offender_id": offender_id,
+            "victim_id": victim_id,
+            "scenario": scenario,          # ← offender_id에서 가져온 원본 시나리오
+            "victim_profile": victim_profile,  # ← 역시 fetch_entities 기준
+            "attacker_prompt": attacker_prompt,
+            "victim_prompt": victim_prompt,
+            "max_turns": max_turns,
+            "round_no": round_no,
+        }
+
+        if case_id_override:
+            payload["case_id_override"] = case_id_override
+        if guidance:
+            payload["guidance"] = guidance
+
+        # 6) 원본 MCP 도구 호출 (data 래핑 필수)
+        mcp_input = {"data": payload}
+        result = original_tool.invoke(mcp_input)
+        return result
+
+    mcp_simulator_run_cached.name = "mcp.simulator_run"
+    mcp_simulator_run_cached.description = (
+        "보이스피싱 시뮬레이션을 실행합니다. "
+        "prompt_id는 sim.compose_prompts에서 받은 값을 사용하세요."
+    )
+
+    return mcp_simulator_run_cached
+
 def _extract_last_judgement(cap: ThoughtCapture) -> Dict[str, Any]:
     """가장 최근 admin.make_judgement Observation에서 판정 추출"""
     judge_obs = _last_observation(cap, "admin.make_judgement")
@@ -643,6 +823,37 @@ def _extract_prevention_from_last_observation(cap: ThoughtCapture) -> Dict[str, 
     if prev_dict.get("ok"):
         return prev_dict.get("personalized_prevention", {})
     return {}
+
+def _validate_complete_execution(cap: ThoughtCapture, max_rounds: int) -> dict:
+    """실행 완료 여부를 검증하고 누락된 단계를 반환"""
+    tools_called = _extract_tool_call_sequence(cap)
+    
+    required = {
+        "sim.fetch_entities": 1,
+        "sim.compose_prompts": max_rounds,
+        "mcp.simulator_run": max_rounds,
+        "admin.make_judgement": max_rounds,
+        "admin.generate_guidance": max(0, max_rounds - 1),
+        "admin.make_prevention": 1,
+        "admin.save_prevention": 1,
+    }
+    
+    missing = []
+    tool_counts = {}
+    for tool in tools_called:
+        tool_counts[tool] = tool_counts.get(tool, 0) + 1
+    
+    for tool, expected_count in required.items():
+        actual_count = tool_counts.get(tool, 0)
+        if actual_count < expected_count:
+            missing.append(f"{tool} (예상:{expected_count}, 실제:{actual_count})")
+    
+    return {
+        "is_complete": len(missing) == 0,
+        "missing_steps": missing,
+        "tools_called": tools_called,
+        "tool_counts": tool_counts
+    }
 
 # ─────────────────────────────────────────────────────────
 # ReAct 시스템 프롬프트
@@ -672,6 +883,13 @@ REACT_SYS = (
     "  • 각 입력 미션에서 요구된 필수 도구들을 **모두 호출하여 Observation을 받은 후에만** Final Answer를 출력할 수 있다.\n"
     "  • 도구를 한 번도 호출하지 않은 채 Final Answer만 출력하는 응답은 **잘못된 출력**이며, 포맷 오류로 간주된다.\n"
     "\n"
+    "▼ Final Answer 작성 전 필수 체크리스트\n"
+    "  1. □ 모든 필수 도구를 호출했는가?\n"
+    "  2. □ 각 도구의 Observation을 받았는가?\n"
+    "  3. □ admin.make_prevention을 호출했는가?\n"
+    "  4. □ admin.save_prevention을 호출했는가?\n"
+    "  5. □ 위 4개 항목이 모두 체크되었을 때만 Final Answer 작성\n"
+    "\n"
     "▼ 안전/정책 관련 규칙\n"
     "  • 이 시뮬레이션은 보이스피싱 **예방·훈련 목적의 교육용** 시뮬레이션이다.\n"
     "  • 실제 계좌/전화번호/링크/개인정보를 요구하거나 출력하지 않는다.\n"
@@ -683,14 +901,24 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
     logger.info("[AgentLLM] model=%s", getattr(llm, "model_name", "unknown"))
 
     tools: List = []
-    tools += make_sim_tools(db)
+    # ★★★ sim.compose_prompts 래핑
+    raw_sim_tools = make_sim_tools(db)
+    for tool in raw_sim_tools:
+        if tool.name == "sim.compose_prompts":
+            tools.append(_wrap_sim_compose_prompts(tool))
+        else:
+            tools.append(tool)
 
     mcp_res = make_mcp_tools()
     if isinstance(mcp_res, tuple):
         mcp_tools, mcp_manager = mcp_res
     else:
         mcp_tools, mcp_manager = mcp_res, None
-    tools += mcp_tools
+    for tool in mcp_tools:
+        if tool.name == "mcp.simulator_run":
+            tools.append(_wrap_mcp_simulator_run(tool))
+        else:
+            tools.append(tool)
 
     tools += make_admin_tools(db, GuidelineRepoDB(db))
     if use_tavily:
@@ -796,6 +1024,13 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 당신은 보이스피싱 시뮬레이션 케이스를 최대 {max_rounds}라운드까지 실행하는 에이전트입니다.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【중요: 최대 라운드 = {max_rounds}】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+★ 이 케이스는 정확히 {max_rounds}라운드까지만 실행합니다.
+★ 라운드 {max_rounds} 판정 완료 후 → 즉시 단계 10(예방책 생성)으로 이동
+★ 라운드 {max_rounds + 1}은 절대 실행 금지
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【실행 단계】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -808,105 +1043,165 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 - 도구: sim.compose_prompts
 - 입력: {{"data": {{"scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>, "round_no": 1}}}}
 - 주의: guidance 필드 포함 금지
-- 저장: attacker_prompt, victim_prompt
+- 결과: prompt_id를 받아서 PROMPT_ID_R1 변수에 저장
 
 단계 3: 시뮬레이션 실행 (라운드1)
 - 도구: mcp.simulator_run
-- 주의: data 래핑 없이 최상위 JSON만 사용
-- 입력 필드:
-  * offender_id: {offender_id}
-  * victim_id: {victim_id}
-  * scenario: <1단계 scenario>
-  * attacker_prompt: <2단계 결과>
-  * victim_prompt: <2단계 결과>
-  * max_turns: {req.max_turns}
-  * round_no: 1
-- 저장: case_id, turns
+- 입력: {{"offender_id": {offender_id}, "victim_id": {victim_id}, "scenario": <1단계 scenario>, "prompt_id": PROMPT_ID_R1, "max_turns": {req.max_turns}, "round_no": 1}}
+- 저장: case_id (CASE_ID 변수), turns
 
 단계 4: 판정 (라운드1)
 - 도구: admin.make_judgement
 - 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": <3단계 turns>}}}}
-- 확인: risk.level이 "critical"이면 단계 8로 이동
-- 저장: 판정 결과
+- 저장: 판정 결과 (JUDGEMENT_R1)
+
+단계 4-1: 라운드1 종료 조건 체크
+  [A] risk.level == "critical"인가?
+      → YES: 즉시 단계 10으로 이동
+      → NO: 단계 4-2로
+      
+  [B] 현재 라운드 == {max_rounds}인가? (1 == {max_rounds}?)
+      → YES: 즉시 단계 10으로 이동
+      → NO: 단계 5로
 
 단계 5: 가이던스 생성 (라운드2용)
 - 도구: admin.generate_guidance
-- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
-- 저장: guidance_round2
+- 입력: {{"data": {{"case_id": CASE_ID, "run_no": 1, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
+- 저장: GUIDANCE_R2
 
-단계 6: 프롬프트 생성 (라운드N, N=2~{max_rounds})
+▶ 라운드 N 반복 (N=2~{max_rounds})
+
+단계 6: 프롬프트 생성 (라운드N)
 - 도구: sim.compose_prompts
-- 입력: {{"data": {{"scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>, "round_no": N, "guidance": <이전단계 guidance>}}}}
-- 저장: attacker_prompt, victim_prompt
+- 입력: {{"data": {{"scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>, "round_no": N, "guidance": GUIDANCE_R{{N}}}}}}
+- 결과: PROMPT_ID_R{{N}} 저장
 
 단계 7: 시뮬레이션 실행 (라운드N)
 - 도구: mcp.simulator_run
-- 입력 필드:
-  * offender_id: {offender_id}
-  * victim_id: {victim_id}
-  * scenario: <1단계 scenario>
-  * attacker_prompt: <6단계 결과>
-  * victim_prompt: <6단계 결과>
-  * max_turns: {req.max_turns}
-  * round_no: N
-  * case_id_override: <3단계 case_id>
-  * guidance: <이전단계 guidance>
+- 입력: {{"offender_id": {offender_id}, "victim_id": {victim_id}, "scenario": <1단계 scenario>, "prompt_id": PROMPT_ID_R{{N}}, "max_turns": {req.max_turns}, "round_no": N, "case_id_override": CASE_ID, "guidance": {{"type": "A", "text": GUIDANCE_R{{N}}.text}}}}
 - 저장: turns
 
 단계 8: 판정 (라운드N)
 - 도구: admin.make_judgement
-- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": N, "turns": <7단계 turns>}}}}
-- 확인: 
-  * risk.level == "critical" → 단계 10으로
-  * N == {max_rounds} → 단계 10으로
-  * 그 외 → 단계 9로
+- 입력: {{"data": {{"case_id": CASE_ID, "run_no": N, "turns": <7단계 turns>}}}}
+- 저장: JUDGEMENT_R{{N}}
+
+단계 8-1: 라운드N 종료 조건 체크 ← **매우 중요**
+  
+  [체크 A] risk.level == "critical"인가?
+      → YES: **즉시 단계 10으로 이동** (라운드 수 무관)
+      → NO: 체크 B로
+  
+  [체크 B] N == {max_rounds}인가?
+      예시: N=5일 때 {max_rounds}=5이면 5 == 5 → TRUE
+      → YES: **즉시 단계 10으로 이동** (최대 라운드 도달)
+      → NO: 단계 9로 (다음 라운드 준비)
 
 단계 9: 가이던스 생성 (다음 라운드용)
+- **진입 조건**: N < {max_rounds} AND risk.level != "critical"
 - 도구: admin.generate_guidance
-- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": N, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
-- 저장 후 단계 6으로
+- 입력: {{"data": {{"case_id": CASE_ID, "run_no": N, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
+- 저장: GUIDANCE_R{{N+1}}
+- **다음**: 단계 6으로 이동 (N을 N+1로 증가)
 
-단계 10: 예방책 생성
+▶ 종료 단계 (필수)
+
+단계 10: 예방책 생성 ← **필수**
+- **진입 조건**: 
+  * risk.level == "critical" OR
+  * N == {max_rounds}
 - 도구: admin.make_prevention
-- 입력: {{"data": {{"case_id": <case_id>, "rounds": <완료라운드수>, "turns": <모든turns통합>, "judgements": <모든judgement>, "guidances": <모든guidance>}}}}
+- 입력: {{"data": {{"case_id": CASE_ID, "rounds": N, "turns": [모든라운드turns], "judgements": [모든judgement], "guidances": [모든guidance]}}}}
+- 저장: prevention_result
 
-단계 11: 예방책 저장
+단계 11: 예방책 저장 ← **필수**
 - 도구: admin.save_prevention
-- 입력: {{"data": {{"case_id": <case_id>, "offender_id": {offender_id}, "victim_id": {victim_id}, "run_no": <마지막라운드>, "summary": <10단계결과>, "steps": <10단계결과>}}}}
+- 입력: {{"data": {{"case_id": CASE_ID, "offender_id": {offender_id}, "victim_id": {victim_id}, "run_no": N, "summary": <10단계 summary>, "steps": <10단계 steps>}}}}
+
+단계 12: Final Answer
+- 모든 단계 완료 후 최종 요약
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 【중요 규칙】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. 변수 재사용
-   - 1단계의 scenario, victim_profile은 모든 라운드에서 동일하게 사용
-   - 3단계의 case_id는 모든 후속 단계에서 동일하게 사용
+1. **라운드 카운터 N 추적**
+   - 라운드1: N=1
+   - 라운드2: N=2
+   - 라운드3: N=3
+   - 라운드4: N=4
+   - 라운드5: N=5 (최대)
+   - N이 {max_rounds}에 도달하면 단계 10으로
 
-2. run_no 규칙
-   - 라운드1 → run_no=1
-   - 라운드2 → run_no=2
-   - 라운드N → run_no=N
+2. **종료 조건 우선순위**
+   - 1순위: risk.level == "critical" → 즉시 단계 10
+   - 2순위: N == {max_rounds} → 즉시 단계 10
+   - 3순위: 계속 진행 (N < {max_rounds} AND not critical)
 
-3. 도구별 입력 형식
-   - mcp.simulator_run: data 래핑 없음 (최상위 JSON)
-   - 나머지 모든 도구: {{"data": {{...}}}} 형식
+3. **변수 재사용**
+   - scenario, victim_profile: 1단계에서 받아서 모든 라운드 재사용
+   - CASE_ID: 단계 3에서 받아서 모든 후속 단계 재사용
+   - PROMPT_ID_RN: 각 라운드마다 새로 생성
+   - GUIDANCE_RN: 이전 라운드 판정 기반 생성
 
-4. Action Input 작성
+4. **도구별 입력 형식**
+   - mcp.simulator_run: data 래핑 없음
+   - 나머지 도구: {{"data": {{...}}}} 형식
+
+5. **Action Input 작성**
    - 반드시 한 줄로 작성
    - 줄바꿈, 들여쓰기, 주석 금지
-   - 예: {{"data": {{"field": "value"}}}}
-
-5. attacker_prompt, victim_prompt 처리
-   - sim.compose_prompts 결과를 그대로 사용
-   - 따옴표 이스케이프 불필요 (도구가 자동 처리)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-【실행 흐름】
+【실행 흐름 예시 - max_rounds={max_rounds}】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-라운드1: 1→2→3→4→5
-라운드2~N: 6→7→8→9 (critical 아니고 max_rounds 미만이면 반복)
-종료: 10→11
+초기화: 1 (엔티티 로드)
+
+라운드1:
+  2→3→4→4-1 체크: critical? NO, 1=={max_rounds}? NO → 5
+
+라운드2:
+  6→7→8→8-1 체크: critical? NO, 2=={max_rounds}? NO → 9→6
+
+라운드3:
+  6→7→8→8-1 체크: critical? NO, 3=={max_rounds}? NO → 9→6
+
+라운드4:
+  6→7→8→8-1 체크: critical? NO, 4=={max_rounds}? NO → 9→6
+
+라운드5:
+  6→7→8→8-1 체크: critical? NO, 5=={max_rounds}? YES → **10**
+
+종료: 10 (예방책 생성) → 11 (예방책 저장) → 12 (Final Answer)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【조기 종료 예시 - critical 발생】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+라운드3에서 critical 발생 시:
+  6→7→8→8-1 체크: critical? YES → **즉시 10**
+
+종료: 10 (예방책 생성) → 11 (예방책 저장) → 12 (Final Answer)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【절대 금지 사항】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ 라운드 {max_rounds + 1} 실행 금지
+❌ 단계 10, 11 생략 금지
+❌ N > {max_rounds} 상태 진입 금지
+
+**핵심**: 라운드 {max_rounds} 판정(단계 8) 완료 후 → 무조건 단계 10
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【Final Answer 작성 조건】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+다음을 **모두 완료**한 후에만 Final Answer 작성:
+✓ admin.make_prevention 호출 및 Observation 확인
+✓ admin.save_prevention 호출 및 Observation 확인
+
+위 2개 도구를 호출하지 않고 Final Answer 작성 시 **포맷 오류**로 처리됩니다.
 """
 
             logger.info("[CaseMission] 전체 케이스 미션 시작")
@@ -1039,18 +1334,51 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
             logger.info(f"[CaseMission] 종료 사유: {finished_reason}")
 
-            # 6. 예방책 추출
+            # 6. 실행 완료 검증
+            validation = _validate_complete_execution(cap, max_rounds)
+            if not validation["is_complete"]:
+                logger.warning(
+                    f"[Validation] 누락된 단계: {validation['missing_steps']}\n"
+                    f"[Validation] 호출된 도구: {validation['tool_counts']}"
+                )
+                _emit_to_stream("validation_warning", {
+                    "type": "incomplete_execution",
+                    "missing_steps": validation["missing_steps"],
+                    "tool_counts": validation["tool_counts"],
+                    "message": "에이전트가 일부 필수 단계를 건너뛰었습니다. 프롬프트 개선이 필요합니다."
+                })
+            else:
+                logger.info("[Validation] 모든 필수 단계 완료 확인")
+
+            # 7. 예방책 추출
             prevention_obj = _extract_prevention_from_last_observation(cap)
 
+            if not prevention_obj:
+                logger.error(
+                    "[Prevention] 에이전트가 make_prevention을 호출하지 않았습니다.\n"
+                    "[Prevention] 프롬프트 엔지니어링 개선이 필요합니다.\n"
+                    f"[Prevention] 호출된 도구: {validation['tool_counts']}"
+                )
+                _emit_to_stream("error", {
+                    "type": "missing_prevention",
+                    "message": "예방책 생성이 누락되었습니다",
+                    "validation": validation
+                })
+            
+            # 8. 예방책 SSE 및 finished_chain emit
             if prevention_obj:
-                logger.info("[Prevention] 예방책 추출 성공")
+                logger.info("[Prevention] 예방책 최종 확보 완료")
+                # 프론트에서 바로 사용할 수 있도록 prevention 이벤트도 전송
+                _emit_to_stream("prevention", prevention_obj)
+
                 _emit_to_stream("finished_chain", {
                     "case_id": case_id,
                     "rounds": rounds_done,
                     "finished_reason": finished_reason,
+                    "prevention": _truncate(prevention_obj, 2000),
                 })
             else:
-                logger.warning("[Prevention] 예방책 객체 추출 실패")
+                logger.warning("[Prevention] 예방책 객체를 끝내 확보하지 못했습니다.")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # 정상 종료 전 정리
@@ -1082,6 +1410,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             return result_obj
 
     finally:
+        with contextlib.suppress(Exception):
+            case_id = locals().get("case_id")
+            if case_id:
+                # 이 케이스 관련 캐시만 정리
+                keys_to_remove = [k for k in _PROMPT_CACHE.keys() if case_id in k or "round_" in k]
+                for k in keys_to_remove:
+                    _PROMPT_CACHE.pop(k, None)
+                logger.info(f"[PromptCache] 정리: {len(keys_to_remove)}개 항목 제거")
         with contextlib.suppress(Exception):
             _ACTIVE_RUN_KEYS.discard(run_key)
         with contextlib.suppress(Exception):

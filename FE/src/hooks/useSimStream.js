@@ -2,10 +2,6 @@
 import { useRef, useState, useCallback } from "react";
 import { streamReactSimulation } from "../lib/streamReactSimulation";
 
-/**
- * 라운드별 judgement, guidance, prevention이 누적되도록 수정된 useSimStream
- * return : judgements[], guidances[], preventions[]
- */
 export function useSimStream(
   setMessages,
   {
@@ -149,9 +145,9 @@ export function useSimStream(
                 type: "system",
                 sender: "system",
                 role: "system",
-                isRoundDivider: true, // ⭐ 라운드 구분용 플래그
+                isRoundDivider: true,
                 round: roundNo,
-                text: "",             // 대화 내용은 비워둠
+                text: "",
                 content: "",
                 side: "center",
                 timestamp: new Date().toISOString(),
@@ -165,54 +161,53 @@ export function useSimStream(
               setSimulationState?.("RUNNING");
 
               turns.forEach((turn, idx) => {
-  const role = (turn.role || "offender").toLowerCase();
-  const key = `conv:${Date.now()}:${idx}:${role}`;
+                const role = (turn.role || "offender").toLowerCase();
+                const key = `conv:${Date.now()}:${idx}:${role}`;
 
-  if (seenTurnsRef.current.has(key)) return;
-  seenTurnsRef.current.add(key);
+                if (seenTurnsRef.current.has(key)) return;
+                seenTurnsRef.current.add(key);
 
-  const raw = turn.text || "";
-  let text = "";
+                const raw = turn.text || "";
+                let text = "";
 
-  if (role === "victim") {
-    try {
-      const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
-      const match = cleaned.match(/\{[\s\S]*\}/);
+                if (role === "victim") {
+                  try {
+                    const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
+                    const match = cleaned.match(/\{[\s\S]*\}/);
 
-      if (match) {
-        const parsed = JSON.parse(match[0]);
-        text = JSON.stringify(parsed);     // ⭐ JSON 전체 유지!!
-      } else {
-        text = raw;
-      }
-    } catch {
-      text = raw;
-    }
-  } else {
-    text = raw;
-  }
+                    if (match) {
+                      const parsed = JSON.parse(match[0]);
+                      text = JSON.stringify(parsed);
+                    } else {
+                      text = raw;
+                    }
+                  } catch {
+                    text = raw;
+                  }
+                } else {
+                  text = raw;
+                }
 
-  const side = role === "offender" ? "left" : "right";
-  const label =
-    role === "offender"
-      ? (selectedScenario?.name || "피싱범")
-      : (selectedCharacter?.name || "피해자");
+                const side = role === "offender" ? "left" : "right";
+                const label =
+                  role === "offender"
+                    ? (selectedScenario?.name || "피싱범")
+                    : (selectedCharacter?.name || "피해자");
 
-  const newMsg = {
-    type: "chat",
-    role,
-    sender: role,
-    side,
-    text: text,
-    content: text,
-    timestamp: new Date().toISOString(),
-    turn: idx,
-  };
+                const newMsg = {
+                  type: "chat",
+                  role,
+                  sender: role,
+                  side,
+                  text: text,
+                  content: text,
+                  timestamp: new Date().toISOString(),
+                  turn: idx,
+                };
 
-  setLocalMessages((prev) => [...prev, newMsg]);
-  setMessages?.((prev) => [...prev, newMsg]);
-});
-
+                setLocalMessages((prev) => [...prev, newMsg]);
+                setMessages?.((prev) => [...prev, newMsg]);
+              });
 
               setProgress?.((p) => Math.min(100, (typeof p === "number" ? p : 0) + 10));
             }
@@ -226,6 +221,31 @@ export function useSimStream(
             const content = event.content ?? "";
             setLogs((p) => [...p, content]);
 
+            // ★★★ prevention log 파싱 (로그로 들어오는 경우)
+            if (typeof content === "string" && content.startsWith("[prevention]")) {
+              try {
+                const jsonStr = content.replace("[prevention]", "").trim();
+                const parsed = JSON.parse(jsonStr);
+
+                if (parsed.ok && parsed.personalized_prevention) {
+                  console.log("🛡️ Prevention 감지 (log):", parsed.personalized_prevention);
+                  
+                  setPreventions((prev) => [
+                    ...prev,
+                    {
+                      type: "prevention",
+                      case_id: parsed.case_id,
+                      content: parsed.personalized_prevention,
+                      timestamp: new Date().toISOString(),
+                      raw: parsed,
+                    },
+                  ]);
+                }
+              } catch (e) {
+                console.warn("⚠ Prevention 파싱 실패:", e);
+              }
+            }
+
             // guidance log 감지
             if (typeof content === "string" && content.startsWith("[GuidanceGeneration]")) {
               try {
@@ -234,7 +254,6 @@ export function useSimStream(
                 const g = parsed?.generated_guidance;
 
                 if (g) {
-                  /** ⭐ guidance 누적 */
                   setGuidances((prev) => [
                     ...prev,
                     {
@@ -272,9 +291,7 @@ export function useSimStream(
           // 4) judgement (라운드 판정)
           // ──────────────────────────────
           if (type === "judgement") {
-            /** ⭐ judgement 누적 저장 */
             setJudgements((prev) => [...prev, event]);
-
             addSystem?.(
               `라운드 ${evt.round ?? "?"} 판정: ${
                 evt.phishing ? "피싱 성공" : "피싱 실패"
@@ -292,10 +309,26 @@ export function useSimStream(
           }
 
           // ──────────────────────────────
-          // 6) prevention
+          // 6) ★★★ prevention 직접 이벤트
           // ──────────────────────────────
-          if (type === "prevention_tip") {
-            setPreventions((prev) => [...prev, event]);
+          if (type === "prevention" || type === "prevention_tip") {
+            console.log("🛡️ Prevention 감지 (event):", evt);
+            
+            // evt 구조: { ok, case_id, personalized_prevention }
+            const preventionData = evt.personalized_prevention || evt.content || evt;
+            
+            setPreventions((prev) => [
+              ...prev,
+              {
+                type: "prevention",
+                case_id: evt.case_id,
+                content: preventionData,
+                timestamp: new Date().toISOString(),
+                raw: evt,
+              },
+            ]);
+            
+            addSystem?.("예방책 생성 완료");
             continue;
           }
 

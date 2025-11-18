@@ -46,90 +46,157 @@ class SingleData(BaseModel):
 def _to_dict(obj: Any) -> Dict[str, Any]:
     """
     admin.* 툴에 들어오는 data를 dict로 정규화.
-    - dict면 그대로 사용
-    - str이면 JSON / literal / "data": { ... } 블록만 뽑아서 파싱
     """
+    # Pydantic 모델 처리
     if hasattr(obj, "model_dump"):
         obj = obj.model_dump()
 
+    # 이미 dict면 그대로 반환
     if isinstance(obj, dict):
         return obj
 
+    # 문자열이 아니면 에러
     if not isinstance(obj, str):
-        raise HTTPException(status_code=422, detail="data는 JSON 객체여야 합니다.")
+        raise HTTPException(status_code=422, detail=f"data는 JSON 객체여야 합니다. got type: {type(obj).__name__}")
 
     s = obj.strip()
-    logger.info("[admin.make_judgement] _to_dict raw string: %r", s)
+    
+    # 빈 문자열 체크
+    if not s:
+        raise HTTPException(status_code=422, detail="data가 비어있습니다.")
+
+    logger.info("[_to_dict] 입력 길이: %d자", len(s))
 
     def _try_parse(candidate: str) -> Optional[Dict[str, Any]]:
+        """JSON 또는 literal_eval 시도 - 개선된 버전"""
         candidate = candidate.strip()
         if not candidate:
             return None
-        # JSON 우선
+        
+        # 1. JSON 파싱
         try:
             v = json.loads(candidate)
             if isinstance(v, dict):
                 return v
-        except Exception:
+        except json.JSONDecodeError:
             pass
-        # literal_eval 보조
+        
+        # 2. literal_eval
         try:
             v = ast.literal_eval(candidate)
             if isinstance(v, dict):
                 return v
-        except Exception:
+        except (ValueError, SyntaxError):
             pass
+        
+        # 3. 코드펜스 제거 후 재파싱
+        fence_pattern = re.compile(r'^```(?:json)?\s*(.*?)\s*```$', re.DOTALL)
+        fence_match = fence_pattern.match(candidate)
+        if fence_match:
+            clean = fence_match.group(1).strip()
+            try:
+                v = json.loads(clean)
+                if isinstance(v, dict):
+                    return v
+            except json.JSONDecodeError:
+                pass
+        
+        # 4. 첫 { 부터 마지막 } 까지만 추출
+        first_brace = candidate.find('{')
+        last_brace = candidate.rfind('}')
+        if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
+            extracted = candidate[first_brace:last_brace+1]
+            if extracted != candidate:
+                try:
+                    v = json.loads(extracted)
+                    if isinstance(v, dict):
+                        return v
+                except json.JSONDecodeError:
+                    pass
+        
         return None
 
-    # 1) 전체 문자열에 대해 JSON 시도
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 1단계: 전체 문자열 직접 파싱
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     val = _try_parse(s)
     if val is not None:
+        logger.info("[_to_dict] 1단계 성공 (전체 문자열)")
         return val
 
-    # 2) "data" 키 이후의 {...} 블록만 골라서 다시 JSON 만들기
-    idx = s.find('"data"')
-    if idx != -1:
-        # "data" 뒤 첫 '{' 위치 찾기
-        brace_start = s.find("{", idx)
-        if brace_start != -1:
-            depth = 0
-            end = None
-            for i, ch in enumerate(s[brace_start:], start=brace_start):
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            if end is not None:
-                # data 값만 잘라내서 다시 {"data": <여기>} 형태의 JSON으로 감싸기
-                inner = s[brace_start:end+1]
-                logger.info("[admin.make_judgement] _to_dict extracted data block: %r", inner)
-                wrapped = '{"data":' + inner + '}'
-                val = _try_parse(wrapped)
-                if val is not None:
-                    return val
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 2단계: "data" 키 뒤의 {...} 블록만 추출
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    data_keyword_pos = s.find('"data"')
+    if data_keyword_pos == -1:
+        data_keyword_pos = s.find("'data'")
+    
+    if data_keyword_pos != -1:
+        colon_pos = s.find(":", data_keyword_pos)
+        if colon_pos != -1:
+            search_start = colon_pos + 1
+            while search_start < len(s) and s[search_start] in ' \t\n':
+                search_start += 1
+            
+            if search_start < len(s) and s[search_start] == '{':
+                depth = 0
+                end_pos = None
+                
+                for i in range(search_start, len(s)):
+                    ch = s[i]
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            end_pos = i
+                            break
+                
+                if end_pos is not None:
+                    inner_block = s[search_start:end_pos+1]
+                    logger.info("[_to_dict] 2단계: data 블록 추출 (%d자)", len(inner_block))
+                    
+                    val = _try_parse(inner_block)
+                    if val is not None:
+                        logger.info("[_to_dict] 2단계 성공 (data 블록 파싱)")
+                        return {"data": val}
 
-    # 3) 그래도 안 되면, 기존처럼 가장 큰 { .. } 블록 + 끝의 ] 잘라내기 시도
-    m = re.search(r"\{.*\}", s, re.S)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 3단계: 전체에서 가장 큰 {...} 블록 추출
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    m = re.search(r"\{.*\}", s, re.DOTALL)
     if m:
         sub = m.group(0)
+        logger.info("[_to_dict] 3단계: 정규식 추출 (%d자)", len(sub))
         val = _try_parse(sub)
         if val is not None:
+            logger.info("[_to_dict] 3단계 성공")
             return val
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 4단계: 끝의 ']' 제거 시도
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     tmp = s
-    for _ in range(5):
+    for attempt in range(5):
         if not tmp.rstrip().endswith("]"):
             break
         tmp = tmp.rstrip()[:-1].rstrip()
         val = _try_parse(tmp)
         if val is not None:
-            logger.warning("[admin._to_dict] fixed extra trailing ']' in data")
+            logger.warning("[_to_dict] 4단계 성공 (끝의 ']' %d개 제거)", attempt + 1)
             return val
 
-    raise HTTPException(status_code=422, detail="data는 JSON 객체여야 합니다.")
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 모든 시도 실패
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    logger.error("[_to_dict] 모든 파싱 시도 실패")
+    logger.error("[_to_dict] 입력 앞 500자: %s", s[:500])
+    logger.error("[_to_dict] 입력 뒤 500자: %s", s[-500:])
+    raise HTTPException(
+        status_code=422,
+        detail="data는 JSON 객체여야 합니다. 파싱 실패."
+    )
+
 
 
 def _unwrap_data(obj: Any) -> Dict[str, Any]:
@@ -205,18 +272,31 @@ class _MakePreventionInput(BaseModel):
 # ─────────────────────────────────────────────────────────
 def _is_terminal_case(rounds: int, judgements: List[Dict[str, Any]]) -> Tuple[bool, str]:
     """
-    rounds 가 5 이상이거나, judgements 중 risk.level == 'critical' 이 하나라도 있으면 터미널로 간주.
-    return: (is_terminal, reason)  # reason in {"round5", "critical", "not_terminal"}
+    rounds 가 3 이상이거나, judgements 중 risk.level == 'critical' 이 하나라도 있으면 터미널로 간주.
+    return: (is_terminal, reason)  # reason in {"round3", "critical", "not_terminal"}
     """
+    logger.info(f"[_is_terminal_case] rounds={rounds}, judgements count={len(judgements or [])}")
+    
     try:
-        if rounds >= 5:
-            return True, "round5"
-        for j in judgements or []:
-            lvl = str(((j.get("risk") or {}).get("level") or "")).lower()
-            if lvl == "critical":
-                return True, "critical"
-    except Exception:
-        pass
+        if rounds >= 3:
+            return True, "round3"
+        
+        for idx, j in enumerate(judgements or []):
+            logger.info(f"[_is_terminal_case] judgement[{idx}]: {j}")
+            
+            risk = j.get("risk")
+            logger.info(f"[_is_terminal_case] risk={risk}")
+            
+            if risk:
+                lvl = str(risk.get("level", "")).lower()
+                logger.info(f"[_is_terminal_case] level={lvl}")
+                
+                if lvl == "critical":
+                    logger.info(f"[_is_terminal_case] ✓ CRITICAL 발견!")
+                    return True, "critical"
+    except Exception as e:
+        logger.error(f"[_is_terminal_case] Exception: {e}")
+    
     return False, "not_terminal"
 
 # ─────────────────────────────────────────────────────────
@@ -663,7 +743,7 @@ def make_admin_tools(db: Session, guideline_repo):
             return {
                 "ok": False,
                 "error": "not_terminal",
-                "message": "prevention can be generated only at round 5 or when risk is critical",
+                "message": "prevention can be generated only at round 3 or when risk is critical",
                 "rounds": pi.rounds,
             }
 

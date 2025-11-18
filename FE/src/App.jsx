@@ -4,6 +4,7 @@ import LandingPage from "./LandingPage";
 import ErrorBoundary from "./ErrorBoundary";
 import SimulatorPage from "./SimulatorPage";
 import ReportPage from "./ReportPage";
+import { useSimStream } from "./hooks/useSimStream";
 
 const COLORS = {
   bg: "#1E1F22",
@@ -343,6 +344,27 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
       },
     ]);
 
+  // ★ useSimStream 훅 추가
+  const {
+    logs: streamLogs,
+    messages: streamMessages,
+    start: streamStart,
+    stop: streamStop,
+    running: streamRunning,
+    judgements,
+    guidances,
+    preventions,
+  } = useSimStream(setMessages, {
+    addSystem,
+    addChat,
+    setProgress,
+    setSimulationState,
+    getConversationBundle,
+    onSessionResult: setSessionResult,
+    selectedScenario,
+    selectedCharacter,
+  });
+
   // victim image helper
   const getVictimImage = (photoPath) => {
     if (!photoPath) return null;
@@ -405,272 +427,14 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     };
   }, []);
 
-  /* ✅ startSimulation - SSE 스트리밍 */
-  // const startSimulation = async () => {
-  //   if (streamingRef.current) {
-  //     addSystem("이미 시뮬레이션이 진행 중입니다.");
-  //     return;
-  //   }
-  //   streamingRef.current = true;
-
-  //   if (!selectedScenario || !selectedCharacter) {
-  //     addSystem("시나리오와 캐릭터를 먼저 선택해주세요.");
-  //     streamingRef.current = false;
-  //     return;
-  //   }
-
-  //   setHasInitialRun(true);
-  //   seenTurnsRef.current = new Set();   // ✅ 중복 키 초기화
-
-  //   if (simIntervalRef.current) {
-  //     clearInterval(simIntervalRef.current);
-  //     simIntervalRef.current = null;
-  //   }
-
-  //   setSimulationState("PREPARE");
-  //   setMessages([]);
-  //   setProgress(0);
-  //   setSessionResult(null);
-  //   setCurrentCaseId(null);
-  //   setShowReportPrompt(false);
-
-  //   addSystem(`시뮬레이션 시작: ${selectedScenario.name} / ${selectedCharacter.name}`);
-
-  //   try {
-  //     const payload = {
-  //       victim_id: selectedCharacter.id,
-  //       offender_id: selectedScenario.id,
-  //       use_tavily: false,
-  //       max_turns: 15,
-  //       round_limit: 5,
-  //       // stream_id는 generator에서 자동 부여(유지)
-  //     };
-
-  //     let caseId = null;
-  //     let totalRounds = payload.round_limit;
-  //     let currentRound = 0;
-
-  //     for await (const event of streamReactSimulation(payload)) {
-  //       // 서버는 { type, content, ts } 구조를 씀 → content 우선
-  //       const evt = event?.content ?? event;
-  //       console.log("[SSE Event]", event);
-        
-  //       // 🔚 로컬/명시 종료 신호 → 즉시 종료 처리
-  //       if (event.type === "run_end_local" || event.type === "run_end") {
-  //         setSimulationState("FINISH");
-  //         setShowReportPrompt(true);
-  //         addSystem("시뮬레이션이 종료되었습니다.");
-  //         // 선택: 최종 데이터 조회
-  //         if (caseId) {
-  //           try {
-  //             const bundle = await getConversationBundle(caseId);
-  //             setDefaultCaseData(bundle);
-  //             setSessionResult((prev) => ({
-  //               ...(prev || {}),
-  //               phishing: bundle.phishing,
-  //               evidence: bundle.evidence,
-  //               totalTurns: bundle.total_turns,
-  //               preview: bundle.preview,
-  //             }));
-  //           } catch (_) {}
-  //         }
-  //         break; // 제너레이터 루프 종료
-  //       }
-
-  //       if (event.type === "error") {
-  //         // 서버의 409 메시지면 부드럽게 안내
-  //         if ((event.message || "").includes("duplicated simulation run detected")) {
-  //           addSystem("이미 실행 중인 시뮬레이션이 있습니다. 잠시 후 다시 시도해주세요.");
-  //         }
-  //         throw new Error(event.message || "시뮬레이션 오류");
-  //       }
-
-  //       else if (event.type === "case_created") {
-  //         caseId = evt.case_id;
-  //         setCurrentCaseId(caseId);
-  //         addSystem(`케이스 생성: ${caseId}`);
-  //       }
-        
-  //       else if (event.type === "round_start") {
-  //         currentRound = evt.round;
-  //         addSystem(evt.message);
-  //       }
-        
-  //       else if (event.type === "simulation_progress") {
-  //         setSimulationState("RUNNING");
-  //         addSystem(evt.message || `라운드 ${evt.round} 진행 중...`);
-  //       }
-        
-  //       else if (event.type === "conversation_logs") {
-  //         // 진행 상황만 업데이트
-  //         setProgress((evt.round / totalRounds) * 100);
-
-  //         // ✅ 누락된 턴만 보정 (서버가 한꺼번에 보내줄 수 있으므로)
-  //         const logs = Array.isArray(evt.logs) ? evt.logs : [];
-  //         const missing = logs
-  //           .sort((a,b) => (a.turn_index ?? 0) - (b.turn_index ?? 0))
-  //           .filter((log) => {
-  //             const role = (log.role || "offender").toLowerCase();
-  //             const key = `${evt.round}:${log.turn_index}:${role}`;
-  //             return !seenTurnsRef.current.has(key);
-  //           });
-
-  //         for (const log of missing) {
-  //           const role = (log.role || "offender").toLowerCase();
-  //           const raw = log.content || log.text || log.message || "";
-  //           const content = extractDialogueOrPlainText(raw);
-
-  //           const label =
-  //             role === "offender"
-  //               ? (selectedScenario?.name || "피싱범")
-  //               : (selectedCharacter?.name || "피해자");
-  //           const side = role === "offender" ? "left" : "right";
-  //           const ts = log.created_kst
-  //             ? new Date(log.created_kst).toLocaleTimeString()
-  //             : new Date().toLocaleTimeString();
-
-  //           addChat(role, content, ts, label, side, {
-  //             run: log.run,
-  //             turn: log.turn_index || log.turn,
-  //           });
-
-  //           const key = `${evt.round}:${log.turn_index}:${role}`;
-  //           seenTurnsRef.current.add(key);
-  //         }
-
-  //         // 안내 메시지 (선택)
-  //         if (evt.status === "no_logs") {
-  //           addSystem(`⚠️ 라운드 ${evt.round} 로그를 가져오지 못했습니다.`);
-  //         }
-  //         setSimulationState("RUNNING");
-  //       }
-        
-  //       else if (event.type === "round_complete") {
-  //         // conversation_logs에서 이미 처리했으므로 중복 방지
-  //         addSystem(`라운드 ${evt.round} 완료 (${evt.total_turns}턴)`);
-  //       }
-  //       // ✅ 백엔드가 [conversation_log] 묶음 로그만 보낼 때 프론트에서 발화별로 분해
-  //       else if (
-  //         event?.type === "log" &&
-  //         typeof event.content === "string" &&
-  //         event.content.startsWith("[conversation_log]")
-  //       ) {
-  //         const parsed = parseConversationLogContent(event.content);
-  //         if (parsed && parsed.turns.length) {
-  //           const roundNo = parsed.roundNo || 1;
-  //           // 진행률 살짝 올려주기(선택)
-  //           setProgress((p) => Math.min(100, p + 1));
-  //           setSimulationState("RUNNING");
-
-  //           parsed.turns.forEach((t, idx) => {
-  //             const role = (t.role || "offender").toLowerCase();
-  //             const raw = t.text || t.content || "";
-  //             const content = extractDialogueOrPlainText(raw);
-
-  //             const key = `${roundNo}:${idx}:${role}`;
-  //             if (seenTurnsRef.current.has(key)) return; // 중복 방지
-  //             seenTurnsRef.current.add(key);
-
-  //             const label =
-  //               role === "offender"
-  //                 ? (selectedScenario?.name || "피싱범")
-  //                 : (selectedCharacter?.name || "피해자");
-  //             const side = role === "offender" ? "left" : "right";
-  //             const ts = new Date().toLocaleTimeString();
-
-  //             addChat(role, content, ts, label, side, {
-  //               run: roundNo,
-  //               turn: idx,
-  //             });
-  //           });
-  //         }
-  //       }
-  //       else if (event.type === "new_message") {
-  //         // 중복 방지
-  //         const role = (evt.role || "offender").toLowerCase();
-  //         const key = `${evt.round}:${evt.turn_index}:${role}`;
-  //         if (seenTurnsRef.current.has(key)) {
-  //           continue;
-  //         }
-  //         seenTurnsRef.current.add(key);
-
-  //         // 내용 정리 (victim의 ```json``` 포함 케이스)
-  //         const raw = evt.content || "";
-  //         const content = extractDialogueOrPlainText(raw);
-
-  //         const label =
-  //           role === "offender"
-  //             ? (selectedScenario?.name || "피싱범")
-  //             : (selectedCharacter?.name || "피해자");
-
-  //         const side = role === "offender" ? "left" : "right";
-  //         const ts = evt.created_kst
-  //           ? new Date(evt.created_kst).toLocaleTimeString()
-  //           : new Date().toLocaleTimeString();
-
-  //         // 바로 대화창에 append
-  //         addChat(role, content, ts, label, side, {
-  //           run: evt.round,
-  //           turn: evt.turn_index,
-  //         });
-
-  //         // 스피너 감추기 / 진행중 표시
-  //         setSimulationState("RUNNING");
-  //         setProgress((p) => Math.min(100, p + 1));
-  //       }
-        
-  //       else if (event.type === "judgement") {
-  //         addSystem(`라운드 ${evt.round} 판정: ${evt.phishing ? "피싱 성공" : "피싱 실패"} - ${evt.reason}`);
-  //       }
-        
-  //       else if (event.type === "guidance_generated") {
-  //         addSystem(`라운드 ${evt.round} 지침 생성: ${evt.guidance?.categories?.join(", ") || "N/A"}`);
-  //       }
-        
-  //       else if (event.type === "complete") {
-  //         setProgress(100);
-  //         setSimulationState("IDLE");
-  //         setShowReportPrompt(true);
-  //         addSystem("시뮬레이션 완료!");
-          
-  //         // 최종 데이터 조회
-  //         if (caseId) {
-  //           const bundle = await getConversationBundle(caseId);
-  //           setDefaultCaseData(bundle);
-  //           setSessionResult((prev) => ({
-  //             ...(prev || {}),
-  //             phishing: bundle.phishing,
-  //             evidence: bundle.evidence,
-  //             totalTurns: bundle.total_turns,
-  //             preview: bundle.preview,
-  //           }));
-  //         }
-  //       }
-  //     }
-
-  //     // 종료 신호 없이 자연 종료됐는데도 caseId가 없다면 에러
-  //     // (run_end_local/ run_end를 받았다면 여기까지 오지 않음)
-  //     if (!caseId && simulationState !== "FINISH") {
-  //       throw new Error("case_id를 받지 못했습니다.");
-  //     }
-
-  //   } catch (err) {
-  //     console.error("SSE 스트리밍 실패:", err);
-  //     addSystem(`시뮬레이션 실패: ${err.message}`);
-  //     setSimulationState("IDLE");
-  //   } finally {
-  //     streamingRef.current = false;
-  //   }
-  // };
-
   /* resetToSelection */
   const resetToSelection = () => {
     setSelectedScenario(null);
     setSelectedCharacter(null);
-    setMessages([]);
-    setSessionResult(null);
-    setProgress(0);
-    setSimulationState("IDLE");
+    // setMessages([]);
+    // setSessionResult(null);
+    // setProgress(0);
+    // setSimulationState("IDLE");
     setCurrentPage("simulator");
   };
 
@@ -729,6 +493,15 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     progress,
     setProgress,
 
+    // ★ useSimStream 데이터 추가
+    streamStart,
+    streamStop,
+    streamRunning,
+    streamLogs,
+    judgements,
+    guidances,
+    preventions,
+
     victimImageUrl: selectedCharacter
       ? getVictimImage(selectedCharacter.photo_path)
       : null,
@@ -741,7 +514,11 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
       )}
       {currentPage === "simulator" && <ErrorBoundary><SimulatorPage {...pageProps} /></ErrorBoundary>}
       {currentPage === "report" && (
-        <ReportPage {...pageProps} defaultCaseData={defaultCaseData} />
+        <ReportPage 
+          {...pageProps} 
+          defaultCaseData={defaultCaseData}
+          preventions={preventions}
+        />
       )}
     </div>
   );

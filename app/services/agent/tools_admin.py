@@ -81,28 +81,15 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
         
-        # ★★★ 1-1. 이스케이프 문제 수정 후 재시도 (강화 버전)
+        # ★★★ 1-1. Invalid control character 에러 처리
+        # 실제 개행문자를 이스케이프된 형태로 변환
         try:
-            cleaned = candidate
-            
-            # \\n → 실제 줄바꿈
-            if '\\n' in cleaned:
-                cleaned = cleaned.replace('\\n', '\n')
-            # \\t → 실제 탭
-            if '\\t' in cleaned:
-                cleaned = cleaned.replace('\\t', '\t')
-            # \\r → 실제 캐리지 리턴
-            if '\\r' in cleaned:
-                cleaned = cleaned.replace('\\r', '\r')
-            # \\' → ' (JSON에서는 작은따옴표를 이스케이프할 필요 없음)
-            if "\\'" in cleaned:
-                cleaned = cleaned.replace("\\'", "'")
-            
-            # 변환이 발생한 경우에만 재파싱 시도
+            # 제어 문자를 이스케이프
+            cleaned = candidate.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
             if cleaned != candidate:
                 v = json.loads(cleaned)
                 if isinstance(v, dict):
-                    logger.info("[_try_parse] 이스케이프 변환 후 성공")
+                    logger.info("[_try_parse] 제어문자 이스케이프 후 성공")
                     return v
         except json.JSONDecodeError:
             pass
@@ -298,24 +285,31 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     )
     
     # ★★★ 부족한 닫는 중괄호 추가 (과다보다 먼저 처리)
+    s_fixed = s
+    modifications = []
+    
     if open_braces > close_braces:
         missing = open_braces - close_braces
-        tmp = s + ('}' * missing)
+        s_fixed = s_fixed + ('}' * missing)
+        modifications.append(f"}} {missing}개")
         logger.info("[_to_dict] 5단계: 닫는 } %d개 추가 시도", missing)
-        val = _try_parse(tmp)
-        if val is not None:
-            logger.warning("[_to_dict] 5단계 성공 (} %d개 추가)", missing)
-            return val
     
     # ★★★ 부족한 닫는 대괄호 추가
     if open_brackets > close_brackets:
         missing = open_brackets - close_brackets
-        tmp = s + (']' * missing)
+        s_fixed = s_fixed + (']' * missing)
+        modifications.append(f"] {missing}개")
         logger.info("[_to_dict] 5단계: 닫는 ] %d개 추가 시도", missing)
-        val = _try_parse(tmp)
+    
+    # ★★★ 괄호를 추가했다면 반드시 파싱 시도
+    if modifications:
+        logger.info("[_to_dict] 5단계: 괄호 보정 완료 (%s)", ", ".join(modifications))
+        val = _try_parse(s_fixed)
         if val is not None:
-            logger.warning("[_to_dict] 5단계 성공 (] %d개 추가)", missing)
+            logger.warning("[_to_dict] 5단계 성공 (괄호 보정: %s)", ", ".join(modifications))
             return val
+        # 실패해도 보정된 버전으로 계속 진행
+        s = s_fixed
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # ★★★ 6단계: 이스케이프 변환 시도
@@ -357,6 +351,11 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         if "Expecting" in e.msg:
             logger.error("[_to_dict] ⚠️  JSON 구조 오류: %s", e.msg)
             logger.error("[_to_dict] ⚠️  에이전트가 잘못된 JSON을 생성했을 가능성")
+        
+        # Invalid control character 에러
+        if "Invalid control character" in e.msg:
+            logger.error("[_to_dict] ⚠️  제어 문자 오류: JSON 문자열 내부에 이스케이프되지 않은 개행문자 존재")
+            logger.error("[_to_dict] ⚠️  원인: 에이전트가 \\n 대신 실제 개행문자를 사용")
     
     raise HTTPException(
         status_code=422,

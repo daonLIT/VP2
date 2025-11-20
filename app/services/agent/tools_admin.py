@@ -81,7 +81,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         except json.JSONDecodeError:
             pass
         
-        # ★★★ 1-1. Invalid control character 에러 처리
+        # ★★★ 1-1. Invalid control character 에러 처리 (강화)
         # 실제 개행문자를 이스케이프된 형태로 변환
         try:
             # 제어 문자를 이스케이프
@@ -130,12 +130,56 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ★★★ 0단계: 작은따옴표로 감싸진 JSON 값 정리
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    def normalize_quoted_json(text: str) -> str:
+        """
+        "text": '{"key": "value"}' 같은 패턴을 
+        "text": "{\"key\": \"value\"}" 형태로 변환
+        """
+        # 패턴: "key": '...' 형태 찾기
+        pattern = r'("[^"]+"\s*:\s*)\'([^\']*(?:\'\'[^\']*)*)\'(?=\s*[,}\]])'
+        
+        def replace_func(match):
+            prefix = match.group(1)  # "key": 부분
+            content = match.group(2)  # '...' 내부
+            
+            # 내부의 따옴표 이스케이프
+            content_escaped = content.replace('"', '\\"')
+            
+            return f'{prefix}"{content_escaped}"'
+        
+        result = re.sub(pattern, replace_func, text)
+        return result
+
+    s_normalized = normalize_quoted_json(s)
+    if s_normalized != s:
+        logger.info("[_to_dict] 0단계: 작은따옴표 JSON 값 정규화")
+        val = _try_parse(s_normalized)
+        if val is not None:
+            logger.info("[_to_dict] 0단계 성공")
+            return val
+        s = s_normalized
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 1단계: 전체 문자열 직접 파싱
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     val = _try_parse(s)
     if val is not None:
         logger.info("[_to_dict] 1단계 성공 (전체 문자열)")
         return val
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ★★★ 1-2단계: 제어문자 사전 정리 후 재시도
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    s_cleaned_ctrl = s.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+    if s_cleaned_ctrl != s:
+        logger.info("[_to_dict] 1-2단계: 전체 문자열 제어문자 정리")
+        val = _try_parse(s_cleaned_ctrl)
+        if val is not None:
+            logger.info("[_to_dict] 1-2단계 성공 (제어문자 정리)")
+            return val
+        s = s_cleaned_ctrl
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 2단계: "data" 키 뒤의 {...} 블록만 추출
@@ -223,7 +267,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     # 5단계: 중괄호 부족/과다 감지 및 수정 시도 (강화 버전)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    # ★★★ 5단계 전처리: 끝의 공백 및 과도한 괄호 동시 제거
+    # 5단계 전처리: 끝의 공백 및 과도한 괄호 동시 제거
     s_cleaned = s.rstrip()
     
     # 끝에서부터 과도한 }와 ] 제거 (최대 5개까지)
@@ -231,7 +275,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     for _ in range(5):
         if not s_cleaned:
             break
-        s_cleaned = s_cleaned.rstrip()  # 매번 공백 제거
+        s_cleaned = s_cleaned.rstrip()
         if s_cleaned and s_cleaned[-1] in ']}':
             s_cleaned = s_cleaned[:-1]
             removed_total += 1
@@ -246,7 +290,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             return val
         s = s_cleaned
 
-    # 문자열 내부 제외하고 카운트 (개선된 버전)
+    # 문자열 내부 제외하고 카운트
     def count_brackets(text: str) -> tuple:
         open_b = 0
         close_b = 0
@@ -284,7 +328,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         open_braces, close_braces, open_brackets, close_brackets
     )
     
-    # ★★★ 부족한 닫는 중괄호 추가 (과다보다 먼저 처리)
+    # 부족한 닫는 중괄호 추가
     s_fixed = s
     modifications = []
     
@@ -294,25 +338,24 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         modifications.append(f"}} {missing}개")
         logger.info("[_to_dict] 5단계: 닫는 } %d개 추가 시도", missing)
     
-    # ★★★ 부족한 닫는 대괄호 추가
+    # 부족한 닫는 대괄호 추가
     if open_brackets > close_brackets:
         missing = open_brackets - close_brackets
         s_fixed = s_fixed + (']' * missing)
         modifications.append(f"] {missing}개")
         logger.info("[_to_dict] 5단계: 닫는 ] %d개 추가 시도", missing)
     
-    # ★★★ 괄호를 추가했다면 반드시 파싱 시도
+    # 괄호를 추가했다면 반드시 파싱 시도
     if modifications:
         logger.info("[_to_dict] 5단계: 괄호 보정 완료 (%s)", ", ".join(modifications))
         val = _try_parse(s_fixed)
         if val is not None:
             logger.warning("[_to_dict] 5단계 성공 (괄호 보정: %s)", ", ".join(modifications))
             return val
-        # 실패해도 보정된 버전으로 계속 진행
         s = s_fixed
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # ★★★ 6단계: 이스케이프 변환 시도
+    # 6단계: 이스케이프 변환 시도
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if '\\n' in s or "\\'" in s or '\\t' in s:
         logger.info("[_to_dict] 6단계: 이스케이프 변환 시도")
@@ -320,6 +363,109 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         val = _try_parse(cleaned)
         if val is not None:
             logger.warning("[_to_dict] 6단계 성공 (이스케이프 변환)")
+            return val
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ★★★ 7단계: 중첩된 JSON 문자열 처리 (신규)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # "text": '{"nested": "json"}' 같은 패턴의 작은따옴표 내부를
+    # 이스케이프된 큰따옴표로 변환
+    def fix_nested_json_strings(text: str) -> str:
+        """작은따옴표로 감싸진 JSON 값을 큰따옴표로 변환하고 내부 따옴표를 이스케이프"""
+        result = []
+        i = 0
+        
+        while i < len(text):
+            # "key": ' 패턴 찾기
+            if i < len(text) - 3 and text[i] == '"':
+                # 키 시작
+                key_start = i
+                i += 1
+                # 키 끝까지
+                while i < len(text) and text[i] != '"':
+                    if text[i] == '\\':
+                        i += 2
+                    else:
+                        i += 1
+                
+                if i < len(text):
+                    i += 1  # 닫는 "
+                    # : 찾기
+                    while i < len(text) and text[i] in ' \t\n\r':
+                        i += 1
+                    
+                    if i < len(text) and text[i] == ':':
+                        result.append(text[key_start:i+1])
+                        i += 1
+                        # 공백 건너뛰기
+                        while i < len(text) and text[i] in ' \t\n\r':
+                            result.append(text[i])
+                            i += 1
+                        
+                        # ' 로 시작하는 값인지 확인
+                        if i < len(text) and text[i] == "'":
+                            # 작은따옴표로 감싸진 값 추출
+                            i += 1  # ' 건너뛰기
+                            value_start = i
+                            escaped_value = []
+                            
+                            while i < len(text) and text[i] != "'":
+                                if text[i] == '"':
+                                    escaped_value.append('\\"')
+                                elif text[i] == '\\' and i + 1 < len(text) and text[i+1] == "'":
+                                    # \' 는 그냥 '로
+                                    escaped_value.append("'")
+                                    i += 1
+                                else:
+                                    escaped_value.append(text[i])
+                                i += 1
+                            
+                            # 변환된 값을 큰따옴표로 감싸기
+                            result.append('"')
+                            result.extend(escaped_value)
+                            result.append('"')
+                            
+                            if i < len(text) and text[i] == "'":
+                                i += 1  # 닫는 ' 건너뛰기
+                            continue
+            
+            result.append(text[i])
+            i += 1
+        
+        return ''.join(result)
+    
+    s_nested_fixed = fix_nested_json_strings(s)
+    if s_nested_fixed != s:
+        logger.info("[_to_dict] 7단계: 중첩 JSON 문자열 처리")
+        val = _try_parse(s_nested_fixed)
+        if val is not None:
+            logger.warning("[_to_dict] 7단계 성공 (중첩 JSON 처리)")
+            return val
+        s = s_nested_fixed
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ★★★ 8단계: 모든 처리를 조합하여 최종 시도
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    logger.info("[_to_dict] 8단계: 종합 처리 시도")
+    s_final = s
+    
+    # 1. 작은따옴표 정규화
+    s_final = normalize_quoted_json(s_final)
+    # 2. 중첩 JSON 처리
+    s_final = fix_nested_json_strings(s_final)
+    # 3. 제어문자 정리
+    s_final = s_final.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+    # 4. 괄호 보정
+    open_b, close_b, open_sq, close_sq = count_brackets(s_final)
+    if open_b > close_b:
+        s_final += '}' * (open_b - close_b)
+    if open_sq > close_sq:
+        s_final += ']' * (open_sq - close_sq)
+    
+    if s_final != s:
+        val = _try_parse(s_final)
+        if val is not None:
+            logger.warning("[_to_dict] 8단계 성공 (종합 처리)")
             return val
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -356,6 +502,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         if "Invalid control character" in e.msg:
             logger.error("[_to_dict] ⚠️  제어 문자 오류: JSON 문자열 내부에 이스케이프되지 않은 개행문자 존재")
             logger.error("[_to_dict] ⚠️  원인: 에이전트가 \\n 대신 실제 개행문자를 사용")
+            logger.error("[_to_dict] ⚠️  해결: 0단계, 1-2단계, 7-8단계에서 자동 처리 시도했으나 실패")
     
     raise HTTPException(
         status_code=422,

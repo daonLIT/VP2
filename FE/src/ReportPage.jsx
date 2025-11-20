@@ -229,20 +229,41 @@ const ReportPage = ({
       ? scenarios[0]?.type ?? "피싱 유형"
       : "피싱 유형");
 
-  // 🔹 위험도 뱃지
+  // 🔹 InvestigationBoard와 동일한 위험도 매핑
+  function getRiskTokens(levelRaw) {
+    const lv = String(levelRaw || "").toLowerCase();
+
+    if (lv === "critical") {
+      return { label: "치명적", color: "#EF4444", bg: "#EF444420" };
+    }
+    if (lv === "high") {
+      return { label: "높음", color: "#F59E0B", bg: "#F59E0B20" };
+    }
+    if (lv === "medium") {
+      return { label: "보통", color: "#06B6D4", bg: "#06B6D420" };
+    }
+    if (lv === "low") {
+      return { label: "낮음", color: "#10B981", bg: "#10B98120" };
+    }
+
+    // 예외 값 처리
+    return {
+      label: levelRaw ?? "-",
+      color: THEME.sub,
+      bg: THEME.panelDark,
+    };
+  }
+
+  // 🔹 위험도 뱃지 (개인화 예방법 상단)
   function RiskBadge({ level }) {
-    const lv = String(level || "").toLowerCase();
-    let toneBg = THEME.border;
-    if (lv.includes("high")) toneBg = THEME.danger;
-    else if (lv.includes("medium")) toneBg = THEME.warn;
-    else if (lv.includes("low")) toneBg = THEME.success;
+    const { label, color, bg } = getRiskTokens(level);
 
     return (
       <span
         className="text-xs px-3 py-1 rounded font-semibold"
-        style={{ backgroundColor: toneBg, color: THEME.black }}
+        style={{ backgroundColor: bg, color }}
       >
-        위험도: {level ?? "-"}
+        위험도: {label}
       </span>
     );
   }
@@ -518,12 +539,11 @@ const ReportPage = ({
                         </h4>
                         <div className="space-y-3">
                           {parsedFinalAnswer.rounds.map((round) => {
-                            const riskColor =
-                              round.riskLevel.toLowerCase() === "high"
-                                ? THEME.danger
-                                : round.riskLevel.toLowerCase() === "medium"
-                                  ? THEME.warn
-                                  : THEME.success;
+                            const {
+                              label: riskLabel,
+                              color: riskColor,
+                              bg: riskBg,
+                            } = getRiskTokens(round.riskLevel);
 
                             return (
                               <div
@@ -551,16 +571,16 @@ const ReportPage = ({
                                         color: THEME.white,
                                       }}
                                     >
-                                      {round.phishing ? "피싱" : "정상"}
+                                      {round.phishing ? "피싱성공" : "피싱실패"}
                                     </span>
                                     <span
                                       className="px-3 py-1 rounded text-xs font-semibold"
                                       style={{
-                                        backgroundColor: riskColor,
-                                        color: THEME.white,
+                                        backgroundColor: riskBg,
+                                        color: riskColor,
                                       }}
                                     >
-                                      {round.riskLevel}
+                                      {riskLabel}
                                     </span>
                                   </div>
                                 </div>

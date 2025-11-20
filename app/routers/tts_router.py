@@ -1,155 +1,405 @@
-# app/api/tts_routes.py
+# app/routers/tts_router.py
 from __future__ import annotations
-from typing import List, Optional, Dict, Any
+import os, io, base64, re, wave
+from typing import List, Optional, Literal, Union, Tuple, Set
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+from dotenv import load_dotenv
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from app.db.session import get_db
+from app.db import models as m
+from app.services.tts_service import get_cached_dialog, cache_run_dialog
 
-from app.core.logging import get_logger
-from app.services.tts_cache import TTS_CACHE, TTSItem
-from app.services.tts_service import start_tts_for_run_background
+# 환경 설정
+load_dotenv()
+cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
-logger = get_logger(__name__)
+if cred_path:
+    # 상대 경로면 절대 경로로 변환
+    if not os.path.isabs(cred_path):
+        # VP 디렉토리 기준으로 경로 계산
+        base_dir = Path(__file__).parent.parent.parent  # VP 디렉토리
+        cred_path = str(base_dir / cred_path)
+    
+    # 파일 존재 여부 확인
+    if not os.path.exists(cred_path):
+        raise FileNotFoundError(
+            f"Google Cloud credentials file not found: {cred_path}\n"
+            f"Please check GOOGLE_APPLICATION_CREDENTIALS in .env"
+        )
+    
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
+    print(f"✅ Google Cloud credentials loaded from: {cred_path}")
+else:
+    print("⚠️ GOOGLE_APPLICATION_CREDENTIALS not set in .env")
 
-router = APIRouter(prefix="/api/tts", tags=["tts"])
+# Google TTS 클라이언트
+from google.cloud import texttospeech_v1 as texttospeech
+tts_client = texttospeech.TextToSpeechClient()
 
+router = APIRouter(tags=["TTS"])
 
-# ─────────────────────────────────────────────────────────
-# Pydantic 모델
-# ─────────────────────────────────────────────────────────
-class TTSSynthesizeRequest(BaseModel):
-    mode: str = "dialogue"
-    case_id: Optional[str] = None   # 없으면 마지막 처리된 case_id 사용
-    run_no: Optional[int] = None    # 없으면 해당 case의 모든 run 반환
+# ============================================
+# Pydantic 모델들
+# ============================================
+class WordTiming(BaseModel):
+    token: str
+    charCount: int
+    startSec: float
+    durationSec: float
 
-
-class TTSItemResponse(BaseModel):
-    case_id: str
-    run_no: int
-    turn_index: int
+class DialogueItem(BaseModel):
+    run_no: Optional[int] = None
     speaker: str
     text: str
+    voiceName: str
+    languageCode: str
     audioContent: str
     contentType: str
-    totalDurationSec: Optional[float] = None
-    charTimeSec: Optional[float] = None
+    totalDurationSec: float
+    charTimeSec: float
+    words: List[WordTiming]
 
+class DialogueResponse(BaseModel):
+    items: List[DialogueItem]
+    note: str = "Word timings are heuristic (char-proportional)."
 
-class TTSSynthesizeResponse(BaseModel):
-    items: List[TTSItemResponse]
-
-# ─────────────────────────────────────────────────────────
-# TTS 생성 시작용 모델
-# ─────────────────────────────────────────────────────────
-class TTSTurn(BaseModel):
-    role: str
-    text: str
-
-
-class TTSStartRequest(BaseModel):
+class CaseDialogueRequest(BaseModel):
+    """케이스 대화 TTS 변환 요청"""
     case_id: str
-    run_no: int
-    turns: List[TTSTurn]
+    run_no: int  # 특정 라운드의 대화를 변환
+    speakingRate: float = 1.5
+    pitch: float = 0.0
 
+# ============================================
+# 음성 매핑
+# ============================================
+VOICE_BY_SPEAKER = {
+    "offender": {"languageCode": "ko-KR", "voiceName": "ko-KR-Standard-C"},
+    "victim":   {"languageCode": "ko-KR", "voiceName": "ko-KR-Standard-A"},
+}
 
-class TTSStartResponse(BaseModel):
-    ok: bool
-    message: str
-# ─────────────────────────────────────────────────────────
-# 엔드포인트
-# ─────────────────────────────────────────────────────────
-@router.post("/synthesize", response_model=TTSSynthesizeResponse)
-def synthesize_tts(req: TTSSynthesizeRequest) -> TTSSynthesizeResponse:
-    """
-    프론트 TTSModal에서 호출하는 엔드포인트.
+VOICE_BY_AGE_GENDER = {
+    ("20s", "female"): "ko-KR-Standard-A",
+    ("30s", "female"): "ko-KR-Standard-A",
+    ("20s", "male")  : "ko-KR-Standard-C",
+    ("30s", "male")  : "ko-KR-Standard-C",
+    ("40s", "female"): "ko-KR-Standard-B",
+    ("50s", "female"): "ko-KR-Standard-B",
+    ("60s", "female"): "ko-KR-Standard-B",
+    ("40s", "male")  : "ko-KR-Standard-D",
+    ("50s", "male")  : "ko-KR-Standard-D",
+    ("60s", "male")  : "ko-KR-Standard-D",
+}
 
-    - case_id가 없으면: 마지막으로 TTS가 생성된 case_id 사용
-    - run_no가 없으면: 해당 case_id의 모든 run_no 항목을 한 번에 반환
-    """
-    logger.info(
-        f"[TTS] synthesize 요청: mode={req.mode}, case_id={req.case_id}, run_no={req.run_no}"
+OFFENDER_ALTERNATES = [
+    "ko-KR-Standard-A",
+    "ko-KR-Standard-B",
+    "ko-KR-Standard-C",
+    "ko-KR-Standard-D",
+]
+
+# ============================================
+# 유틸리티 함수들
+# ============================================
+CHAR_PATTERN = re.compile(r"[가-힣A-Za-z0-9]")
+
+def count_chars(token: str) -> int:
+    return len(CHAR_PATTERN.findall(token))
+
+def wav_duration_sec(wav_bytes: bytes) -> float:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        return w.getnframes() / float(w.getframerate())
+
+def wrap_pcm_to_wav(pcm_bytes: bytes, sample_rate: int = 24000, 
+                    channels: int = 1, sampwidth: int = 2) -> bytes:
+    """raw PCM (linear16) bytes → WAV 파일 bytes"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(sampwidth)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+def synthesize_wav_and_timings(
+    text: str,
+    languageCode: str,
+    voiceName: str,
+    speakingRate: float = 1.5,
+    pitch: float = 0.0,
+    sample_rate_hz: int = 24000,
+) -> Tuple[bytes, float, float, List[WordTiming]]:
+    """Google TTS 호출 → WAV bytes 확보 + 타이밍 반환"""
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code=languageCode, 
+        name=voiceName
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+        speaking_rate=speakingRate,
+        pitch=pitch,
+        sample_rate_hertz=sample_rate_hz,
     )
 
-    # case_id 결정
-    if req.case_id:
-        case_id = req.case_id
+    resp = tts_client.synthesize_speech(
+        input=synthesis_input, 
+        voice=voice, 
+        audio_config=audio_config
+    )
+    audio_bytes = resp.audio_content or b""
+
+    # 이미 WAV인지 확인
+    if len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE":
+        wav_bytes = audio_bytes
     else:
-        case_id = TTS_CACHE.get_last_case_id()
-        if not case_id:
-            logger.warning("[TTS] synthesize 실패: last_case_id 없음")
-            raise HTTPException(status_code=404, detail="사용 가능한 TTS 데이터가 없습니다. (case_id 없음)")
+        wav_bytes = wrap_pcm_to_wav(audio_bytes, sample_rate=sample_rate_hz)
 
-    items: List[TTSItem] = []
+    total_sec = wav_duration_sec(wav_bytes)
 
-    if req.run_no is not None:
-        # 특정 run만
-        got = TTS_CACHE.get_items(case_id, req.run_no)
-        if not got:
-            logger.info(
-                f"[TTS] synthesize: 아직 준비 안 됨 (case_id={case_id}, run_no={req.run_no})"
-            )
-            raise HTTPException(
-                status_code=404,
-                detail=f"TTS 데이터가 아직 준비되지 않았습니다. case_id={case_id}, run_no={req.run_no}",
-            )
-        items.extend(got)
+    # 토큰화
+    tokens = [tk for tk in re.split(r"\s+", text.strip()) if tk]
+    counts = [count_chars(tk) for tk in tokens]
+    total_chars = sum(counts)
+    words: List[WordTiming] = []
+
+    if total_chars <= 0 or not tokens:
+        per = total_sec / max(len(tokens), 1) if tokens else 0.0
+        acc = 0.0
+        for tk in tokens:
+            words.append(WordTiming(
+                token=tk, charCount=0, 
+                startSec=round(acc, 6), 
+                durationSec=round(per, 6)
+            ))
+            acc += per
+        return wav_bytes, total_sec, 0.0, words
+
+    # 글자 비례 계산
+    char_time = total_sec / total_chars
+    acc = 0.0
+    for tk, cc in zip(tokens, counts):
+        dur = cc * char_time
+        words.append(WordTiming(
+            token=tk, charCount=cc, 
+            startSec=acc, durationSec=dur
+        ))
+        acc += dur
+
+    # 보정
+    if words:
+        last = words[-1]
+        last_end = last.startSec + last.durationSec
+        if total_sec - last_end > 1e-6:
+            last.durationSec += (total_sec - last_end)
+
+    for w in words:
+        w.startSec = round(w.startSec, 6)
+        w.durationSec = round(w.durationSec, 6)
+
+    return wav_bytes, total_sec, round(char_time, 9), words
+
+def choose_voice_name(
+    speaker: str,
+    age_group: Optional[str] = None,
+    gender: Optional[str] = None,
+    taken_voices: Optional[Set[str]] = None
+) -> str:
+    """화자/연령/성별 기반 음성 선택"""
+    # 1. 연령+성별 우선
+    if age_group and gender:
+        candidate = VOICE_BY_AGE_GENDER.get((age_group, gender))
+        if candidate:
+            return candidate
+    
+    # 2. speaker 기반
+    base = VOICE_BY_SPEAKER.get(speaker, VOICE_BY_SPEAKER["victim"])
+    candidate = base["voiceName"]
+    
+    # 3. offender 충돌 방지
+    if speaker == "offender" and taken_voices and candidate in taken_voices:
+        for alt in OFFENDER_ALTERNATES:
+            if alt not in taken_voices:
+                return alt
+    
+    return candidate
+
+# ============================================
+# ★★★ 핵심: 케이스 대화 TTS 변환 엔드포인트
+# ============================================
+@router.post("/case-dialogue", response_model=DialogueResponse)
+def synthesize_case_dialogue(
+    req: CaseDialogueRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    케이스의 특정 라운드 대화를 TTS로 변환
+    
+    흐름:
+    1. 캐시에서 대화 찾기
+    2. 없으면 DB에서 로드
+    3. TTS 변환
+    """
+    case_id = req.case_id
+    run_no = req.run_no
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Step 1: 캐시에서 찾기
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    cached_turns = get_cached_dialog(case_id, run_no)
+    
+    if cached_turns:
+        turns = cached_turns
+        source = "cache"
     else:
-        # 해당 케이스의 전체 run
-        got = TTS_CACHE.get_all_case_items(case_id)
-        if not got:
-            logger.info(
-                f"[TTS] synthesize: 아직 준비 안 됨 (case_id={case_id}, run=ALL)"
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Step 2: DB에서 로드
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        round_row = (
+            db.query(m.ConversationRound)
+            .filter(
+                m.ConversationRound.case_id == case_id,
+                m.ConversationRound.run == run_no
             )
-            raise HTTPException(
-                status_code=404,
-                detail=f"TTS 데이터가 아직 준비되지 않았습니다. case_id={case_id}",
-            )
-        items.extend(got)
-
-    # 캐시 아이템 → 응답 포맷으로 변환
-    resp_items: List[TTSItemResponse] = []
-    for it in items:
-        resp_items.append(
-            TTSItemResponse(
-                case_id=it.case_id,
-                run_no=it.run_no,
-                turn_index=it.turn_index,
-                speaker=it.speaker,
-                text=it.text,
-                audioContent=it.audio_b64,
-                contentType=it.content_type,
-                totalDurationSec=it.total_duration_sec,
-                charTimeSec=it.char_time_sec,
-            )
+            .first()
         )
-
-    logger.info(
-        f"[TTS] synthesize 응답: case_id={case_id}, run_no={req.run_no if req.run_no is not None else 'ALL'}, items={len(resp_items)}"
+        
+        if not round_row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"case_id={case_id}, run_no={run_no} 대화를 찾을 수 없습니다"
+            )
+        
+        turns = round_row.turns or []
+        source = "db"
+        
+        # 캐시에 저장 (다음 요청용)
+        cache_run_dialog(case_id, run_no, turns)
+    
+    if not turns:
+        raise HTTPException(
+            status_code=404,
+            detail=f"대화 내용이 비어있습니다 (source={source})"
+        )
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Step 3: 피해자 음성 미리 수집 (충돌 방지)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    victim_voices: Set[str] = set()
+    for turn in turns:
+        role = turn.get("role", "")
+        if role == "victim":
+            age = turn.get("age_group")
+            gender = turn.get("gender")
+            v = choose_voice_name("victim", age, gender)
+            victim_voices.add(v)
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Step 4: TTS 변환
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    items: List[DialogueItem] = []
+    
+    for turn in turns:
+        role = turn.get("role", "unknown")
+        text = turn.get("text", "")
+        
+        if not text:
+            continue
+        # ★★★ victim JSON 응답 처리
+        if role == "victim" and text.strip().startswith("{"):
+            try:
+                victim_json = json.loads(text)
+                text = victim_json.get("dialogue", text)
+            except:
+                pass
+        # 음성 선택
+        age = turn.get("age_group")
+        gender = turn.get("gender")
+        
+        if role == "offender":
+            vname = choose_voice_name("offender", age, gender, victim_voices)
+        else:
+            vname = choose_voice_name("victim", age, gender)
+        
+        lang = VOICE_BY_SPEAKER.get(role, VOICE_BY_SPEAKER["victim"])["languageCode"]
+        
+        try:
+            wav_bytes, total_sec, char_time, words = synthesize_wav_and_timings(
+                text=text,
+                languageCode=lang,
+                voiceName=vname,
+                speakingRate=req.speakingRate,
+                pitch=req.pitch,
+                sample_rate_hz=24000
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"TTS 변환 실패: {e}"
+            )
+        
+        items.append(DialogueItem(
+            run_no=run_no,
+            speaker=role,
+            text=text,
+            voiceName=vname,
+            languageCode=lang,
+            audioContent=base64.b64encode(wav_bytes).decode("utf-8"),
+            contentType="audio/wav",
+            totalDurationSec=round(total_sec, 3),
+            charTimeSec=round(char_time, 6),
+            words=words,
+        ))
+    
+    return DialogueResponse(
+        items=items,
+        note=f"Loaded from {source}. Word timings are heuristic."
     )
-    return TTSSynthesizeResponse(items=resp_items)
 
-@router.post("/start", response_model=TTSStartResponse)
-def start_tts(req: TTSStartRequest) -> TTSStartResponse:
-    """
-    프론트에서 버튼을 눌렀을 때 호출.
-    - turns: [{role, text}, ...] 를 그대로 받아서 TTS 백그라운드 생성 시작
-    - 바로 반환하고, 실제 생성은 thread에서 비동기로 수행
-    """
-    if not req.turns:
-        raise HTTPException(status_code=400, detail="turns가 비어있습니다.")
+# ============================================
+# 기존 헬스체크 엔드포인트들
+# ============================================
+@router.get("/voices")
+def list_voices():
+    """사용 가능한 TTS 음성 목록 반환"""
+    try:
+        voices = tts_client.list_voices()
+        korean_voices = [
+            {
+                "name": voice.name,
+                "language_code": voice.language_codes[0],
+                "ssml_gender": voice.ssml_gender.name,
+                "natural_sample_rate": voice.natural_sample_rate_hertz
+            }
+            for voice in voices.voices
+            if "ko-KR" in voice.language_codes[0]
+        ]
+        return {"voices": korean_voices}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"음성 목록 조회 실패: {e}")
 
-    raw_turns: List[Dict[str, Any]] = [
-        {"role": t.role, "text": t.text} for t in req.turns
-    ]
-
-    logger.info(
-        f"[TTS] /start 호출: case_id={req.case_id}, run_no={req.run_no}, turns={len(raw_turns)}"
-    )
-
-    # 이미 생성되어 있거나 생성 중이면, tts_service 쪽에서 자체적으로 skip 처리함
-    start_tts_for_run_background(req.case_id, req.run_no, raw_turns)
-
-    return TTSStartResponse(
-        ok=True,
-        message="TTS 생성이 비동기로 시작되었습니다.",
-    )
+@router.get("/health")
+def tts_health():
+    """TTS 서비스 헬스체크"""
+    try:
+        synthesis_input = texttospeech.SynthesisInput(text="테스트")
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="ko-KR",
+            name="ko-KR-Standard-A"
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16
+        )
+        
+        tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        return {"status": "healthy", "service": "google-tts"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}

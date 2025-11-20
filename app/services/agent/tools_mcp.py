@@ -349,6 +349,7 @@ def make_mcp_tools():
             "meta": meta,
             "log": result,
             "total_turns": stats.get("turns"),
+            "run_no": model.round_no or 1,
             "debug_templates": {          # 👈 추가
                 "attacker": atk_system,
                 "victim":   vic_system,

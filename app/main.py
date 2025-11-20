@@ -19,6 +19,9 @@ from app.routers import react_agent_stream_router
 from app.routers import react_agent_router
 from app.routers import tts_router
 
+print(f"[DEBUG] TTS Router loaded: {tts_router.router}")
+print(f"[DEBUG] TTS Router routes: {[route.path for route in tts_router.router.routes]}")
+
 #langsmith
 import os
 from langsmith import Client
@@ -67,7 +70,7 @@ app.include_router(agent_router.router, prefix=settings.API_PREFIX)
 app.include_router(react_agent_router.router, prefix=settings.API_PREFIX)
 
 app.include_router(react_agent_stream_router.router, prefix=settings.API_PREFIX)
-app.include_router(tts_router.router, prefix=settings.API_PREFIX)
+app.include_router(tts_router.router, prefix=f"{settings.API_PREFIX}/tts")
 
 
 

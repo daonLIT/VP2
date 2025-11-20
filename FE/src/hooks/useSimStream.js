@@ -13,6 +13,9 @@ export function useSimStream(
     onSessionResult,
     selectedScenario,
     selectedCharacter,
+    setOffenderGender, // ← 추가
+    setOffenderId,     // ✅ 추가
+    setVictimId,       // ✅ 추가
   } = {}
 ) {
   const [logs, setLogs] = useState([]);
@@ -43,6 +46,7 @@ export function useSimStream(
   // 🔊 TTS용: conversation_log 순서 기반 run 번호 / case_id
   const [ttsRuns, setTtsRuns] = useState([]);
   const [ttsCaseId, setTtsCaseId] = useState(null);
+  const [victimGender, setVictimGender] = useState("여");
   
   const stripAnsi = (s = "") => String(s).replace(/\x1B\[[0-9;]*m/g, "");
   const containsFinishedChain = (text = "") => /\bFinished chain\b/i.test(stripAnsi(text));
@@ -97,6 +101,18 @@ export function useSimStream(
       // 🔊 TTS용 초기화
       setTtsRuns([]);
       setTtsCaseId(null);
+      // ★★★ victimGender 초기화
+      setVictimGender("여");
+
+      // ✅ payload에서 ID를 즉시 저장 (시뮬레이션 시작 시점)
+      if (payload?.offender_id && setOffenderId) {
+        setOffenderId(payload.offender_id);
+        console.log("🎯 [offenderId] 설정:", payload.offender_id);
+      }
+      if (payload?.victim_id && setVictimId) {
+        setVictimId(payload.victim_id);
+        console.log("👤 [victimId] 설정:", payload.victim_id);
+      }
 
       caseIdRef.current = null;
       seenTurnsRef.current = new Set();
@@ -137,6 +153,27 @@ export function useSimStream(
             break;
           }
 
+          // ──────────────────────────────
+          // 0) conversation_round (victim_gender 포함)
+          // ──────────────────────────────
+          if (type === "conversation_round") {
+            console.log("🎯 conversation_round 감지!", evt);
+            
+            const gender = evt?.victim_gender || event?.content?.victim_gender;
+            
+            if (gender) {
+              setVictimGender(gender);
+              console.log("👤 [useSimStream] victimGender 업데이트:", gender);
+            }
+            
+           // ✅ offender_gender도 여기서 감지 (SSE에서 보내주는 경우)
+            const offGender = evt?.offender_gender || event?.content?.offender_gender;
+            if (offGender && setOffenderGender) {
+              setOffenderGender(offGender);
+              console.log("🎭 [useSimStream] offenderGender 업데이트:", offGender);
+            }
+            continue;
+          }
           // ──────────────────────────────
           // 1) conversation_log
           // ──────────────────────────────
@@ -192,6 +229,28 @@ export function useSimStream(
                   byRun,
                 };
               });
+              // ✅ 첫 턴에서 성별 정보 추출 (SSE에 없을 때 fallback)
+              if (turns.length > 0) {
+                const firstTurn = turns[0];
+                
+                // victim 성별
+                if (firstTurn.speaker === "victim" || firstTurn.role === "victim") {
+                  const vGender = firstTurn.gender || firstTurn.victim_gender;
+                  if (vGender) {
+                    setVictimGender(vGender);
+                    console.log("👤 [conversation_log] victimGender:", vGender);
+                  }
+                }
+                
+                // offender 성별
+                if (firstTurn.speaker === "offender" || firstTurn.role === "offender") {
+                  const oGender = firstTurn.gender || firstTurn.offender_gender;
+                  if (oGender && setOffenderGender) {
+                    setOffenderGender(oGender);
+                    console.log("🎭 [conversation_log] offenderGender:", oGender);
+                  }
+                }
+              }
             }
 
             // ⭐ 라운드가 바뀌었으면 라운드 박스 메시지 시스템으로 삽입
@@ -418,6 +477,9 @@ export function useSimStream(
       onSessionResult,
       selectedScenario,
       selectedCharacter,
+      setOffenderGender, // ← 의존성 추가
+      setOffenderId,    // ✅ 의존성 추가
+      setVictimId,      // ✅ 의존성 추가
     ]
   );
 
@@ -442,5 +504,6 @@ export function useSimStream(
     ttsRuns,
     ttsCaseId,
     ttsCache,
+    victimGender,
   };
 }

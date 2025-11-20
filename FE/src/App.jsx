@@ -170,6 +170,7 @@ export async function* streamReactSimulation(payload = {}) {
     "error",
     "terminal",
     "conversation_log",  // ✅ 이미 있음
+    "conversation_round",
     "judgement",
     "guidance",
     "prevention",
@@ -323,6 +324,9 @@ const App = () => {
   const [dataLoading, setDataLoading] = useState(true);
   const [dataError, setDataError] = useState(null);
   const [currentCaseId, setCurrentCaseId] = useState(null);
+  const [offenderGender, setOffenderGender] = useState(null);
+  const [offenderId, setOffenderId] = useState(null);  // ✅ 추가
+  const [victimId, setVictimId] = useState(null);      // ✅ 추가
 
   const addSystem = (content) =>
     setMessages((prev) => [
@@ -357,6 +361,7 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     ttsRuns,
     ttsCaseId,
     ttsCache,
+    victimGender,
   } = useSimStream(setMessages, {
     addSystem,
     addChat,
@@ -366,6 +371,9 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     onSessionResult: setSessionResult,
     selectedScenario,
     selectedCharacter,
+    setOffenderGender, // ★ 추가
+    setOffenderId,    // ✅ 추가
+    setVictimId,      // ✅ 추가
   });
 
   // victim image helper
@@ -473,7 +481,7 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     setSimulationState,
 
     messages,
-    setMessages, // ✅ 추가: 외부에서 messages state 관리 중
+    setMessages,
     addSystem,
     addChat,
 
@@ -507,6 +515,10 @@ const addChat = (sender, content, timestamp = null, senderLabel = null, side = n
     ttsRunsFromStream: ttsRuns,
     ttsCaseIdFromStream: ttsCaseId,
     ttsCacheFromStream: ttsCache,
+    victimGenderFromStream: victimGender,
+    offenderGenderFromStream: offenderGender, // ★ 추가
+    victimIdFromStream: victimId,               // ✅ state 사용
+    offenderIdFromStream: offenderId,           // ✅ 추가
 
     victimImageUrl: selectedCharacter
       ? getVictimImage(selectedCharacter.photo_path)

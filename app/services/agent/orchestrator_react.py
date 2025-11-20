@@ -21,10 +21,14 @@ from app.services.agent.tools_mcp import make_mcp_tools
 from app.services.agent.tools_tavily import make_tavily_tools
 from app.services.agent.guideline_repo_db import GuidelineRepoDB
 from app.core.logging import get_logger
-from app.services.tts_service import start_tts_for_run_background
+
 
 from app.schemas.simulation_request import SimulationStartRequest
 from app.services.prompt_integrator_db import build_prompt_package_from_payload
+from app.services.tts_service import (
+    cache_run_dialog,          # ✅ 라운드별 대화 캐시 저장
+    clear_case_dialog_cache,   # ✅ 케이스 종료 시 캐시 정리
+)
 
 logger = get_logger(__name__)
 
@@ -556,8 +560,68 @@ def _smart_print(*args, **kwargs):
             return
 
         tag = None
+        
+        # ★★★ conversation_log 감지 (MCP 대화 결과)
         if ("case_id" in data) and ("turns" in data) and ("stats" in data):
             tag = "conversation_log"
+            
+            # ✅ 즉시 TTS 캐시 저장
+            try:
+                case_id = data.get("case_id")
+                run_no = data.get("run_no", 1)  # run_no가 없으면 1로 가정
+                raw_turns = data.get("turns", [])
+
+                # ★★★ 메타 정보 추출 (피해자 성별)
+                meta = data.get("meta", {})
+                victim_profile = meta.get("victim_profile", {})
+                victim_meta = victim_profile.get("meta", {})
+                victim_gender = victim_meta.get("gender", "여")  # 기본값: 여성
+                
+                # victim dialogue 정리
+                cleaned_turns = []
+                for turn in raw_turns:
+                    role = turn.get("role", "")
+                    text = turn.get("text", "")
+                    
+                    # victim의 JSON 응답 처리
+                    if role == "victim" and text.strip().startswith("{"):
+                        try:
+                            victim_json = json.loads(text)
+                            text = victim_json.get("dialogue", text)
+                        except:
+                            pass
+                    
+                    cleaned_turns.append({
+                        "role": role,
+                        "text": text
+                    })
+                
+                if case_id and cleaned_turns:
+                    cache_run_dialog(
+                        case_id=str(case_id),
+                        run_no=run_no,
+                        turns=cleaned_turns,
+                    )
+                    logger.info(
+                        "[TTS_CACHE] ★ 즉시 캐시: case_id=%s run_no=%s turns=%s gender=%s",
+                        case_id,
+                        run_no,
+                        len(cleaned_turns),
+                        victim_gender,
+                    )
+                    # ★★★ SSE로 conversation_round 전송 시 gender 포함
+                    _emit_to_stream(
+                        "conversation_round",
+                        {
+                            "case_id": str(case_id),
+                            "run_no": run_no,
+                            "turns": _truncate(cleaned_turns, 2000),
+                            "victim_gender": victim_gender,  # ← 추가!
+                        },
+                    )
+            except Exception as e:
+                logger.error(f"[TTS_CACHE] _smart_print 캐시 저장 실패: {e}")
+        
         elif ("persisted" in data) and ("phishing" in data) and ("risk" in data):
             tag = "judgement"
         elif ("type" in data) and ("text" in data) and (("categories" in data) or ("targets" in data)):
@@ -636,12 +700,45 @@ def _wrap_sim_compose_prompts(original_tool):
     def sim_compose_prompts_cached(data: Any) -> dict:
         """프롬프트 생성 후 캐시에 저장하고 prompt_id만 반환"""
 
-        # 1) 문자열 → JSON
+        # ★★★ 디버깅: 원본 입력 로깅
+        logger.info(f"[PromptCache] 원본 data 타입: {type(data)}")
         if isinstance(data, str):
+            logger.info(f"[PromptCache] 원본 data 길이: {len(data)}")
+            logger.info(f"[PromptCache] 원본 data 전체: {data}")  # ★ 전체 출력으로 변경
+        else:
+            logger.info(f"[PromptCache] 원본 data: {data}")
+
+        # 1) 문자열 → JSON (강화된 파싱 with 정규식 추출)
+        if isinstance(data, str):
+            # ★★★ JSON 부분만 추출 (줄바꿈 이후 텍스트 제거)
+            s = data.strip()
+            
+            # 첫 번째 완전한 JSON 객체만 추출
+            brace_count = 0
+            json_end_idx = -1
+            for i, char in enumerate(s):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end_idx = i + 1
+                        break
+            
+            if json_end_idx > 0:
+                json_str = s[:json_end_idx]
+                logger.info(f"[PromptCache] 추출된 JSON 길이: {len(json_str)}")
+                logger.info(f"[PromptCache] 추출된 JSON: {json_str[:300]}...")
+            else:
+                json_str = s
+            
             try:
-                parsed = json.loads(data)
-            except Exception:
-                parsed = _loose_parse_json(data)
+                parsed = json.loads(json_str)
+                logger.info(f"[PromptCache] json.loads 성공")
+            except Exception as e:
+                logger.warning(f"[PromptCache] json.loads 실패: {e}")
+                parsed = _loose_parse_json(json_str)
+                logger.info(f"[PromptCache] _loose_parse_json 결과 keys: {list(parsed.keys()) if isinstance(parsed, dict) else 'NOT_DICT'}")
         else:
             parsed = data
 
@@ -651,41 +748,74 @@ def _wrap_sim_compose_prompts(original_tool):
                 "error": f"sim.compose_prompts 입력 data는 dict여야 합니다. got={type(parsed).__name__}",
             }
 
-        # 2) {"data": {...}} / {...} 둘 다 지원
-        logger.info(f"[PromptCache] parsed keys: {list(parsed.keys())}")
-        logger.info(f"[PromptCache] 'data' in parsed: {'data' in parsed}")
-        if 'data' in parsed:
-            logger.info(f"[PromptCache] parsed['data'] type: {type(parsed.get('data'))}")
-            logger.info(f"[PromptCache] parsed['data'] keys: {list(parsed['data'].keys()) if isinstance(parsed.get('data'), dict) else 'N/A'}")
+        # ★★★ parsed가 비어있으면 즉시 에러 반환
+        if not parsed:
+            logger.error(f"[PromptCache] parsed가 완전히 비어있음!")
+            return {
+                "ok": False,
+                "error": "json_parse_failed",
+                "message": f"JSON 파싱 완전 실패. 원본 data 타입={type(data)}, 원본 data={str(data)[:500]}",
+            }
+
+        # 2) 데이터 추출 로직 강화 (다층 구조 지원)
+        logger.info(f"[PromptCache] 원본 parsed keys: {list(parsed.keys())}")
+        
+        # 케이스 1: {"data": {"scenario": ..., "victim_profile": ..., "round_no": ...}}
         if "data" in parsed and isinstance(parsed["data"], dict):
             inner = parsed["data"]
+            # round_no가 상위에 있으면 inner로 병합
             if "round_no" in parsed and "round_no" not in inner:
                 inner["round_no"] = parsed["round_no"]
+        # 케이스 2: {"scenario": ..., "victim_profile": ..., "round_no": ...}
+        elif "scenario" in parsed or "victim_profile" in parsed:
+            inner = parsed
+        # 케이스 3: {"data": {"data": {...}}} (중첩된 경우)
+        elif "data" in parsed:
+            inner = parsed["data"]
         else:
             inner = parsed
 
-    # ★ 방어: inner가 비었으면 parsed 전체를 사용
-        if not inner:
-            logger.warning("[PromptCache] inner가 비어있음 → parsed 전체 사용")
-            inner = parsed
-            # ★★ parsed도 비었으면 에러 반환
-            if not inner:
-                return {
-                    "ok": False,
-                    "error": "empty_input",
-                    "message": "sim.compose_prompts에 빈 데이터가 전달되었습니다. scenario/victim_profile이 필요합니다.",
-                    "parsed_keys": list(parsed.keys()),
-                }
+        # 3) 필수 필드 검증 (scenario와 victim_profile 확인)
+        logger.info(f"[PromptCache] inner keys: {list(inner.keys())}")
+        logger.info(f"[PromptCache] scenario 존재: {'scenario' in inner}")
+        logger.info(f"[PromptCache] victim_profile 존재: {'victim_profile' in inner}")
 
-        # ★★★ 추가 진단: inner에 scenario/victim_profile이 있는지 미리 확인
-        logger.info(f"[PromptCache] inner keys after logic: {list(inner.keys())}")
-        logger.info(f"[PromptCache] scenario in inner (before invoke): {'scenario' in inner}")
-        logger.info(f"[PromptCache] victim_profile in inner (before invoke): {'victim_profile' in inner}")
+        if not inner or (not inner.get("scenario") and not inner.get("victim_profile")):
+            # 디버깅 정보 강화
+            logger.error(f"[PromptCache] 파싱 실패 - 원본 data 타입: {type(data)}")
+            logger.error(f"[PromptCache] 파싱 실패 - parsed: {parsed}")
+            logger.error(f"[PromptCache] 파싱 실패 - inner: {inner}")
+            
+            return {
+                "ok": False,
+                "error": "empty_input",
+                "message": "sim.compose_prompts에 scenario 또는 victim_profile이 없습니다.",
+                "parsed_keys": list(parsed.keys()),
+                "inner_keys": list(inner.keys()) if inner else [],
+                "debug_info": {
+                    "data_type": str(type(data)),
+                    "data_preview": str(data)[:300] if isinstance(data, str) else str(data)[:300],
+                    "parsed_has_data": "data" in parsed,
+                    "parsed_has_scenario": "scenario" in parsed,
+                    "inner_is_empty": not bool(inner)
+                }
+            }
+
+        # 4) scenario/victim_profile 추출
+        scenario = inner.get("scenario")
+        victim_profile = inner.get("victim_profile")
+        round_no = inner.get("round_no", 1)
+
+        logger.info(f"[PromptCache] 추출 완료 - scenario: {scenario is not None}, victim_profile: {victim_profile is not None}, round_no: {round_no}")
+
+        # 5) payload 구성 (data 래핑)
         payload = {"data": inner}
 
-        # 3) 원본 도구 호출
+        # 6) 원본 도구 호출
         try:
+            logger.info(f"[PromptCache] 원본 도구 호출 시작 - payload keys: {list(payload.keys())}")
             result = original_tool.invoke(payload)
+            logger.info(f"[PromptCache] 원본 도구 호출 성공")
         except Exception as e:
             logger.error(f"[sim.compose_prompts] 원본 도구 호출 실패: {e}")
             return {
@@ -693,7 +823,7 @@ def _wrap_sim_compose_prompts(original_tool):
                 "error": f"프롬프트 생성 실패: {str(e)}"
             }
 
-        # 4) 결과 파싱
+        # 7) 결과 파싱
         if isinstance(result, str):
             try:
                 result = json.loads(result)
@@ -708,31 +838,10 @@ def _wrap_sim_compose_prompts(original_tool):
 
         if not attacker_prompt or not victim_prompt:
             return {"ok": False, "error": "프롬프트가 비어있습니다"}
-        
-        # ★★★ scenario/victim_profile 추출 (원본 도구 호출 후)
-        # 1차: inner에서 추출
-        scenario = inner.get("scenario")
-        victim_profile = inner.get("victim_profile")
-        round_no = inner.get("round_no", 1)
-        
-        # 2차: result에서 fallback (원본 도구가 반환했을 수도 있음)
-        if scenario is None:
-            scenario = result.get("scenario")
-        if victim_profile is None:
-            victim_profile = result.get("victim_profile")
-        # 3차: parsed에서 fallback (최후의 수단)
-        if scenario is None:
-            scenario = parsed.get("scenario")
-        if victim_profile is None:
-            victim_profile = parsed.get("victim_profile")
 
-        # 디버깅 로그
-        logger.info(f"[PromptCache] inner keys: {list(inner.keys())}")
-        logger.info(f"[PromptCache] result keys: {list(result.keys())}")
-
+        # 8) 캐시 저장
         prompt_id = f"prompts_round_{round_no}_{id(result)}"
 
-        # ★★★ 캐시에 저장 (원본 도구 호출 전에 추출한 데이터 사용)
         _PROMPT_CACHE[prompt_id] = {
             "attacker_prompt": attacker_prompt,
             "victim_prompt": victim_prompt,
@@ -740,13 +849,12 @@ def _wrap_sim_compose_prompts(original_tool):
             "victim_profile": victim_profile,
         }
 
-        logger.info(f"[PromptCache] 저장: {prompt_id} (round={round_no})")
-        logger.info(f"[PromptCache] scenario 존재: {scenario is not None}, victim_profile 존재: {victim_profile is not None}")
+        logger.info(f"[PromptCache] 저장 완료: {prompt_id} (round={round_no})")
 
-        # 경고: None인 경우
+        # 9) 최종 검증
         if scenario is None or victim_profile is None:
             logger.warning(f"[PromptCache] 경고: scenario={scenario is not None}, victim_profile={victim_profile is not None}")
-            logger.warning(f"[PromptCache] 이 경우 mcp.simulator_run에서 에러가 발생할 수 있습니다")
+            logger.warning(f"[PromptCache] mcp.simulator_run 호출 시 에러 가능성 있음")
 
         return {
             "ok": True,
@@ -1323,11 +1431,15 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             guidance_idx = 0
             sim_run_idx = 0
 
+            logger.info(f"[DEBUG] ===== cap.events 전체 ({len(cap.events)}개) =====")
+            for i, ev in enumerate(cap.events):
+                logger.info(f"[DEBUG] Event {i}: type={ev.get('type')}, tool={ev.get('tool', 'N/A')}")
+
             for ev in cap.events:
                 if ev.get("type") == "observation":
                     tool_name = ev.get("tool")
                     output = ev.get("output")
-                    
+                    logger.info(f"[DEBUG] Observation detected: tool={tool_name}, output_len={len(str(output))}")
                     # admin.make_judgement
                     if tool_name == "admin.make_judgement":
                         judgement_idx += 1
@@ -1340,53 +1452,180 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 "evidence": judgement.get("evidence", "")
                             })
                     
-                    # mcp.simulator_run
+                    # mcp.simulator_run 결과 처리: 대화 로그를 testdb + TTS 캐시에 저장
                     elif tool_name == "mcp.simulator_run":
                         sim_run_idx += 1
+                        logger.info(f"[DEBUG] mcp.simulator_run 처리 시작: sim_run_idx={sim_run_idx}")
+                        logger.info(f"[DEBUG] output 타입: {type(output)}")
+                        logger.info(f"[DEBUG] output 길이: {len(str(output))}")
+                        # 1) MCP 결과 파싱
                         sim_dict = _loose_parse_json(output)
-                        turns = sim_dict.get("turns") or []
-                        if isinstance(turns, list):
-                            turns_all.extend(turns)
-                            # ── TTS 비동기 생성 트리거 (run 단위) ───────────────────────────
-                            #  - DB에 의존하지 않고, 해당 run의 전체 대화로그를 그대로 전달
-                            #  - 실제 비동기 처리/캐싱 로직은 app.services.tts_service 쪽에서 구현
-                            try:
-                                sim_case_id = sim_dict.get("case_id")
-                                if sim_case_id and turns:
-                                    start_tts_for_run_background(
-                                        case_id=str(sim_case_id),
-                                        run_no=sim_run_idx,
-                                        turns=turns,
-                                    )
-                            except Exception as e:
-                                logger.warning(f"[TTS] run {sim_run_idx} 백그라운드 생성 실패: {e}")
+                        if not isinstance(sim_dict, dict):
+                            logger.warning(
+                                "[MCP] simulator_run output이 dict가 아님: type=%s value=%s",
+                                type(sim_dict).__name__,
+                                _truncate(sim_dict, 300),
+                            )
+                            continue
+                        logger.info(f"[DEBUG] sim_dict keys: {list(sim_dict.keys())}")
 
-                            # DB 저장 (라운드별)
-                            try:
-                                round_row = (
-                                    db.query(m.ConversationRound)
-                                    .filter(m.ConversationRound.case_id == case_id,
-                                            m.ConversationRound.run == sim_run_idx)
-                                    .first()
+                        # 2) data 래퍼 지원: {"ok": true, "data": {...}} 형태 처리
+                        body = sim_dict.get("data") if isinstance(sim_dict.get("data"), dict) else sim_dict
+                        logger.info(f"[DEBUG] body keys: {list(body.keys())}")
+
+
+                        # ★★★ log.turns 우선 사용 (중복 구조 해결)
+                        if "log" in body and isinstance(body["log"], dict):
+                            raw_turns = body["log"].get("turns", [])
+                        else:
+                            raw_turns = body.get("turns", [])
+                        if not isinstance(raw_turns, list) or not raw_turns:
+                            logger.warning(
+                                "[MCP] simulator_run 결과에 turns 리스트가 없음: keys=%s",
+                                list(body.keys()),
+                            )
+                            continue  # turns 없으면 저장/캐시도 의미 없음
+
+                        # case_id / stats / ended_by는 body 기준으로 우선
+                        sim_case_id = body.get("case_id") or case_id
+                        stats = body.get("stats") or {}
+                        ended_by = body.get("ended_by")
+                        # ★★★ victim dialogue 추출 (JSON → text)
+                        cleaned_turns = []
+                        for turn in raw_turns:
+                            role = turn.get("role", "")
+                            text = turn.get("text", "")
+                            
+                            # victim의 JSON 응답 처리
+                            if role == "victim" and text.strip().startswith("{"):
+                                try:
+                                    victim_json = json.loads(text)
+                                    text = victim_json.get("dialogue", text)
+                                except:
+                                    pass
+                            
+                            cleaned_turns.append({
+                                "role": role,
+                                "text": text
+                            })
+                        turns_all.extend(cleaned_turns)
+
+                        # ── SSE: 라운드 단위 대화 전달 (TTS 모달 버튼 생성용) ─────────────
+                        try:
+                            _emit_to_stream(
+                                "conversation_round",
+                                {
+                                    "case_id": str(sim_case_id) if sim_case_id else None,
+                                    "run_no": sim_run_idx,
+                                    "turns": _truncate(cleaned_turns, 2000),
+                                    "ended_by": ended_by,
+                                    "stats": _truncate(stats, 2000),
+                                },
+                            )
+                        except Exception as e:
+                            logger.warning(f"[SSE] conversation_round emit 실패: {e}")
+
+                        # ── DB 저장 (라운드별: conversation_round) ───────────────────────
+                        try:
+                            round_row = (
+                                db.query(m.ConversationRound)
+                                .filter(
+                                    m.ConversationRound.case_id == sim_case_id,
+                                    m.ConversationRound.run == sim_run_idx,
                                 )
-                                if not round_row:
-                                    round_row = m.ConversationRound(
-                                        case_id=case_id,
-                                        run=sim_run_idx,
-                                        offender_id=offender_id,
-                                        victim_id=victim_id,
-                                        turns=turns,
-                                        ended_by=sim_dict.get("ended_by"),
-                                        stats=sim_dict.get("stats", {}),
-                                    )
-                                    db.add(round_row)
-                                else:
-                                    round_row.turns = turns
-                                    round_row.ended_by = sim_dict.get("ended_by")
-                                    round_row.stats = sim_dict.get("stats", {})
-                                db.commit()
-                            except Exception as e:
-                                logger.warning(f"[DB] round {sim_run_idx} 저장 실패: {e}")
+                                .first()
+                            )
+                            if not round_row:
+                                round_row = m.ConversationRound(
+                                    case_id=sim_case_id,
+                                    run=sim_run_idx,
+                                    offender_id=offender_id,
+                                    victim_id=victim_id,
+                                    turns=cleaned_turns,
+                                    ended_by=ended_by,
+                                    stats=stats,
+                                )
+                                db.add(round_row)
+                            else:
+                                round_row.turns = cleaned_turns
+                                round_row.ended_by = ended_by
+                                round_row.stats = stats
+                            db.commit()
+                            logger.info(
+                                "[DB] ConversationRound stored: case_id=%s run=%s turns=%s",
+                                sim_case_id,
+                                sim_run_idx,
+                                len(cleaned_turns),
+                            )
+                        except Exception as e:
+                            logger.warning(f"[DB] round {sim_run_idx} 저장 실패: {e}")
+
+                        # ── DB 저장 (턴 단위: conversationlog) ────────────────────────────
+                        try:
+                            (
+                                db.query(m.ConversationLog)
+                                .filter(
+                                    m.ConversationLog.case_id == sim_case_id,
+                                    m.ConversationLog.run == sim_run_idx,
+                                )
+                                .delete(synchronize_session=False)
+                            )
+
+                            for idx, turn in enumerate(cleaned_turns, start=1):
+                                role = (turn.get("role") or "").strip() or "unknown"
+                                text = turn.get("text") or ""
+
+                                log_row = m.ConversationLog(
+                                    case_id=sim_case_id,
+                                    offender_id=offender_id,
+                                    victim_id=victim_id,
+                                    turn_index=idx,
+                                    role=role,
+                                    content=text,
+                                    label=None,
+                                    payload=turn,
+                                    use_agent=True,
+                                    run=sim_run_idx,
+                                    guidance_type=None,
+                                    guideline=None,
+                                )
+                                db.add(log_row)
+
+                            db.commit()
+                            logger.info(
+                                "[DB] ConversationLog stored: case_id=%s run=%s turns=%s",
+                                sim_case_id,
+                                sim_run_idx,
+                                len(cleaned_turns),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[DB] ConversationLog 저장 실패: case_id=%s run=%s error=%s",
+                                sim_case_id,
+                                sim_run_idx,
+                                e,
+                            )
+
+                        # ✅ TTS용 메모리 캐시에 라운드별 대화 저장
+                        try:
+                            cache_run_dialog(
+                                case_id=str(sim_case_id),
+                                run_no=sim_run_idx,
+                                turns=cleaned_turns,
+                            )
+                            logger.info(
+                                "[TTS_CACHE] cached dialog for case_id=%s run_no=%s (turns=%s)",
+                                sim_case_id,
+                                sim_run_idx,
+                                len(cleaned_turns),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[TTS_CACHE] cache_run_dialog failed for case_id=%s run_no=%s: %s",
+                                sim_case_id,
+                                sim_run_idx,
+                                e,
+                            )
                     
                     # admin.generate_guidance
                     elif tool_name == "admin.generate_guidance":
@@ -1494,11 +1733,17 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
         with contextlib.suppress(Exception):
             case_id = locals().get("case_id")
             if case_id:
-                # 이 케이스 관련 캐시만 정리
+                # 이 케이스 관련 프롬프트 캐시만 정리
                 keys_to_remove = [k for k in _PROMPT_CACHE.keys() if case_id in k or "round_" in k]
                 for k in keys_to_remove:
                     _PROMPT_CACHE.pop(k, None)
                 logger.info(f"[PromptCache] 정리: {len(keys_to_remove)}개 항목 제거")
+
+                # 🔊 TTS용 대화 캐시도 함께 정리
+                try:
+                    clear_case_dialog_cache(str(case_id))
+                except Exception as e:
+                    logger.warning("[TTS_CACHE] clear_case_dialog_cache 실패: case_id=%s error=%s", case_id, e)
         with contextlib.suppress(Exception):
             _ACTIVE_RUN_KEYS.discard(run_key)
         with contextlib.suppress(Exception):

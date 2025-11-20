@@ -72,6 +72,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         candidate = candidate.strip()
         if not candidate:
             return None
+        
         # 1. JSON 파싱
         try:
             v = json.loads(candidate)
@@ -79,17 +80,33 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                 return v
         except json.JSONDecodeError:
             pass
-        # 1-1. 전처리 후 JSON 파싱 재시도 (\\n이 있는 경우만)
-        if '\\n' in candidate or "\\'" in candidate:
-            cleaned = candidate.replace('\\n', '\n').replace("\\'", "'")
-            try:
+        
+        # ★★★ 1-1. 이스케이프 문제 수정 후 재시도 (강화 버전)
+        try:
+            cleaned = candidate
+            
+            # \\n → 실제 줄바꿈
+            if '\\n' in cleaned:
+                cleaned = cleaned.replace('\\n', '\n')
+            # \\t → 실제 탭
+            if '\\t' in cleaned:
+                cleaned = cleaned.replace('\\t', '\t')
+            # \\r → 실제 캐리지 리턴
+            if '\\r' in cleaned:
+                cleaned = cleaned.replace('\\r', '\r')
+            # \\' → ' (JSON에서는 작은따옴표를 이스케이프할 필요 없음)
+            if "\\'" in cleaned:
+                cleaned = cleaned.replace("\\'", "'")
+            
+            # 변환이 발생한 경우에만 재파싱 시도
+            if cleaned != candidate:
                 v = json.loads(cleaned)
                 if isinstance(v, dict):
+                    logger.info("[_try_parse] 이스케이프 변환 후 성공")
                     return v
-            except json.JSONDecodeError:
-                pass
+        except json.JSONDecodeError:
+            pass
         
-
         # 2. literal_eval
         try:
             v = ast.literal_eval(candidate)
@@ -144,19 +161,18 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         colon_pos = s.find(":", data_keyword_pos)
         if colon_pos != -1:
             search_start = colon_pos + 1
-            while search_start < len(s) and s[search_start] in ' \t\n\r':  # ← \r 추가
+            while search_start < len(s) and s[search_start] in ' \t\n\r':
                 search_start += 1
             
             if search_start < len(s) and s[search_start] == '{':
                 depth = 0
                 end_pos = None
-                in_string = False  # ← 추가
-                escape_next = False  # ← 추가
+                in_string = False
+                escape_next = False
                 
                 for i in range(search_start, len(s)):
                     ch = s[i]
                     
-                    # ← 이스케이프 처리
                     if escape_next:
                         escape_next = False
                         continue
@@ -165,12 +181,10 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                         escape_next = True
                         continue
                     
-                    # ← 문자열 내부 추적
                     if ch == '"':
                         in_string = not in_string
                         continue
                     
-                    # ← 문자열 밖에서만 중괄호 카운트
                     if not in_string:
                         if ch == '{':
                             depth += 1
@@ -209,7 +223,6 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         tmp = tmp.rstrip()
         if not tmp:
             break
-        # 끝 문자가 ] 또는 } 이면 제거 시도
         if tmp[-1] in ']}':
             tmp = tmp[:-1]
             val = _try_parse(tmp)
@@ -220,21 +233,33 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             break
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # 5단계: 중괄호 부족 감지 및 추가 시도
+    # 5단계: 중괄호 부족/과다 감지 및 수정 시도 (강화 버전)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    # ★ 5단계 전처리: 끝의 공백 + 과도한 괄호를 동시에 제거
-    s_trimmed = s.rstrip()
-    if s_trimmed != s:
-        logger.info("[_to_dict] 5단계 전: 끝의 공백 %d자 제거", len(s) - len(s_trimmed))
-        val = _try_parse(s_trimmed)
+    # ★★★ 5단계 전처리: 끝의 공백 및 과도한 괄호 동시 제거
+    s_cleaned = s.rstrip()
+    
+    # 끝에서부터 과도한 }와 ] 제거 (최대 5개까지)
+    removed_total = 0
+    for _ in range(5):
+        if not s_cleaned:
+            break
+        s_cleaned = s_cleaned.rstrip()  # 매번 공백 제거
+        if s_cleaned and s_cleaned[-1] in ']}':
+            s_cleaned = s_cleaned[:-1]
+            removed_total += 1
+        else:
+            break
+    
+    if removed_total > 0 or s_cleaned != s:
+        logger.info("[_to_dict] 5단계 전: 공백+괄호 %d개 제거", removed_total)
+        val = _try_parse(s_cleaned)
         if val is not None:
-            logger.warning("[_to_dict] 5단계 성공 (공백 제거로 해결)")
+            logger.warning("[_to_dict] 5단계 성공 (공백+괄호 제거)")
             return val
-        # 실패해도 trimmed 버전으로 계속 진행
-        s = s_trimmed
+        s = s_cleaned
 
-    # 문자열 내부 제외하고 카운트
+    # 문자열 내부 제외하고 카운트 (개선된 버전)
     def count_brackets(text: str) -> tuple:
         open_b = 0
         close_b = 0
@@ -267,49 +292,13 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     
     open_braces, close_braces, open_brackets, close_brackets = count_brackets(s)
     
-    # ★ 과도한 닫는 괄호 제거
-    if close_braces > open_braces:
-        # 끝에서부터 초과된 만큼 } 제거
-        excess = close_braces - open_braces
-        tmp = s
-        removed = 0
-        while removed < excess and tmp.rstrip():
-            tmp = tmp.rstrip()  # ★ 먼저 공백 제거
-            if tmp and tmp[-1] == '}':
-                tmp = tmp[:-1]
-                removed += 1
-            else:
-                break
-        
-        if removed > 0:
-            logger.info("[_to_dict] 5단계: 과도한 } %d개 제거 시도", removed)
-            val = _try_parse(tmp)
-            if val is not None:
-                logger.warning("[_to_dict] 5단계 성공 (과도한 } %d개 제거)", removed)
-                return val
+    logger.info(
+        "[_to_dict] 5단계: 괄호 카운트 - 중괄호 열림:{%d} 닫힘:{%d}, 대괄호 열림:[%d] 닫힘:]%d]",
+        open_braces, close_braces, open_brackets, close_brackets
+    )
     
-    if close_brackets > open_brackets:
-        # 끝에서부터 초과된 만큼 ] 제거
-        excess = close_brackets - open_brackets
-        tmp = s
-        removed = 0
-        while removed < excess and tmp:
-            if tmp[-1] == ']':
-                tmp = tmp[:-1].rstrip()
-                removed += 1
-            else:
-                break
-        
-        if removed > 0:
-            logger.info("[_to_dict] 5단계: 과도한 ] %d개 제거 시도", removed)
-            val = _try_parse(tmp)
-            if val is not None:
-                logger.warning("[_to_dict] 5단계 성공 (과도한 ] %d개 제거)", removed)
-                return val
-    
-
+    # ★★★ 부족한 닫는 중괄호 추가 (과다보다 먼저 처리)
     if open_braces > close_braces:
-        # 닫는 중괄호 부족
         missing = open_braces - close_braces
         tmp = s + ('}' * missing)
         logger.info("[_to_dict] 5단계: 닫는 } %d개 추가 시도", missing)
@@ -318,12 +307,8 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             logger.warning("[_to_dict] 5단계 성공 (} %d개 추가)", missing)
             return val
     
-    # 대괄호도 체크
-    open_brackets = s.count('[')
-    close_brackets = s.count(']')
-    
+    # ★★★ 부족한 닫는 대괄호 추가
     if open_brackets > close_brackets:
-        # 닫는 대괄호 부족
         missing = open_brackets - close_brackets
         tmp = s + (']' * missing)
         logger.info("[_to_dict] 5단계: 닫는 ] %d개 추가 시도", missing)
@@ -331,12 +316,25 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         if val is not None:
             logger.warning("[_to_dict] 5단계 성공 (] %d개 추가)", missing)
             return val
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ★★★ 6단계: 이스케이프 변환 시도
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if '\\n' in s or "\\'" in s or '\\t' in s:
+        logger.info("[_to_dict] 6단계: 이스케이프 변환 시도")
+        cleaned = s.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r').replace("\\'", "'")
+        val = _try_parse(cleaned)
+        if val is not None:
+            logger.warning("[_to_dict] 6단계 성공 (이스케이프 변환)")
+            return val
+    
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 모든 시도 실패
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     logger.error("[_to_dict] 모든 파싱 시도 실패")
     logger.error("[_to_dict] 입력 앞 500자: %s", s[:500])
     logger.error("[_to_dict] 입력 뒤 500자: %s", s[-500:])
+    
     # JSON 구조 진단
     try:
         json.loads(s)
@@ -359,6 +357,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         if "Expecting" in e.msg:
             logger.error("[_to_dict] ⚠️  JSON 구조 오류: %s", e.msg)
             logger.error("[_to_dict] ⚠️  에이전트가 잘못된 JSON을 생성했을 가능성")
+    
     raise HTTPException(
         status_code=422,
         detail="data는 JSON 객체여야 합니다. 파싱 실패."

@@ -88,10 +88,19 @@ const SimulatorPage = ({
   ttsRunsFromStream,
   ttsCaseIdFromStream,
   ttsCacheFromStream,
+  victimGenderFromStream, // ★ 추가
+  offenderGenderFromStream,
+  victimIdFromStream,
+  offenderIdFromStream,  // ✅ 추가
 }) => {
   // logs / running 은 props로 받은 걸 로컬 변수로 정리
   const logs = streamLogs ?? [];
   const running = !!streamRunning;
+  // ★★★ App에서 전달받은 victimGender 사용
+  const victimGender = victimGenderFromStream || "여";
+  const offenderGender = offenderGenderFromStream || "male";
+  const victimId = victimIdFromStream || selectedCharacter?.id || 1;  // ✅ fallback 추가
+  const offenderId = offenderIdFromStream || selectedScenario?.id || 1;  // ✅ 추가
 
   /* ----------------------------------------------------------
    🧩 상태
@@ -888,6 +897,10 @@ const SimulatorPage = ({
         // 🔥 버튼 생성에 사용할 run_no 목록 (예: [1,2,3])
         availableRuns={ttsRuns}
         ttsCache={ttsCacheFromStream}
+        victimGender={victimGender} // ★ 전달
+        offenderGender={offenderGender} // ← 추가
+        victimId={victimId}              // ← 추가
+        offenderId={offenderId}  // ✅ 추가
       />
       {/* 🔥 커스텀 시나리오 모달 */}
       <CustomScenarioModal

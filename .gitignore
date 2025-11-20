@@ -47,3 +47,7 @@ secrets/
 # Alembic (generated cache & pyc are covered by patterns above)
 alembic/__pycache__/
 *json
+
+# Google Cloud credentials (절대 커밋하지 말 것!)
+service-account-key.json
+*-key.json

@@ -229,6 +229,20 @@ const ReportPage = ({
       ? scenarios[0]?.type ?? "피싱 유형"
       : "피싱 유형");
 
+  // 📌 피싱 시나리오 이름 (offender.name)
+  const scenarioName =
+    selectedScenario?.name ??
+    (Array.isArray(scenarios)
+      ? scenarios[0]?.name ?? "피싱 시나리오"
+      : "피싱 시나리오");
+
+  // 📌 피싱 시나리오 단계 (offender.profile.steps)
+  const scenarioSteps =
+    selectedScenario?.profile?.steps ??
+    (Array.isArray(scenarios) ? scenarios[0]?.profile?.steps : null) ??
+    defaultCaseData?.case?.steps ??
+    [];
+
   // 🔹 InvestigationBoard와 동일한 위험도 매핑
   function getRiskTokens(levelRaw) {
     const lv = String(levelRaw || "").toLowerCase();
@@ -315,7 +329,7 @@ const ReportPage = ({
               className="w-full lg:w-1/3 flex-shrink-0 space-y-8 pr-6"
               style={{ borderRight: `1px solid ${THEME.border}` }}
             >
-              {/* 피싱 유형 */}
+              {/* 피싱 유형 / 시나리오 */}
               <div
                 className="rounded-2xl p-8"
                 style={{
@@ -328,14 +342,61 @@ const ReportPage = ({
                   style={{ color: THEME.text }}
                 >
                   <Shield className="mr-3" size={26} />
-                  피싱 유형
+                  피싱 정보
                 </h2>
+                {/* 🔹 피싱 유형 (type) */}
+                <div className="mb-3">
+                  <span
+                    className="inline-flex items-center text-xs px-3 py-1 rounded-full font-semibold"
+                    style={{
+                      backgroundColor: THEME.bg,
+                      color: THEME.sub,
+                      border: `1px solid ${THEME.border}`,
+                    }}
+                  >
+                    유형:{" "}
+                    <span className="ml-1" style={{ color: THEME.white }}>
+                      {phishingTypeText}
+                    </span>
+                  </span>
+                </div>
+
+                {/* 🔹 피싱 이름 (name) */}
                 <div
-                  className="text-xl font-medium"
+                  className="text-xl font-semibold mb-4"
                   style={{ color: THEME.blurple }}
                 >
-                  {phishingTypeText}
+                  {scenarioName}
                 </div>
+
+                {/* 🔹 피싱 단계 (profile.steps) */}
+                {Array.isArray(scenarioSteps) && scenarioSteps.length > 0 ? (
+                  <ol className="space-y-2 text-sm leading-relaxed">
+                    {scenarioSteps.map((step, idx) => (
+                      <li
+                        key={idx}
+                        className="flex items-start gap-2"
+                        style={{ color: THEME.sub }}
+                      >
+                        <span
+                          className="mt-[2px] text-xs px-2 py-1 rounded-full font-semibold"
+                          style={{
+                            backgroundColor: THEME.bg,
+                            color: THEME.text,
+                            border: `1px solid ${THEME.border}`,
+                          }}
+                        >
+                          {idx + 1}
+                        </span>
+                        <span>{step}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : (
+                  <div className="text-sm" style={{ color: THEME.sub }}>
+                    시나리오 단계 정보가 없습니다.
+                  </div>
+                )}
               </div>
 
               {/* 피해자 정보 */}

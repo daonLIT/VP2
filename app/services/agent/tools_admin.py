@@ -67,19 +67,125 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
 
     logger.info("[_to_dict] 입력 길이: %d자", len(s))
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ★★★ 0-1단계: 전역 Invalid escape 사전 제거
+    # 문자열 밖에서도 \} 같은 패턴을 } 로 변환
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    def global_fix_invalid_escapes(text: str) -> str:
+        """전역적으로 잘못된 이스케이프 패턴 제거"""
+        # 유효하지 않은 이스케이프 패턴들을 백슬래시 제거
+        # \} → }, \] → ], \) → ), \{ → {, \[ → [, \( → (
+        result = text
+        invalid_patterns = [
+            (r'\\}', '}'),
+            (r'\\\]', ']'),
+            (r'\\\)', ')'),
+            (r'\\{', '{'),
+            (r'\\\[', '['),
+            (r'\\\(', '('),
+        ]
+        
+        for pattern, replacement in invalid_patterns:
+            if pattern in result:
+                result = result.replace(pattern, replacement)
+        
+        return result
+    
+    s_global_fixed = global_fix_invalid_escapes(s)
+    if s_global_fixed != s:
+        logger.info("[_to_dict] 0-1단계: 전역 Invalid escape 제거 (%d → %d자)", len(s), len(s_global_fixed))
+        s = s_global_fixed
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ★★★ 0-2단계: 깨진 JSON 구조 복구
+    # rolevictimtext{...} → {"role": "victim", "text": "..."}
+    # roleoffendertext{...} → {"role": "offender", "text": "..."}
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    def fix_broken_json_structure(text: str) -> str:
+        """깨진 JSON 구조 패턴을 올바른 형태로 복구"""
+        import re
+        
+        # 패턴 1: rolevictimtext...} → {"role": "victim", "text": "..."}
+        # 패턴 2: roleoffendertext...} → {"role": "offender", "text": "..."}
+        
+        # rolevictimtext 패턴 찾기
+        result = text
+        
+        # rolevictimtext{content} 패턴
+        pattern1 = re.compile(r'rolevictimtext\{([^}]*)\}', re.DOTALL)
+        result = pattern1.sub(r'{"role": "victim", "text": "\1"}', result)
+        
+        # roleoffendertext{content} 패턴  
+        pattern2 = re.compile(r'roleoffendertext\{([^}]*)\}', re.DOTALL)
+        result = pattern2.sub(r'{"role": "offender", "text": "\1"}', result)
+        
+        # rolevictimtext만 있고 { 없는 경우
+        pattern3 = re.compile(r'rolevictimtext', re.DOTALL)
+        result = pattern3.sub(r'"role": "victim", "text": ', result)
+        
+        # roleoffendertext만 있고 { 없는 경우
+        pattern4 = re.compile(r'roleoffendertext', re.DOTALL)
+        result = pattern4.sub(r'"role": "offender", "text": ', result)
+        
+        return result
+    
+    s_structure_fixed = fix_broken_json_structure(s)
+    if s_structure_fixed != s:
+        logger.info("[_to_dict] 0-2단계: 깨진 JSON 구조 복구 (%d → %d자)", len(s), len(s_structure_fixed))
+        s = s_structure_fixed
+
     def _try_parse(candidate: str) -> Optional[Dict[str, Any]]:
         """JSON 또는 literal_eval 시도 - 개선된 버전"""
         candidate = candidate.strip()
         if not candidate:
             return None
         
+        # ★★★ 0. Invalid escape sequence 처리
+        # \} 같은 잘못된 이스케이프를 } 로 변환
+        def fix_invalid_escapes(text: str) -> str:
+            """잘못된 이스케이프 시퀀스 수정"""
+            result = []
+            i = 0
+            in_string = False
+            
+            while i < len(text):
+                if text[i] == '"' and (i == 0 or text[i-1] != '\\'):
+                    in_string = not in_string
+                    result.append(text[i])
+                    i += 1
+                elif in_string and text[i] == '\\' and i + 1 < len(text):
+                    next_char = text[i + 1]
+                    # 유효한 이스케이프 시퀀스
+                    if next_char in '"\\/:bfnrtu':
+                        result.append(text[i])
+                        result.append(next_char)
+                        i += 2
+                    else:
+                        # 잘못된 이스케이프: \ 제거
+                        result.append(next_char)
+                        i += 2
+                else:
+                    result.append(text[i])
+                    i += 1
+            
+            return ''.join(result)
+        
         # 1. JSON 파싱
         try:
             v = json.loads(candidate)
             if isinstance(v, dict):
                 return v
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            # Invalid escape 에러면 수정 시도
+            if "Invalid" in str(e) and "escape" in str(e):
+                try:
+                    fixed = fix_invalid_escapes(candidate)
+                    v = json.loads(fixed)
+                    if isinstance(v, dict):
+                        logger.info("[_try_parse] Invalid escape 수정 후 성공")
+                        return v
+                except json.JSONDecodeError:
+                    pass
         
         # ★★★ 1-1. Invalid control character 에러 처리 (강화)
         # 실제 개행문자를 이스케이프된 형태로 변환
@@ -449,6 +555,10 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     logger.info("[_to_dict] 8단계: 종합 처리 시도")
     s_final = s
     
+    # 0. 전역 Invalid escape 제거
+    s_final = global_fix_invalid_escapes(s_final)
+    # 0-1. 깨진 JSON 구조 복구
+    s_final = fix_broken_json_structure(s_final)
     # 1. 작은따옴표 정규화
     s_final = normalize_quoted_json(s_final)
     # 2. 중첩 JSON 처리
@@ -503,13 +613,17 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             logger.error("[_to_dict] ⚠️  제어 문자 오류: JSON 문자열 내부에 이스케이프되지 않은 개행문자 존재")
             logger.error("[_to_dict] ⚠️  원인: 에이전트가 \\n 대신 실제 개행문자를 사용")
             logger.error("[_to_dict] ⚠️  해결: 0단계, 1-2단계, 7-8단계에서 자동 처리 시도했으나 실패")
+        
+        # Invalid escape 에러
+        if "Invalid" in e.msg and "escape" in e.msg:
+            logger.error("[_to_dict] ⚠️  잘못된 이스케이프 시퀀스: \\} 같은 잘못된 이스케이프 존재")
+            logger.error("[_to_dict] ⚠️  원인: 에이전트가 유효하지 않은 이스케이프 시퀀스 생성")
+            logger.error("[_to_dict] ⚠️  해결: _try_parse의 fix_invalid_escapes로 자동 처리 시도했으나 실패")
     
     raise HTTPException(
         status_code=422,
         detail="data는 JSON 객체여야 합니다. 파싱 실패."
     )
-
-
 
 def _unwrap_data(obj: Any) -> Dict[str, Any]:
     """

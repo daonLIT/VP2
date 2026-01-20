@@ -89,6 +89,19 @@ MAX_VICTIM_TURNS=15
 ```bash
 ./run-local.sh
 ```
+```python
+백앤드:
+cd VP
+uvicorn app.main:app --reload
+
+mcp서버:
+cd VP
+uvicorn vp_mcp.mcp_server.server:app --reload --port 5177
+
+프론트엔드:
+cd VP/FE
+npm run dev
+```
 
 > 스크립트가 **백엔드/프론트엔드 의존성 설치 → DB 시드(테이블/샘플데이터) → 서버 실행**까지 자동으로 처리합니다.  
 > (프론트 `.env` 없이 동작합니다—`window.location.origin` 기반으로 API 주소를 사용)

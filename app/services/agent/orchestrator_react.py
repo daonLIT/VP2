@@ -354,6 +354,47 @@ class TeeTerminal:
 # ─────────────────────────────────────────────────────────
 # JSON/파싱 유틸
 # ─────────────────────────────────────────────────────────
+def _parse_victim_turn_text(text: Any) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    victim 턴이 아래 형태로 오는 경우를 파싱:
+        '{ "is_convinced": 2, "thoughts": "...", "dialogue": "..." }'
+
+    반환:
+        (dialogue_or_None, victim_meta_or_None)
+    """
+    try:
+        # 이미 dict로 들어온 경우도 방어
+        if isinstance(text, dict):
+            obj = text
+            dialogue = obj.get("dialogue")
+            meta = {
+                "is_convinced": obj.get("is_convinced"),
+                "thoughts": obj.get("thoughts"),
+                "raw_json": None,
+            }
+            return (dialogue if isinstance(dialogue, str) else None), meta
+
+        if not isinstance(text, str):
+            return None, None
+
+        s = text.strip()
+        if not (s.startswith("{") and s.endswith("}")):
+            return None, None
+
+        obj = json.loads(s)
+        if not isinstance(obj, dict):
+            return None, None
+
+        dialogue = obj.get("dialogue")
+        meta = {
+            "is_convinced": obj.get("is_convinced"),
+            "thoughts": obj.get("thoughts"),
+            "raw_json": text,
+        }
+        return (dialogue if isinstance(dialogue, str) else None), meta
+    except Exception:
+        return None, None
+
 def _extract_json_block(agent_result: Any) -> Dict[str, Any]:
     try:
         if isinstance(agent_result, dict):
@@ -603,16 +644,11 @@ def _smart_print(*args, **kwargs):
                     role = turn.get("role", "")
                     text = turn.get("text", "")
 
-                    # 피해자 턴이 JSON이면 dialogue만 뽑기
+                    # 피해자 턴이 JSON이면 dialogue만 뽑기 (TTS 캐시는 대사 중심 유지)
                     if role == "victim":
-                        s = (text or "").strip()
-                        if s.startswith("{"):
-                            try:
-                                v_json = json.loads(s)
-                                text = v_json.get("dialogue", text)
-                            except Exception:
-                                # 파싱 실패하면 원문 그대로 둠
-                                pass
+                        dialogue, _meta = _parse_victim_turn_text(text)
+                        if dialogue:
+                            text = dialogue
 
                     cleaned_turns.append(
                         {
@@ -1154,7 +1190,8 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
         tools=tools, 
         verbose=True,
         handle_parsing_errors=_parsing_error_handler,
-        max_iterations=50  # ★ 전체 케이스 단일 호출이므로 충분한 iteration 확보
+        max_iterations=50,  # ★ 전체 케이스 단일 호출이므로 충분한 iteration 확보
+        return_intermediate_steps=True,  # ✅ 도구 호출/observation을 결과로 강제 반환
     )
     return ex, mcp_manager
 
@@ -1460,7 +1497,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 cap = ThoughtCapture()
-                result = ex.invoke({"input": case_mission}, callbacks=[cap])
+                # ✅ callbacks는 환경에 따라 무시될 수 있어 config로도 전달(이중 안전장치)
+                try:
+                    result = ex.invoke({"input": case_mission}, config={"callbacks": [cap]})
+                except TypeError:
+                    # 일부 버전 호환
+                    result = ex.invoke({"input": case_mission}, callbacks=[cap])
                 logger.info(f"[CaseMission] Agent result: {_truncate(result)}")
             except Exception as e:
                 logger.error(f"[CaseMission] Agent execution failed: {e}")
@@ -1474,9 +1516,35 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             actual_tools = _extract_tool_call_sequence(cap)
             logger.info(f"[CaseMission] 호출된 도구들: {actual_tools}")
 
+            # ✅ fallback: cap.events가 비어도 intermediate_steps로 도구 호출 복구
             if not actual_tools:
-                logger.error("[CaseMission] 도구가 하나도 호출되지 않았습니다")
-                raise HTTPException(500, "에이전트가 도구를 호출하지 않았습니다")
+                dump_enabled = bool(payload.get("dump_case_json", False))
+                steps = []
+                if isinstance(result, dict):
+                    steps = result.get("intermediate_steps") or []
+
+                if steps:
+                    try:
+                        recovered_tools = []
+                        # intermediate_steps: 보통 [(AgentAction, observation), ...] 형태
+                        for step in steps:
+                            if isinstance(step, (list, tuple)) and len(step) >= 1:
+                                action = step[0]
+                                tool_name = getattr(action, "tool", None)
+                                if tool_name:
+                                    recovered_tools.append(tool_name)
+                        actual_tools = recovered_tools
+                        logger.warning("[CaseMission] cap.events 비어있음 → intermediate_steps로 도구 호출 복구: %s", actual_tools)
+                    except Exception as e:
+                        logger.warning("[CaseMission] intermediate_steps 복구 실패: %s", e)
+
+                # dump 모드가 아니면 기존처럼 500 유지(프론트 영향 최소)
+                if not actual_tools and not dump_enabled:
+                    logger.error("[CaseMission] 도구가 하나도 호출되지 않았습니다")
+                    raise HTTPException(500, "에이전트가 도구를 호출하지 않았습니다")
+                # dump 모드면 500을 던지지 않고 가능한 범위까지 진행
+                if not actual_tools and dump_enabled:
+                    logger.warning("[CaseMission] dump 모드: 도구 호출 감지 실패. 가능한 데이터만 덤프 시도합니다.")
 
             used_tools = actual_tools
 
@@ -1574,18 +1642,18 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             role = turn.get("role", "")
                             text = turn.get("text", "")
                             
-                            # victim의 JSON 응답 처리
-                            if role == "victim" and text.strip().startswith("{"):
-                                try:
-                                    victim_json = json.loads(text)
-                                    text = victim_json.get("dialogue", text)
-                                except:
-                                    pass
-                            
-                            cleaned = {
-                                "role": role,
-                                "text": text,
-                            }
+                            cleaned: Dict[str, Any] = {"role": role, "text": text}
+
+                            # ✅ victim의 JSON 응답 처리: dialogue는 text로, 속마음/신뢰도는 victim_meta로 저장
+                            if role == "victim":
+                                dialogue, vmeta = _parse_victim_turn_text(text)
+                                if dialogue:
+                                    cleaned["text"] = dialogue  # UI/판정/DB content 호환
+                                if vmeta:
+                                    cleaned["victim_meta"] = vmeta
+                                    # (선택) 분석 편의상 최상위에도 복사
+                                    cleaned["is_convinced"] = vmeta.get("is_convinced")
+                                    cleaned["thoughts"] = vmeta.get("thoughts")
 
                             # 🔊 TTS용 성별/나이 정보 주입
                             if role == "victim":
@@ -1739,6 +1807,27 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             })
 
             logger.info(f"[CaseMission] 판정 수: {len(judgements_history)}, turns 총 {len(turns_all)}개")
+            # ✅ dump 모드 fallback: cap.events 수집이 실패한 경우 DB에서 라운드 대화 복구
+            try:
+                dump_enabled = bool(payload.get("dump_case_json", False))
+                if dump_enabled and case_id and (not turns_by_round):
+                    rows = (
+                        db.query(m.ConversationRound)
+                        .filter(m.ConversationRound.case_id == case_id)
+                        .order_by(m.ConversationRound.run.asc())
+                        .all()
+                    )
+                    for rr in rows:
+                        rno = int(rr.run)
+                        turns_by_round[rno] = rr.turns or []
+                        stats_by_round[rno] = rr.stats or {}
+                        ended_by_by_round[rno] = rr.ended_by
+                    logger.warning(
+                        "[CaseDumpFallback] cap.events 비어있음 → DB ConversationRound로 복구: rounds=%s",
+                        len(turns_by_round),
+                    )
+            except Exception as e:
+                logger.warning("[CaseDumpFallback] DB 복구 실패: %s", e)
 
             # 5. 종료 사유 판단
             last_judgement = judgements_history[-1] if judgements_history else {}
@@ -1783,7 +1872,41 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     "message": "예방책 생성이 누락되었습니다",
                     "validation": validation
                 })
-            
+            # ─────────────────────────────────────
+            # ✅ 케이스/라운드 위험도 정합 필드 구성
+            # - round risk: admin.make_judgement의 risk.level (ex: critical)
+            # - case  risk: admin.make_prevention.personalized_prevention.analysis.risk_level (ex: high)
+            # ─────────────────────────────────────
+            def _safe_lower(x: Any) -> Optional[str]:
+                try:
+                    if x is None:
+                        return None
+                    s = str(x).strip()
+                    return s.lower() if s else None
+                except Exception:
+                    return None
+
+            # round/judgement 기반 대표 위험도 (보통 마지막 라운드)
+            judgement_risk_level = _safe_lower((last_judgement.get("risk") or {}).get("level"))
+            judgement_risk_score = (last_judgement.get("risk") or {}).get("score")
+            judgement_risk_rationale = (last_judgement.get("risk") or {}).get("rationale")
+
+            # case/prevention 기반 위험도 (모델이 만든 예방 분석 스케일)
+            case_risk_level = None
+            case_risk_source = None
+            try:
+                # prevention_obj는 _extract_prevention...에서 personalized_prevention만 반환함
+                # 즉, prevention_obj == {"summary":..., "analysis": {...}, ...}
+                case_risk_level = _safe_lower(((prevention_obj or {}).get("analysis") or {}).get("risk_level"))
+                if case_risk_level:
+                    case_risk_source = "prevention.analysis.risk_level"
+            except Exception:
+                case_risk_level = None
+
+            # prevention에 case risk가 없으면 judgement로 fallback (그래도 둘 다 필드는 유지)
+            if not case_risk_level:
+                case_risk_level = judgement_risk_level
+                case_risk_source = "judgement.risk.level(fallback)"
             # 8. 예방책 SSE 및 finished_chain emit
             if prevention_obj:
                 logger.info("[Prevention] 예방책 최종 확보 완료")
@@ -1821,6 +1944,19 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 "personalized_prevention": prevention_obj,
                 "finished_reason": finished_reason,
                 "round_judgements": judgements_history,  # ★ 라운드별 판정 요약
+                # ✅ 명시적인 "라운드(판정) 위험도" vs "케이스(예방) 위험도" 동시 보존
+                # - judgement_* : admin.make_judgement 기반 (ex: critical)
+                # - case_*      : prevention.analysis 기반 (ex: high) source
+                "judgement_risk": {
+                    "level": judgement_risk_level,
+                    "score": judgement_risk_score,
+                    "rationale": judgement_risk_rationale,
+                    "source": "admin.make_judgement",
+                },
+                "case_risk": {
+                    "level": case_risk_level,
+                    "source": case_risk_source,
+                },
             }
 
             # ─────────────────────────────────────
@@ -1841,11 +1977,19 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     # range의 end는 미포함이므로 rounds_done까지 포함하려면 +1
                     safe_rounds_done = max(0, int(rounds_done))
                     for rno in range(1, safe_rounds_done + 1):
+                        # 라운드별 judgement를 rounds에도 붙여서 한 번에 보기 쉽게
+                        j = None
+                        try:
+                            if isinstance(judgements_history, list):
+                                j = next((x for x in judgements_history if x.get("run_no") == rno), None)
+                        except Exception:
+                            j = None
                         rounds_payload.append({
                             "run_no": rno,
                             "turns": turns_by_round.get(rno, []),
                             "stats": stats_by_round.get(rno, {}),
                             "ended_by": ended_by_by_round.get(rno),
+                            "judgement": j,  # ✅ round risk.level 포함
                         })
                     case_artifact = {
                         "case_id": case_id,
@@ -1857,6 +2001,19 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         "max_rounds": int(max_rounds),
                         "rounds_done": int(rounds_done),
                         "finished_reason": finished_reason,
+                        # ✅ 케이스/라운드 위험도 둘 다 최상위에 명시
+                        # - judgement_risk.level: 라운드 판정 기반 (critical 등)
+                        # - case_risk.level: 예방 분석 기반 (high 등) source
+                        "judgement_risk": {
+                            "level": judgement_risk_level,
+                            "score": judgement_risk_score,
+                            "rationale": judgement_risk_rationale,
+                            "source": "admin.make_judgement",
+                        },
+                        "case_risk": {
+                            "level": case_risk_level,
+                            "source": case_risk_source,
+                        },
                         # 시나리오/프로필(분석용)
                         "scenario": scenario_base,
                         "victim_profile": victim_profile_base,

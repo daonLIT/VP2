@@ -43,6 +43,7 @@ MCP_BASE_URL = os.getenv("MCP_BASE_URL", "http://127.0.0.1:5177")  # 운영 시 
 class SingleData(BaseModel):
     data: Any = Field(..., description="이 안에 실제 페이로드를 담는다")
 
+
 def _to_dict(obj: Any) -> Dict[str, Any]:
     """
     admin.* 툴에 들어오는 data를 dict로 정규화.
@@ -60,7 +61,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail=f"data는 JSON 객체여야 합니다. got type: {type(obj).__name__}")
 
     s = obj.strip()
-    
+
     # 빈 문자열 체크
     if not s:
         raise HTTPException(status_code=422, detail="data가 비어있습니다.")
@@ -72,25 +73,14 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     # 문자열 밖에서도 \} 같은 패턴을 } 로 변환
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def global_fix_invalid_escapes(text: str) -> str:
-        """전역적으로 잘못된 이스케이프 패턴 제거"""
-        # 유효하지 않은 이스케이프 패턴들을 백슬래시 제거
-        # \} → }, \] → ], \) → ), \{ → {, \[ → [, \( → (
-        result = text
-        invalid_patterns = [
-            (r'\\}', '}'),
-            (r'\\\]', ']'),
-            (r'\\\)', ')'),
-            (r'\\{', '{'),
-            (r'\\\[', '['),
-            (r'\\\(', '('),
-        ]
-        
-        for pattern, replacement in invalid_patterns:
-            if pattern in result:
-                result = result.replace(pattern, replacement)
-        
-        return result
-    
+        """
+        전역적으로 잘못된 이스케이프 패턴 제거.
+        NOTE: 기존 코드는 정규식 문자열을 str.replace로 처리해 사실상 동작이 약했음.
+        최소 침습으로 re.sub 사용.
+        """
+        # \} \] \) \{ \[ \( 형태에서 백슬래시 제거
+        return re.sub(r'\\([}\]\)\{\[\(])', r'\1', text)
+
     s_global_fixed = global_fix_invalid_escapes(s)
     if s_global_fixed != s:
         logger.info("[_to_dict] 0-1단계: 전역 Invalid escape 제거 (%d → %d자)", len(s), len(s_global_fixed))
@@ -103,32 +93,23 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def fix_broken_json_structure(text: str) -> str:
         """깨진 JSON 구조 패턴을 올바른 형태로 복구"""
-        import re
-        
-        # 패턴 1: rolevictimtext...} → {"role": "victim", "text": "..."}
-        # 패턴 2: roleoffendertext...} → {"role": "offender", "text": "..."}
-        
-        # rolevictimtext 패턴 찾기
-        result = text
-        
         # rolevictimtext{content} 패턴
+        result = text
+
         pattern1 = re.compile(r'rolevictimtext\{([^}]*)\}', re.DOTALL)
         result = pattern1.sub(r'{"role": "victim", "text": "\1"}', result)
-        
-        # roleoffendertext{content} 패턴  
+
         pattern2 = re.compile(r'roleoffendertext\{([^}]*)\}', re.DOTALL)
         result = pattern2.sub(r'{"role": "offender", "text": "\1"}', result)
-        
-        # rolevictimtext만 있고 { 없는 경우
+
         pattern3 = re.compile(r'rolevictimtext', re.DOTALL)
         result = pattern3.sub(r'"role": "victim", "text": ', result)
-        
-        # roleoffendertext만 있고 { 없는 경우
+
         pattern4 = re.compile(r'roleoffendertext', re.DOTALL)
         result = pattern4.sub(r'"role": "offender", "text": ', result)
-        
+
         return result
-    
+
     s_structure_fixed = fix_broken_json_structure(s)
     if s_structure_fixed != s:
         logger.info("[_to_dict] 0-2단계: 깨진 JSON 구조 복구 (%d → %d자)", len(s), len(s_structure_fixed))
@@ -139,44 +120,40 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         candidate = candidate.strip()
         if not candidate:
             return None
-        
+
         # ★★★ 0. Invalid escape sequence 처리
-        # \} 같은 잘못된 이스케이프를 } 로 변환
         def fix_invalid_escapes(text: str) -> str:
             """잘못된 이스케이프 시퀀스 수정"""
-            result = []
+            result: List[str] = []
             i = 0
             in_string = False
-            
+
             while i < len(text):
-                if text[i] == '"' and (i == 0 or text[i-1] != '\\'):
+                if text[i] == '"' and (i == 0 or text[i - 1] != '\\'):
                     in_string = not in_string
                     result.append(text[i])
                     i += 1
                 elif in_string and text[i] == '\\' and i + 1 < len(text):
                     next_char = text[i + 1]
-                    # 유효한 이스케이프 시퀀스
                     if next_char in '"\\/:bfnrtu':
                         result.append(text[i])
                         result.append(next_char)
                         i += 2
                     else:
-                        # 잘못된 이스케이프: \ 제거
                         result.append(next_char)
                         i += 2
                 else:
                     result.append(text[i])
                     i += 1
-            
+
             return ''.join(result)
-        
+
         # 1. JSON 파싱
         try:
             v = json.loads(candidate)
             if isinstance(v, dict):
                 return v
         except json.JSONDecodeError as e:
-            # Invalid escape 에러면 수정 시도
             if "Invalid" in str(e) and "escape" in str(e):
                 try:
                     fixed = fix_invalid_escapes(candidate)
@@ -186,11 +163,9 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                         return v
                 except json.JSONDecodeError:
                     pass
-        
+
         # ★★★ 1-1. Invalid control character 에러 처리 (강화)
-        # 실제 개행문자를 이스케이프된 형태로 변환
         try:
-            # 제어 문자를 이스케이프
             cleaned = candidate.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
             if cleaned != candidate:
                 v = json.loads(cleaned)
@@ -199,7 +174,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                     return v
         except json.JSONDecodeError:
             pass
-        
+
         # 2. literal_eval
         try:
             v = ast.literal_eval(candidate)
@@ -207,7 +182,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                 return v
         except (ValueError, SyntaxError):
             pass
-        
+
         # 3. 코드펜스 제거 후 재파싱
         fence_pattern = re.compile(r'^```(?:json)?\s*(.*?)\s*```$', re.DOTALL)
         fence_match = fence_pattern.match(candidate)
@@ -219,12 +194,12 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                     return v
             except json.JSONDecodeError:
                 pass
-        
+
         # 4. 첫 { 부터 마지막 } 까지만 추출
         first_brace = candidate.find('{')
         last_brace = candidate.rfind('}')
         if first_brace != -1 and last_brace != -1 and first_brace < last_brace:
-            extracted = candidate[first_brace:last_brace+1]
+            extracted = candidate[first_brace:last_brace + 1]
             if extracted != candidate:
                 try:
                     v = json.loads(extracted)
@@ -232,7 +207,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                         return v
                 except json.JSONDecodeError:
                     pass
-        
+
         return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -240,23 +215,18 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def normalize_quoted_json(text: str) -> str:
         """
-        "text": '{"key": "value"}' 같은 패턴을 
+        "text": '{"key": "value"}' 같은 패턴을
         "text": "{\"key\": \"value\"}" 형태로 변환
         """
-        # 패턴: "key": '...' 형태 찾기
         pattern = r'("[^"]+"\s*:\s*)\'([^\']*(?:\'\'[^\']*)*)\'(?=\s*[,}\]])'
-        
+
         def replace_func(match):
-            prefix = match.group(1)  # "key": 부분
-            content = match.group(2)  # '...' 내부
-            
-            # 내부의 따옴표 이스케이프
+            prefix = match.group(1)
+            content = match.group(2)
             content_escaped = content.replace('"', '\\"')
-            
             return f'{prefix}"{content_escaped}"'
-        
-        result = re.sub(pattern, replace_func, text)
-        return result
+
+        return re.sub(pattern, replace_func, text)
 
     s_normalized = normalize_quoted_json(s)
     if s_normalized != s:
@@ -300,28 +270,28 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             search_start = colon_pos + 1
             while search_start < len(s) and s[search_start] in ' \t\n\r':
                 search_start += 1
-            
+
             if search_start < len(s) and s[search_start] == '{':
                 depth = 0
                 end_pos = None
                 in_string = False
                 escape_next = False
-                
+
                 for i in range(search_start, len(s)):
                     ch = s[i]
-                    
+
                     if escape_next:
                         escape_next = False
                         continue
-                    
+
                     if ch == '\\':
                         escape_next = True
                         continue
-                    
+
                     if ch == '"':
                         in_string = not in_string
                         continue
-                    
+
                     if not in_string:
                         if ch == '{':
                             depth += 1
@@ -330,11 +300,11 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                             if depth == 0:
                                 end_pos = i
                                 break
-                
+
                 if end_pos is not None:
-                    inner_block = s[search_start:end_pos+1]
+                    inner_block = s[search_start:end_pos + 1]
                     logger.info("[_to_dict] 2단계: data 블록 추출 (%d자)", len(inner_block))
-                    
+
                     val = _try_parse(inner_block)
                     if val is not None:
                         logger.info("[_to_dict] 2단계 성공 (data 블록 파싱)")
@@ -343,9 +313,9 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 3단계: 전체에서 가장 큰 {...} 블록 추출
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    m = re.search(r"\{.*\}", s, re.DOTALL)
-    if m:
-        sub = m.group(0)
+    m_big = re.search(r"\{.*\}", s, re.DOTALL)
+    if m_big:
+        sub = m_big.group(0)
         logger.info("[_to_dict] 3단계: 정규식 추출 (%d자)", len(sub))
         val = _try_parse(sub)
         if val is not None:
@@ -368,15 +338,12 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                 return val
         else:
             break
-    
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 5단계: 중괄호 부족/과다 감지 및 수정 시도 (강화 버전)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    # 5단계 전처리: 끝의 공백 및 과도한 괄호 동시 제거
     s_cleaned = s.rstrip()
-    
-    # 끝에서부터 과도한 }와 ] 제거 (최대 5개까지)
+
     removed_total = 0
     for _ in range(5):
         if not s_cleaned:
@@ -387,7 +354,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             removed_total += 1
         else:
             break
-    
+
     if removed_total > 0 or s_cleaned != s:
         logger.info("[_to_dict] 5단계 전: 공백+괄호 %d개 제거", removed_total)
         val = _try_parse(s_cleaned)
@@ -404,7 +371,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         close_sq = 0
         in_string = False
         escape = False
-        
+
         for ch in text:
             if escape:
                 escape = False
@@ -424,34 +391,31 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
                     open_sq += 1
                 elif ch == ']':
                     close_sq += 1
-        
+
         return open_b, close_b, open_sq, close_sq
-    
+
     open_braces, close_braces, open_brackets, close_brackets = count_brackets(s)
-    
+
     logger.info(
         "[_to_dict] 5단계: 괄호 카운트 - 중괄호 열림:{%d} 닫힘:{%d}, 대괄호 열림:[%d] 닫힘:]%d]",
         open_braces, close_braces, open_brackets, close_brackets
     )
-    
-    # 부족한 닫는 중괄호 추가
+
     s_fixed = s
     modifications = []
-    
+
     if open_braces > close_braces:
         missing = open_braces - close_braces
         s_fixed = s_fixed + ('}' * missing)
         modifications.append(f"}} {missing}개")
         logger.info("[_to_dict] 5단계: 닫는 } %d개 추가 시도", missing)
-    
-    # 부족한 닫는 대괄호 추가
+
     if open_brackets > close_brackets:
         missing = open_brackets - close_brackets
         s_fixed = s_fixed + (']' * missing)
         modifications.append(f"] {missing}개")
         logger.info("[_to_dict] 5단계: 닫는 ] %d개 추가 시도", missing)
-    
-    # 괄호를 추가했다면 반드시 파싱 시도
+
     if modifications:
         logger.info("[_to_dict] 5단계: 괄호 보정 완료 (%s)", ", ".join(modifications))
         val = _try_parse(s_fixed)
@@ -459,7 +423,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             logger.warning("[_to_dict] 5단계 성공 (괄호 보정: %s)", ", ".join(modifications))
             return val
         s = s_fixed
-    
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 6단계: 이스케이프 변환 시도
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -470,76 +434,67 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         if val is not None:
             logger.warning("[_to_dict] 6단계 성공 (이스케이프 변환)")
             return val
-    
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # ★★★ 7단계: 중첩된 JSON 문자열 처리 (신규)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # "text": '{"nested": "json"}' 같은 패턴의 작은따옴표 내부를
-    # 이스케이프된 큰따옴표로 변환
     def fix_nested_json_strings(text: str) -> str:
         """작은따옴표로 감싸진 JSON 값을 큰따옴표로 변환하고 내부 따옴표를 이스케이프"""
-        result = []
+        result: List[str] = []
         i = 0
-        
+
         while i < len(text):
-            # "key": ' 패턴 찾기
             if i < len(text) - 3 and text[i] == '"':
-                # 키 시작
                 key_start = i
                 i += 1
-                # 키 끝까지
                 while i < len(text) and text[i] != '"':
                     if text[i] == '\\':
                         i += 2
                     else:
                         i += 1
-                
+
                 if i < len(text):
                     i += 1  # 닫는 "
-                    # : 찾기
                     while i < len(text) and text[i] in ' \t\n\r':
                         i += 1
-                    
+
                     if i < len(text) and text[i] == ':':
-                        result.append(text[key_start:i+1])
+                        result.append(text[key_start:i + 1])
                         i += 1
-                        # 공백 건너뛰기
                         while i < len(text) and text[i] in ' \t\n\r':
                             result.append(text[i])
                             i += 1
-                        
-                        # ' 로 시작하는 값인지 확인
+
                         if i < len(text) and text[i] == "'":
-                            # 작은따옴표로 감싸진 값 추출
-                            i += 1  # ' 건너뛰기
-                            value_start = i
-                            escaped_value = []
-                            
+                            i += 1
+                            escaped_value: List[str] = []
+
                             while i < len(text) and text[i] != "'":
                                 if text[i] == '"':
                                     escaped_value.append('\\"')
-                                elif text[i] == '\\' and i + 1 < len(text) and text[i+1] == "'":
-                                    # \' 는 그냥 '로
+                                elif text[i] == '\\' and i + 1 < len(text) and text[i + 1] == "'":
                                     escaped_value.append("'")
                                     i += 1
                                 else:
                                     escaped_value.append(text[i])
                                 i += 1
-                            
-                            # 변환된 값을 큰따옴표로 감싸기
+
                             result.append('"')
                             result.extend(escaped_value)
                             result.append('"')
-                            
+
                             if i < len(text) and text[i] == "'":
-                                i += 1  # 닫는 ' 건너뛰기
+                                i += 1
                             continue
-            
+
+            # ✅ 방어 가드: i가 len(text)로 점프한 뒤 text[i] 접근 방지
+            if i >= len(text):
+                break
             result.append(text[i])
             i += 1
-        
+
         return ''.join(result)
-    
+
     s_nested_fixed = fix_nested_json_strings(s)
     if s_nested_fixed != s:
         logger.info("[_to_dict] 7단계: 중첩 JSON 문자열 처리")
@@ -548,82 +503,73 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             logger.warning("[_to_dict] 7단계 성공 (중첩 JSON 처리)")
             return val
         s = s_nested_fixed
-    
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # ★★★ 8단계: 모든 처리를 조합하여 최종 시도
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     logger.info("[_to_dict] 8단계: 종합 처리 시도")
     s_final = s
-    
-    # 0. 전역 Invalid escape 제거
+
     s_final = global_fix_invalid_escapes(s_final)
-    # 0-1. 깨진 JSON 구조 복구
     s_final = fix_broken_json_structure(s_final)
-    # 1. 작은따옴표 정규화
     s_final = normalize_quoted_json(s_final)
-    # 2. 중첩 JSON 처리
     s_final = fix_nested_json_strings(s_final)
-    # 3. 제어문자 정리
     s_final = s_final.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-    # 4. 괄호 보정
+
     open_b, close_b, open_sq, close_sq = count_brackets(s_final)
     if open_b > close_b:
         s_final += '}' * (open_b - close_b)
     if open_sq > close_sq:
         s_final += ']' * (open_sq - close_sq)
-    
+
     if s_final != s:
         val = _try_parse(s_final)
         if val is not None:
             logger.warning("[_to_dict] 8단계 성공 (종합 처리)")
             return val
-    
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # 모든 시도 실패
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     logger.error("[_to_dict] 모든 파싱 시도 실패")
     logger.error("[_to_dict] 입력 앞 500자: %s", s[:500])
     logger.error("[_to_dict] 입력 뒤 500자: %s", s[-500:])
-    
+
     # JSON 구조 진단
     try:
         json.loads(s)
     except json.JSONDecodeError as e:
         logger.error("[_to_dict] JSON 파싱 에러: %s (위치: %d / 전체길이: %d)", e.msg, e.pos, len(s))
-        
-        # 에러 위치 주변 컨텍스트
+
         context_start = max(0, e.pos - 100)
         context_end = min(len(s), e.pos + 100)
         logger.error("[_to_dict] 에러 위치 주변 (±100자):")
         logger.error("    %s", s[context_start:context_end])
-        
-        # 문자열 미완성 체크
+
         if "Unterminated string" in e.msg:
             logger.error("[_to_dict] ⚠️  문자열이 중간에 잘렸습니다")
             logger.error("[_to_dict] ⚠️  원인: 에이전트 출력 길이 제한 또는 LLM 응답 불완전")
             logger.error("[_to_dict] ⚠️  해결: max_iterations 증가 또는 데이터 분할 전송")
-        
-        # Expecting 에러
+
         if "Expecting" in e.msg:
             logger.error("[_to_dict] ⚠️  JSON 구조 오류: %s", e.msg)
             logger.error("[_to_dict] ⚠️  에이전트가 잘못된 JSON을 생성했을 가능성")
-        
-        # Invalid control character 에러
+
         if "Invalid control character" in e.msg:
             logger.error("[_to_dict] ⚠️  제어 문자 오류: JSON 문자열 내부에 이스케이프되지 않은 개행문자 존재")
             logger.error("[_to_dict] ⚠️  원인: 에이전트가 \\n 대신 실제 개행문자를 사용")
             logger.error("[_to_dict] ⚠️  해결: 0단계, 1-2단계, 7-8단계에서 자동 처리 시도했으나 실패")
-        
-        # Invalid escape 에러
+
         if "Invalid" in e.msg and "escape" in e.msg:
             logger.error("[_to_dict] ⚠️  잘못된 이스케이프 시퀀스: \\} 같은 잘못된 이스케이프 존재")
             logger.error("[_to_dict] ⚠️  원인: 에이전트가 유효하지 않은 이스케이프 시퀀스 생성")
             logger.error("[_to_dict] ⚠️  해결: _try_parse의 fix_invalid_escapes로 자동 처리 시도했으나 실패")
-    
+
     raise HTTPException(
         status_code=422,
         detail="data는 JSON 객체여야 합니다. 파싱 실패."
     )
+
 
 def _unwrap_data(obj: Any) -> Dict[str, Any]:
     """
@@ -640,6 +586,7 @@ def _unwrap_data(obj: Any) -> Dict[str, Any]:
         return inner
 
     return d
+
 
 def _normalize_kind(val: Any) -> str:
     if isinstance(val, str):
@@ -658,12 +605,14 @@ def _normalize_kind(val: Any) -> str:
         return s
     raise HTTPException(status_code=422, detail="kind는 문자열이어야 합니다.")
 
+
 # ─────────────────────────────────────────────────────────
 # 입력 스키마
 # ─────────────────────────────────────────────────────────
 class _JudgeReadInput(BaseModel):
     case_id: UUID
     run_no: int = Field(1, ge=1)
+
 
 class _JudgeMakeInput(BaseModel):
     case_id: UUID
@@ -672,8 +621,10 @@ class _JudgeMakeInput(BaseModel):
     turns: Optional[List[Dict[str, Any]]] = None
     log: Optional[Dict[str, Any]] = None
 
+
 class _GuidanceInput(BaseModel):
     kind: str = Field(..., pattern="^(P|A)$", description="지침 종류: 'P'(피해자) | 'A'(공격자)")
+
 
 class _SavePreventionInput(BaseModel):
     case_id: UUID
@@ -682,6 +633,7 @@ class _SavePreventionInput(BaseModel):
     run_no: int = Field(1, ge=1)
     summary: str
     steps: List[str] = Field(default_factory=list)
+
 
 # ★ 추가: 최종예방책 생성 입력
 class _MakePreventionInput(BaseModel):
@@ -693,6 +645,7 @@ class _MakePreventionInput(BaseModel):
     # 포맷은 고정적으로 personalized_prevention을 기대
     format: str = Field("personalized_prevention")
 
+
 # ─────────────────────────────────────────────────────────
 # 터미널 조건(라운드5 또는 critical) 판단 헬퍼
 # ─────────────────────────────────────────────────────────
@@ -702,28 +655,29 @@ def _is_terminal_case(rounds: int, judgements: List[Dict[str, Any]]) -> Tuple[bo
     return: (is_terminal, reason)  # reason in {"round3", "critical", "not_terminal"}
     """
     logger.info(f"[_is_terminal_case] rounds={rounds}, judgements count={len(judgements or [])}")
-    
+
     try:
         if rounds >= 3:
             return True, "round3"
-        
+
         for idx, j in enumerate(judgements or []):
             logger.info(f"[_is_terminal_case] judgement[{idx}]: {j}")
-            
+
             risk = j.get("risk")
             logger.info(f"[_is_terminal_case] risk={risk}")
-            
+
             if risk:
                 lvl = str(risk.get("level", "")).lower()
                 logger.info(f"[_is_terminal_case] level={lvl}")
-                
+
                 if lvl == "critical":
                     logger.info(f"[_is_terminal_case] ✓ CRITICAL 발견!")
                     return True, "critical"
     except Exception as e:
         logger.error(f"[_is_terminal_case] Exception: {e}")
-    
+
     return False, "not_terminal"
+
 
 # ─────────────────────────────────────────────────────────
 # MCP에서 대화 턴(JSON) 가져오기
@@ -734,8 +688,7 @@ def _fetch_turns_from_mcp(case_id: UUID, run_no: int) -> List[Dict[str, Any]]:
     기대 형식: [{"role": "attacker"|"victim"|"system", "text": "...", "meta": {...}}, ...]
     기본 엔드포인트 가정: GET {MCP_BASE_URL}/api/cases/{case_id}/turns?run={run_no}
     """
-    # url = f"{MCP_BASE_URL}/api/cases/{case_id}/turns}"
-    url = f"{MCP_BASE_URL}/api/cases/{case_id}/turns"  # 안전하게 재정의
+    url = f"{MCP_BASE_URL}/api/cases/{case_id}/turns"
     params = {"run": run_no}
     try:
         with httpx.Client(timeout=30) as client:
@@ -746,7 +699,6 @@ def _fetch_turns_from_mcp(case_id: UUID, run_no: int) -> List[Dict[str, Any]]:
         logger.error(f"[MCP] 대화 로그 조회 실패: {e}")
         raise HTTPException(status_code=502, detail=f"MCP 대화로그 조회 실패: {e}")
 
-    # 서버 스키마에 맞게 정규화
     turns: Any = None
     if isinstance(data, dict):
         if "turns" in data:
@@ -762,6 +714,7 @@ def _fetch_turns_from_mcp(case_id: UUID, run_no: int) -> List[Dict[str, Any]]:
     if not isinstance(turns, list):
         raise HTTPException(status_code=502, detail="MCP 응답에서 turns 배열을 찾을 수 없습니다.")
     return turns  # type: ignore[return-value]
+
 
 # ─────────────────────────────────────────────────────────
 # 판정 결과 저장 / 조회 (DB는 결과 저장·조회에만 사용)
@@ -791,8 +744,8 @@ def _persist_verdict(
             Model = m.AdminCaseSummary
             row = (
                 db.query(Model)
-                  .filter(Model.case_id == case_id, Model.run == run_no)
-                  .first()
+                .filter(Model.case_id == case_id, Model.run == run_no)
+                .first()
             )
             if not row:
                 row = Model(case_id=case_id, run=run_no)
@@ -823,12 +776,11 @@ def _persist_verdict(
     # 2) 항상 AdminCase에 최신 요약 + 히스토리 라인 누적
     try:
         case = db.get(m.AdminCase, case_id)
-        # ★ 없으면 최소 AdminCase 생성 (시나리오 모르면 빈 dict로라도 생성)
         if not case:
             try:
                 case = m.AdminCase(
                     id=case_id,
-                    scenario={},           # 시나리오를 모르면 빈 객체라도 저장 (NOT NULL 회피)
+                    scenario={},
                     phishing=False,
                     status="running",
                     defense_count=0,
@@ -837,7 +789,6 @@ def _persist_verdict(
                 db.flush()
             except Exception as e:
                 logger.warning(f"[admin.make_judgement] AdminCase 생성 실패: {e}")
-                # AdminCaseSummary 저장만 성공했어도 persisted는 True로 볼 수 있게 commit
                 if success:
                     try:
                         db.commit()
@@ -845,10 +796,8 @@ def _persist_verdict(
                         pass
                 return success
 
-        # 케이스 단위 phishing은 OR
         case.phishing = bool(getattr(case, "phishing", False) or verdict.get("phishing", False))
 
-        # 최신 요약 컬럼이 존재할 경우에만 세팅(없어도 동작)
         risk = verdict.get("risk") or {}
         cont = verdict.get("continue") or {}
 
@@ -867,7 +816,6 @@ def _persist_verdict(
         if hasattr(case, "last_recommendation_reason"):
             case.last_recommendation_reason = str(cont.get("reason", "") or "")
 
-        # 라운드 히스토리 라인 누적 (run 포함)
         prev = (case.evidence or "").strip()
         piece = json.dumps({"run": run_no, "verdict": verdict}, ensure_ascii=False)
         case.evidence = (prev + ("\n" if prev else "") + piece)[:8000]
@@ -882,18 +830,18 @@ def _persist_verdict(
             db.commit()
         except Exception:
             pass
-        # AdminCaseSummary 업서트가 성공했다면 그걸로도 persisted=True로 인정
         return bool(success)
 
-def _read_persisted_verdict(db: Session, *, case_id: UUID, run_no: int) -> Optional[Dict[str, Any]]:  # noqa: E501
+
+def _read_persisted_verdict(db: Session, *, case_id: UUID, run_no: int) -> Optional[Dict[str, Any]]:
     # 1) AdminCaseSummary 우선
     try:
         if hasattr(m, "AdminCaseSummary"):
             Model = m.AdminCaseSummary
             row = (
                 db.query(Model)
-                  .filter(Model.case_id == case_id, Model.run == run_no)
-                  .first()
+                .filter(Model.case_id == case_id, Model.run == run_no)
+                .first()
             )
             if row:
                 ev = ""
@@ -901,33 +849,34 @@ def _read_persisted_verdict(db: Session, *, case_id: UUID, run_no: int) -> Optio
                     ev = row.evidence
                 elif hasattr(row, "reason") and getattr(row, "reason", None):
                     ev = row.reason
-                risk = {}
+
+                risk: Dict[str, Any] = {}
                 if hasattr(row, "risk_score"):
                     risk["score"] = int(getattr(row, "risk_score", 0) or 0)
                 if hasattr(row, "risk_level"):
                     risk["level"] = getattr(row, "risk_level", None) or ""
                 if hasattr(row, "risk_rationale"):
                     risk["rationale"] = getattr(row, "risk_rationale", None) or ""
-                vul = []
+
+                vul: List[Any] = []
                 if hasattr(row, "vulnerabilities") and getattr(row, "vulnerabilities", None):
                     vul = list(row.vulnerabilities or [])
-                # verdict_json이 있으면 우선
+
                 if hasattr(row, "verdict_json") and getattr(row, "verdict_json", None):
                     vj = dict(row.verdict_json or {})
-                    # 최소 필드 보장
                     vj.setdefault("evidence", ev)
                     vj.setdefault("risk", risk or {"score": 0, "level": "", "rationale": ""})
                     vj.setdefault("victim_vulnerabilities", vul)
                     vj.setdefault("phishing", bool(getattr(row, "phishing", False)))
-                    vj.setdefault("continue", {"recommendation":"continue","reason":""})
+                    vj.setdefault("continue", {"recommendation": "continue", "reason": ""})
                     return vj
-                # 없으면 조립
+
                 return {
                     "phishing": bool(getattr(row, "phishing", False)),
                     "evidence": ev,
                     "risk": risk or {"score": 0, "level": "", "rationale": ""},
                     "victim_vulnerabilities": vul,
-                    "continue": {"recommendation":"continue","reason":""},
+                    "continue": {"recommendation": "continue", "reason": ""},
                 }
     except Exception:
         pass
@@ -947,35 +896,90 @@ def _read_persisted_verdict(db: Session, *, case_id: UUID, run_no: int) -> Optio
         pass
     return None
 
+
 # ─────────────────────────────────────────────────────────
 # LLM 결과 파싱 보조
 # ─────────────────────────────────────────────────────────
 def _safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
-    """코드펜스/설명 섞여도 JSON만 뽑아 파싱 시도."""
-    text = text.strip()
-    fence = re.compile(r"^```(?:json)?\s*(\{.*\})\s*```$", re.S)
-    m = fence.match(text)
-    if m:
-        text = m.group(1).strip()
-    if not (text.startswith("{") and text.endswith("}")):
-        m2 = re.search(r"\{.*\}$", text, re.S)
-        if m2:
-            text = m2.group(0)
+    """
+    코드펜스/설명 섞여도 '첫 번째로 완결되는 JSON(객체/배열)'만 추출해 파싱.
+    Extra data(뒤에 설명 문장 붙음) 오류를 크게 줄인다.
+    """
+    text = (text or "").strip()
+
+    def _strip_code_fence(s: str) -> str:
+        s = s.strip()
+        if s.startswith("```"):
+            s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
+        return s.strip()
+
+    def _extract_first_json_fragment(s: str) -> Optional[str]:
+        s = _strip_code_fence(s)
+        if not s:
+            return None
+
+        start = None
+        start_ch = None
+        for idx, ch in enumerate(s):
+            if ch in "{[":
+                start = idx
+                start_ch = ch
+                break
+        if start is None or start_ch is None:
+            return None
+
+        end_ch = "}" if start_ch == "{" else "]"
+        depth = 0
+        in_str = False
+        esc = False
+
+        for j in range(start, len(s)):
+            ch = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            else:
+                if ch == '"':
+                    in_str = True
+                    continue
+                if ch == start_ch:
+                    depth += 1
+                elif ch == end_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return s[start:j + 1]
+        return None
+
+    frag = _extract_first_json_fragment(text)
+    if not frag:
+        return None
+
     try:
-        return json.loads(text)
+        obj = json.loads(frag)
+        if isinstance(obj, dict):
+            return obj
+        # 배열이면 dict로 감싸서 기존 호출부 안전
+        return {"data": obj}
     except Exception:
         try:
-            obj = ast.literal_eval(text)
+            obj = ast.literal_eval(frag)
             if isinstance(obj, dict):
                 return obj
+            return {"data": obj}
         except Exception:
             return None
+
 
 # ─────────────────────────────────────────────────────────
 # 툴 팩토리
 # ─────────────────────────────────────────────────────────
 def make_admin_tools(db: Session, guideline_repo):
-    # ★ 동적 지침 생성기 인스턴스 (2안)
     dynamic_generator = DynamicGuidanceGenerator()
 
     @tool(
@@ -991,10 +995,8 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"JudgeMakeInput 검증 실패: {e}")
 
-        # 1) Action Input으로 턴이 오면 그대로 사용
         turns: Optional[List[Dict[str, Any]]] = ji.turns
 
-        # 2) 없으면 MCP에서 가져오기 (DB 접근 금지)
         if turns is None and ji.log and isinstance(ji.log, dict):
             maybe = ji.log.get("turns")
             if isinstance(maybe, list):
@@ -1002,9 +1004,8 @@ def make_admin_tools(db: Session, guideline_repo):
         if turns is None:
             turns = _fetch_turns_from_mcp(ji.case_id, ji.run_no)
 
-        # 3) 턴 기반 요약/판정 (admin_summary.summarize_run_full은 turns를 받아야 함)
         try:
-            verdict = summarize_run_full(turns=turns)  # <- turns-only
+            verdict = summarize_run_full(turns=turns)
         except TypeError as te:
             logger.error("[admin.make_judgement] summarize_run_full가 turns 기반 시그니처를 지원해야 합니다.")
             raise HTTPException(
@@ -1012,7 +1013,6 @@ def make_admin_tools(db: Session, guideline_repo):
                 detail="summarize_run_full이 'turns' 인자를 지원하도록 업데이트해 주세요."
             ) from te
 
-        # ── 정책 오버라이드: critical일 때만 stop, 그 외는 continue ──
         risk = verdict.get("risk") or {}
         score = int(risk.get("score", 0) or 0)
         score = 0 if score < 0 else (100 if score > 100 else score)
@@ -1020,10 +1020,12 @@ def make_admin_tools(db: Session, guideline_repo):
 
         level = str((risk.get("level") or "").lower())
         if level not in {"low", "medium", "high", "critical"}:
-            level = ("critical" if score >= 75 else
-                     "high"     if score >= 50 else
-                     "medium"   if score >= 25 else
-                     "low")
+            level = (
+                "critical" if score >= 75 else
+                "high" if score >= 50 else
+                "medium" if score >= 25 else
+                "low"
+            )
         risk["level"] = level
         verdict["risk"] = risk
 
@@ -1039,12 +1041,11 @@ def make_admin_tools(db: Session, guideline_repo):
             }
 
         persisted = _persist_verdict(db, case_id=ji.case_id, run_no=ji.run_no, verdict=verdict)
-        # ★ 방어적: 첫 시도에서 persisted=False면 1회 재시도
         if not persisted:
             try:
                 logger.warning("[admin.make_judgement] persisted=False → 1회 재시도")
                 persisted = _persist_verdict(db, case_id=ji.case_id, run_no=ji.run_no, verdict=verdict)
-            except Exception as _:
+            except Exception:
                 pass
 
         return {
@@ -1069,18 +1070,16 @@ def make_admin_tools(db: Session, guideline_repo):
 
         saved = _read_persisted_verdict(db, case_id=ji.case_id, run_no=ji.run_no)
         if saved is not None:
-            out = {
+            return {
                 "ok": True,
                 "phishing": bool(saved.get("phishing", False)),
                 "reason": str(saved.get("evidence", "")),  # 기존 호환
                 "run_no": ji.run_no,
-                # 신규 필드도 함께
                 "evidence": saved.get("evidence", ""),
                 "risk": saved.get("risk", {"score": 0, "level": "", "rationale": ""}),
                 "victim_vulnerabilities": saved.get("victim_vulnerabilities", []),
                 "continue": saved.get("continue", {"recommendation": "continue", "reason": ""}),
             }
-            return out
 
         return {
             "ok": False,
@@ -1089,7 +1088,6 @@ def make_admin_tools(db: Session, guideline_repo):
             "message": "저장된 라운드 판정이 없습니다. admin.make_judgement를 먼저 호출하세요."
         }
 
-    # ★★ 신규(2안): 동적 공격 지침 생성 - DynamicGuidanceGenerator 사용
     @tool(
         "admin.generate_guidance",
         args_schema=SingleData,
@@ -1109,17 +1107,14 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception:
             return {"ok": False, "error": "invalid_case_id", "message": "case_id must be UUID"}
 
-        # 1) 저장된 판정 확보(V1 캐시)
         verdict = _read_persisted_verdict(db, case_id=case_uuid, run_no=run_no)
         if not verdict:
             return {"ok": False, "error": "no_saved_verdict", "message": "admin.make_judgement 이후 호출하세요."}
 
-        # 2) 선택 컨텍스트
         scenario = payload.get("scenario") or {}
         victim_profile = payload.get("victim_profile") or {}
         previous_judgements = payload.get("previous_judgements") or []
 
-        # 3) 동적 지침 생성기 호출
         try:
             result = dynamic_generator.generate_guidance(
                 db=db,
@@ -1128,13 +1123,12 @@ def make_admin_tools(db: Session, guideline_repo):
                 scenario=scenario,
                 victim_profile=victim_profile,
                 previous_judgments=previous_judgements,
-                verdict=verdict,  # ★ 판정 결과 전달 (risk/vulns/evidence/phishing 활용)
+                verdict=verdict,
             )
         except Exception as e:
             logger.exception("[admin.generate_guidance] 실패")
             return {"ok": False, "error": f"generator_failed: {e!s}"}
 
-        # 4) 표준화된 응답
         return {
             "ok": True,
             "type": "A",
@@ -1147,7 +1141,6 @@ def make_admin_tools(db: Session, guideline_repo):
             "source": "dynamic_generator+verdict"
         }
 
-    # ★ 신규: 최종예방책 생성
     @tool(
         "admin.make_prevention",
         args_schema=SingleData,
@@ -1163,8 +1156,7 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"MakePreventionInput 검증 실패: {e}")
 
-        # ★ 정책 게이트: 라운드5 도달 또는 위험도 critical일 때만 생성 허용
-        is_term, reason = _is_terminal_case(pi.rounds, pi.judgements)
+        is_term, _reason = _is_terminal_case(pi.rounds, pi.judgements)
         if not is_term:
             return {
                 "ok": False,
@@ -1173,10 +1165,8 @@ def make_admin_tools(db: Session, guideline_repo):
                 "rounds": pi.rounds,
             }
 
-        # LLM은 게이트 통과 후 생성
         llm = agent_chat(temperature=0.2)
 
-        # 스키마 힌트
         schema_hint = {
             "personalized_prevention": {
                 "summary": "string (2~3문장)",
@@ -1242,12 +1232,13 @@ def make_admin_tools(db: Session, guideline_repo):
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"SavePreventionInput 검증 실패: {e}")
 
-        # ★ 중복 저장 방지: 동일 case_id로 이미 활성 예방책이 있으면 그 id 반환
         try:
             q = (
                 db.query(m.PersonalizedPrevention)
-                  .filter(m.PersonalizedPrevention.case_id == spi.case_id,
-                          m.PersonalizedPrevention.is_active == True)  # noqa: E712
+                .filter(
+                    m.PersonalizedPrevention.case_id == spi.case_id,
+                    m.PersonalizedPrevention.is_active == True  # noqa: E712
+                )
             )
             if hasattr(m.PersonalizedPrevention, "created_at"):
                 q = q.order_by(m.PersonalizedPrevention.created_at.desc())
@@ -1257,7 +1248,6 @@ def make_admin_tools(db: Session, guideline_repo):
             if existing:
                 return str(existing.id)
         except Exception:
-            # 조회 실패는 저장을 막지 않음
             pass
 
         obj = m.PersonalizedPrevention(
@@ -1273,5 +1263,4 @@ def make_admin_tools(db: Session, guideline_repo):
         db.commit()
         return str(obj.id)
 
-    # 기존 + 신규 툴 모두 반환 (★ generate_guidance 추가됨)
     return [make_judgement, judge, generate_guidance, make_prevention, save_prevention]

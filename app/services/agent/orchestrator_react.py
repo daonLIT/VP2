@@ -6,6 +6,8 @@ import json
 import re
 import ast
 from datetime import datetime
+import os
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -40,7 +42,7 @@ EXPECT_MCP_DATA_WRAPPER = False
 
 MIN_ROUNDS = 2
 MAX_ROUNDS_DEFAULT = 5
-MAX_ROUNDS_UI_LIMIT = 3
+MAX_ROUNDS_UI_LIMIT = 5
 
 _PROMPT_CACHE: Dict[str, Dict[str, str]] = {}
 
@@ -1497,6 +1499,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             turns_all = []
             guidance_history = []
 
+            # ✅ 라운드별 대화/통계/종료사유를 메모리에 모아둠 (DB 재조회 없이 케이스 JSON 덤프용)
+            turns_by_round: Dict[int, List[Dict[str, Any]]] = {}
+            stats_by_round: Dict[int, Dict[str, Any]] = {}
+            ended_by_by_round: Dict[int, Optional[str]] = {}
+
             # ThoughtCapture에서 순서대로 추출
             judgement_idx = 0
             guidance_idx = 0
@@ -1590,6 +1597,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
                             cleaned_turns.append(cleaned)
                         turns_all.extend(cleaned_turns)
+
+                        # ✅ 케이스 덤프용 라운드별 저장 (DB 재조회 필요 없게)
+                        try:
+                            turns_by_round[sim_run_idx] = cleaned_turns
+                            stats_by_round[sim_run_idx] = stats if isinstance(stats, dict) else {}
+                            ended_by_by_round[sim_run_idx] = ended_by
+                        except Exception:
+                            pass
 
                         # ── SSE: 라운드 단위 대화 전달 (TTS 모달 버튼 생성용) ─────────────
                         try:
@@ -1807,6 +1822,67 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 "finished_reason": finished_reason,
                 "round_judgements": judgements_history,  # ★ 라운드별 판정 요약
             }
+
+            # ─────────────────────────────────────
+            # ✅ 케이스 전체 JSON 덤프 (옵션 ON일 때만)
+            # - DB 재조회 없이, 위에서 모아둔 turns_by_round/stats_by_round로 저장
+            # - 시스템 영향 최소: 기본 OFF
+            # ─────────────────────────────────────
+            try:
+                dump_enabled = bool(payload.get("dump_case_json", False))
+                if dump_enabled:
+                    dump_dir = (
+                        payload.get("dump_dir")
+                        or os.getenv("VP_CASE_DUMP_DIR")
+                        or "./artifacts/cases"
+                    )
+                    Path(dump_dir).mkdir(parents=True, exist_ok=True)
+                    rounds_payload: List[Dict[str, Any]] = []
+                    # range의 end는 미포함이므로 rounds_done까지 포함하려면 +1
+                    safe_rounds_done = max(0, int(rounds_done))
+                    for rno in range(1, safe_rounds_done + 1):
+                        rounds_payload.append({
+                            "run_no": rno,
+                            "turns": turns_by_round.get(rno, []),
+                            "stats": stats_by_round.get(rno, {}),
+                            "ended_by": ended_by_by_round.get(rno),
+                        })
+                    case_artifact = {
+                        "case_id": case_id,
+                        "timestamp": datetime.now().isoformat(),
+                        "input": _truncate(payload, 2000),
+                        "offender_id": offender_id,
+                        "victim_id": victim_id,
+                        "max_turns_per_round": int(req.max_turns),
+                        "max_rounds": int(max_rounds),
+                        "rounds_done": int(rounds_done),
+                        "finished_reason": finished_reason,
+                        # 시나리오/프로필(분석용)
+                        "scenario": scenario_base,
+                        "victim_profile": victim_profile_base,
+                        # 핵심 로그
+                        "rounds": rounds_payload,                 # ✅ 라운드별 turns/stats/ended_by
+                        "round_judgements": judgements_history,   # 라운드별 판정 요약
+                        "guidances": guidance_history,            # 다음 라운드용 guidance들
+                        "personalized_prevention": prevention_obj or {},
+                        # 부가 메타
+                        "meta": {
+                            "used_tools": used_tools,
+                            "stream_id": stream_id,
+                            "victim_gender": victim_gender,
+                            "offender_gender": offender_gender,
+                            "victim_age_group": victim_age_group,
+                        }
+                    }
+                    out_path = Path(dump_dir) / f"{case_id}.json"
+                    with out_path.open("w", encoding="utf-8") as f:
+                        json.dump(case_artifact, f, ensure_ascii=False, indent=2)
+                    logger.info("[CaseDump] saved: %s", str(out_path))
+                    _emit_to_stream("artifact_saved", {"case_id": case_id, "path": str(out_path)})
+                    # (선택) 결과에도 경로 포함
+                    result_obj["artifact_path"] = str(out_path)
+            except Exception as e:
+                logger.warning("[CaseDump] failed: %s", e)
 
             with contextlib.suppress(Exception):
                 _emit_run_end("success", {"case_id": case_id, "rounds": rounds_done})

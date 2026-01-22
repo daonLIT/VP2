@@ -20,6 +20,7 @@ from app.services.llm_providers import agent_chat
 from app.services.agent.tools_sim import make_sim_tools
 from app.services.agent.tools_admin import make_admin_tools
 from app.services.agent.tools_mcp import make_mcp_tools
+from app.services.agent.tools_emotion import label_victim_emotions
 from app.services.agent.tools_tavily import make_tavily_tools
 from app.services.agent.guideline_repo_db import GuidelineRepoDB
 from app.core.logging import get_logger
@@ -418,6 +419,21 @@ def _parse_victim_turn_text(text: Any) -> Tuple[Optional[str], Optional[Dict[str
     except Exception:
         return None, None
 
+def _norm_role(role: Any) -> str:
+    """
+    MCP/LLM/tool이 role을 다양하게 주는 경우를 통일.
+    - victim 계열: victim/user/사용자/피해자
+    - offender 계열: offender/scammer/attacker/assistant/agent/가해자/사기범
+    """
+    s = str(role or "").strip().lower()
+    if not s:
+        return "unknown"
+    if s in ("victim", "user", "사용자", "피해자"):
+        return "victim"
+    if s in ("offender", "scammer", "attacker", "assistant", "agent", "가해자", "사기범"):
+        return "offender"
+    return s
+
 def _extract_json_block(agent_result: Any) -> Dict[str, Any]:
     try:
         if isinstance(agent_result, dict):
@@ -498,6 +514,47 @@ def _loose_parse_json(obj: Any) -> Dict[str, Any]:
         except Exception:
             pass
     return {}
+
+def _loose_parse_json_any(obj: Any) -> Any:
+    """
+    _loose_parse_json는 dict만 반환해서, label_victim_emotions처럼 list(turns)가 오는 경우를 못 받는다.
+    이 함수는 dict/list 모두 복구해서 반환한다.
+    """
+    if isinstance(obj, (dict, list)):
+        return obj
+    s = str(obj).strip()
+    if not s:
+        return obj
+
+    # 1) strict json
+    try:
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            return json.loads(s)
+    except Exception:
+        pass
+
+    # 2) python literal
+    try:
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            return ast.literal_eval(s)
+    except Exception:
+        pass
+
+    # 3) first {...} or [...]
+    try:
+        m = re.search(r"(\{.*\}|\[.*\])", s, re.S)
+        if m:
+            frag = m.group(1)
+            try:
+                return json.loads(frag)
+            except Exception:
+                try:
+                    return ast.literal_eval(frag)
+                except Exception:
+                    return obj
+    except Exception:
+        pass
+    return obj
 
 def _strip_action_input_wrappers(text: str) -> str:
     """
@@ -862,7 +919,7 @@ def _smart_print(*args, **kwargs):
 
                 cleaned_turns = []
                 for turn in raw_turns:
-                    role = turn.get("role", "")
+                    role = _norm_role(turn.get("role", ""))
                     text = turn.get("text", "")
 
                     # 피해자 턴이 JSON이면 dialogue만 뽑기 (TTS 캐시는 대사 중심 유지)
@@ -1225,6 +1282,7 @@ def _validate_complete_execution(cap: ThoughtCapture, rounds_done: int) -> dict:
         # ✅ 조기 종료(critical) 또는 max_rounds 미만 수행을 고려: "실제로 끝난 라운드 수" 기준
         "sim.compose_prompts": rounds_done,
         "mcp.simulator_run": rounds_done,
+        "label_victim_emotions": rounds_done,  # ✅ 추가
         "admin.make_judgement": rounds_done,
         "admin.generate_guidance": max(0, rounds_done - 1),
         "admin.make_prevention": 1,
@@ -1350,6 +1408,15 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
             tools.append(_wrap_tool_force_json_input(tool, require_data_wrapper=True))
         else:
             tools.append(tool)
+    # ✅ Emotion tool 등록 (mcp.simulator_run 다음에 호출해서 turns에 emotion/hmm을 붙이는 용도)
+    tools.append(label_victim_emotions)
+    # ✅ tool name 고정: 이벤트 처리/validation에서 "label_victim_emotions"로 찾기 때문에 실제 등록 name 불일치 방지
+    # (langchain tool 데코레이터/버전에 따라 name이 달라질 수 있음)
+    try:
+        if getattr(label_victim_emotions, "name", None) != "label_victim_emotions":
+            setattr(label_victim_emotions, "name", "label_victim_emotions")
+    except Exception:
+        pass
     if use_tavily:
         tools += make_tavily_tools()
 
@@ -1415,6 +1482,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
     ex = None
     mcp_manager = None
     _emitted_run_end = False
+    case_id = None  # ✅ finally에서 안전하게 참조하기 위해 선할당
 
     try:
         if _stop and _stop.is_set():
@@ -1503,6 +1571,26 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             victim_profile_base = _as_dict(victim_profile)
             templates_base = _as_dict(templates)
 
+            # ─────────────────────────────────────
+            # ✅ Emotion/HMM 환경변수 기본값(선택)
+            # - main.py에서 load_dotenv()를 이미 수행하므로 여기선 "읽기"만 한다.
+            # - case_mission에서 pair_mode를 아예 지정하지 않으면 tools_emotion에서
+            #   EMOTION_PAIR_MODE를 기본값으로 사용하게 된다.
+            # - 그래도 디버깅/명시성을 원하면 아래 값을 case_mission에 주입할 수 있다.
+            # ─────────────────────────────────────
+            def _env_emotion_pair_mode() -> Optional[str]:
+                try:
+                    v = (os.getenv("EMOTION_PAIR_MODE") or "").strip()
+                    return v or None
+                except Exception:
+                    return None
+
+            env_pair_mode = _env_emotion_pair_mode()  # ex) "prev_offender"
+            if env_pair_mode:
+                logger.info("[EmotionEnv] EMOTION_PAIR_MODE=%s", env_pair_mode)
+            else:
+                logger.info("[EmotionEnv] EMOTION_PAIR_MODE not set (tools default will apply)")
+
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # ★★★ 전체 케이스 미션 구성 (동적 라운드)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1536,9 +1624,17 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 - 입력: {{"offender_id": {offender_id}, "victim_id": {victim_id}, "scenario": <1단계 scenario>, "prompt_id": PROMPT_ID_R1, "max_turns": {req.max_turns}, "round_no": 1}}
 - 저장: case_id (CASE_ID 변수), turns
 
+단계 3-1: 감정 라벨링 (라운드1)
+- 도구: label_victim_emotions
+- 입력: {{"turns": <3단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"}}
+- 주의:
+  * pair_mode를 여기서 강제로 지정하지 마세요.
+  * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE(예: prev_offender)를 기본으로 사용합니다.
+- 저장: TURNS_R1_LABELED
+
 단계 4: 판정 (라운드1)
 - 도구: admin.make_judgement
-- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": <3단계 turns>}}}}
+- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": TURNS_R1_LABELED}}}}
 - 저장: 판정 결과 (JUDGEMENT_R1)
 
 단계 4-1: 라운드1 종료 조건 체크
@@ -1567,9 +1663,17 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 - 입력: {{"offender_id": {offender_id}, "victim_id": {victim_id}, "scenario": <1단계 scenario>, "prompt_id": PROMPT_ID_R{{N}}, "max_turns": {req.max_turns}, "round_no": N, "case_id_override": CASE_ID, "guidance": {{"type": "A", "text": GUIDANCE_R{{N}}.text}}}}
 - 저장: turns
 
+단계 7-1: 감정 라벨링 (라운드N)
+- 도구: label_victim_emotions
+- 입력: {{"turns": <7단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"}}
+- 주의:
+  * pair_mode를 여기서 강제로 지정하지 마세요.
+  * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE(예: prev_offender)를 기본으로 사용합니다.
+- 저장: TURNS_R{{N}}_LABELED
+
 단계 8: 판정 (라운드N)
 - 도구: admin.make_judgement
-- 입력: {{"data": {{"case_id": CASE_ID, "run_no": N, "turns": <7단계 turns>}}}}
+- 입력: {{"data": {{"case_id": CASE_ID, "run_no": N, "turns": TURNS_R{{N}}_LABELED}}}}
 - 저장: JUDGEMENT_R{{N}}
 
 단계 8-1: 라운드N 종료 조건 체크 ← **매우 중요**
@@ -1597,7 +1701,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
   * risk.level == "critical" OR
   * N == {max_rounds}
 - 도구: admin.make_prevention
-- 입력: {{"data": {{"case_id": CASE_ID, "rounds": N, "turns": [모든라운드turns], "judgements": [모든judgement], "guidances": [모든guidance]}}}}
+- 입력: {{"data": {{"case_id": CASE_ID, "rounds": N, "turns": [모든라운드_TURNS_LABELED], "judgements": [모든judgement], "guidances": [모든guidance]}}}}
 - 저장: prevention_result
 
 단계 11: 예방책 저장 ← **필수**
@@ -1738,6 +1842,25 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         logger.warning("[CaseMission] cap.events 비어있음 → intermediate_steps로 도구 호출 복구: %s", actual_tools)
                     except Exception as e:
                         logger.warning("[CaseMission] intermediate_steps 복구 실패: %s", e)
+                # ✅ cap.events가 비어있을 때 case_id도 intermediate_steps observation에서 복구 시도
+                if not case_id and steps:
+                    try:
+                        for step in steps:
+                            if not (isinstance(step, (list, tuple)) and len(step) >= 2):
+                                continue
+                            action, obs = step[0], step[1]
+                            if getattr(action, "tool", None) != "mcp.simulator_run":
+                                continue
+                            sim_dict = _loose_parse_json(obs)
+                            if isinstance(sim_dict, dict):
+                                body = sim_dict.get("data") if isinstance(sim_dict.get("data"), dict) else sim_dict
+                                _cid = body.get("case_id")
+                                if _cid:
+                                    case_id = str(_cid)
+                                    logger.warning("[CaseMission] case_id intermediate_steps로 복구: %s", case_id)
+                                    break
+                    except Exception as e:
+                        logger.warning("[CaseMission] case_id intermediate_steps 복구 실패: %s", e)
 
                 # dump 모드가 아니면 기존처럼 500 유지(프론트 영향 최소)
                 if not actual_tools and not dump_enabled:
@@ -1750,7 +1873,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             used_tools = actual_tools
 
             # 2. case_id 추출
-            case_id = _extract_case_id_from_agent_output(result, cap)
+            # ✅ 위에서 intermediate_steps로 복구했을 수도 있으니, 없을 때만 기존 로직 사용
+            if not case_id:
+                case_id = _extract_case_id_from_agent_output(result, cap)
             if not case_id:
                 logger.error("[CaseMission] case_id 추출 실패")
                 raise HTTPException(500, "case_id 추출 실패")
@@ -1761,9 +1886,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             # 3. 완료된 라운드 수 계산
             # ❗ 기존: action 기준 카운트 → retry/중복 호출 시 라운드 수 부풀려짐
             # ✅ 수정: observation 기반으로 run_no를 최대한 신뢰하고 dedupe
+            # ✅ rounds_done 계산 전용(=count 전용) dedupe 키 모음
+            seen_judgement_keys_for_count: Set[Any] = set()
             rounds_done = 0
             try:
-                seen = set()
                 for ev in cap.events:
                     if ev.get("type") != "observation" or ev.get("tool") != "admin.make_judgement":
                         continue
@@ -1773,11 +1899,13 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     # admin.make_judgement 출력에 run_no/run이 있으면 그걸 사용
                     rno = j.get("run_no", j.get("run"))
                     if isinstance(rno, int):
-                        seen.add(rno)
+                        seen_judgement_keys_for_count.add(rno)
                     else:
                         # run_no가 없으면 "내용 기반"으로 중복 제거(최소 안전장치)
-                        seen.add(json.dumps(_truncate(j, 2000), ensure_ascii=False, sort_keys=True))
-                rounds_done = len(seen)
+                        seen_judgement_keys_for_count.add(
+                            json.dumps(_truncate(j, 2000), ensure_ascii=False, sort_keys=True)
+                        )
+                rounds_done = len(seen_judgement_keys_for_count)
             except Exception:
                 rounds_done = 0
 
@@ -1788,19 +1916,23 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
             # 4. 각 라운드 판정 및 turns 추출
             judgements_history = []
-            turns_all = []
+            turns_all = []  # ✅ 아래에서 turns_by_round 기반으로 재구성
             guidance_history = []
+            # ✅ judgements_history 수집(=히스토리 생성) 전용 dedupe set
+            judgement_seen_run_nos: Set[int] = set()
 
             # ✅ 라운드별 대화/통계/종료사유를 메모리에 모아둠 (DB 재조회 없이 케이스 JSON 덤프용)
             turns_by_round: Dict[int, List[Dict[str, Any]]] = {}
             stats_by_round: Dict[int, Dict[str, Any]] = {}
             ended_by_by_round: Dict[int, Optional[str]] = {}
+            case_id_by_round: Dict[int, str] = {}  # ✅ 라운드별 case_id (override 포함) 추적
 
             # ThoughtCapture에서 순서대로 추출
             judgement_idx = 0
             guidance_idx = 0
             sim_run_idx = 0
-            seen_judgement_run_nos: Set[int] = set()
+            # ✅ "가장 최근 simulator_run의 라운드키" 기억: label_victim_emotions merge 대상을 정확히 지정
+            last_sim_round_key: Optional[int] = None
 
             logger.info(f"[DEBUG] ===== cap.events 전체 ({len(cap.events)}개) =====")
             for i, ev in enumerate(cap.events):
@@ -1818,9 +1950,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             # ✅ 가능한 경우, 실제 run_no를 따르고 중복을 제거
                             rno = judgement.get("run_no", judgement.get("run"))
                             if isinstance(rno, int):
-                                if rno in seen_judgement_run_nos:
+                                if rno in judgement_seen_run_nos:
                                     continue
-                                seen_judgement_run_nos.add(rno)
+                                judgement_seen_run_nos.add(rno)
                                 use_run_no = rno
                             else:
                                 judgement_idx += 1
@@ -1870,10 +2002,23 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         sim_case_id = body.get("case_id") or case_id
                         stats = body.get("stats") or {}
                         ended_by = body.get("ended_by")
+                        # ✅ 라운드 키: 가능하면 MCP가 준 round_no/run_no를 사용(재시도 시 sim_run_idx 부풀림 방지)
+                        round_key = body.get("round_no") or body.get("run_no") or body.get("run") or sim_run_idx
+                        try:
+                            round_key = int(round_key)
+                        except Exception:
+                            round_key = sim_run_idx
+                        last_sim_round_key = round_key
+                        # ✅ label_victim_emotions 단계에서 DB 업데이트 시 사용할 case_id 추적
+                        try:
+                            if sim_case_id:
+                                case_id_by_round[round_key] = str(sim_case_id)
+                        except Exception:
+                            pass
                         # ★★★ victim dialogue 추출 (JSON → text)
                         cleaned_turns = []
                         for turn in raw_turns:
-                            role = turn.get("role", "")
+                            role = _norm_role(turn.get("role", ""))
                             text = turn.get("text", "")
                             
                             cleaned: Dict[str, Any] = {"role": role, "text": text}
@@ -1898,13 +2043,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 cleaned["gender"] = offender_gender     # "male"/"female"
 
                             cleaned_turns.append(cleaned)
-                        turns_all.extend(cleaned_turns)
+                        # ✅ turns_all은 여기서 바로 누적하지 말고
+                        #    label_victim_emotions 결과로 덮인 뒤 최종 재구성
 
                         # ✅ 케이스 덤프용 라운드별 저장 (DB 재조회 필요 없게)
                         try:
-                            turns_by_round[sim_run_idx] = cleaned_turns
-                            stats_by_round[sim_run_idx] = stats if isinstance(stats, dict) else {}
-                            ended_by_by_round[sim_run_idx] = ended_by
+                            turns_by_round[round_key] = cleaned_turns
+                            stats_by_round[round_key] = stats if isinstance(stats, dict) else {}
+                            ended_by_by_round[round_key] = ended_by
                         except Exception:
                             pass
 
@@ -1914,7 +2060,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 "conversation_round",
                                 {
                                     "case_id": str(sim_case_id) if sim_case_id else None,
-                                    "run_no": sim_run_idx,
+                                    "run_no": round_key,
                                     "turns": _truncate(cleaned_turns, 2000),
                                     "ended_by": ended_by,
                                     "stats": _truncate(stats, 2000),
@@ -1929,14 +2075,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 db.query(m.ConversationRound)
                                 .filter(
                                     m.ConversationRound.case_id == sim_case_id,
-                                    m.ConversationRound.run == sim_run_idx,
+                                    m.ConversationRound.run == round_key,
                                 )
                                 .first()
                             )
                             if not round_row:
                                 round_row = m.ConversationRound(
                                     case_id=sim_case_id,
-                                    run=sim_run_idx,
+                                    run=round_key,
                                     offender_id=offender_id,
                                     victim_id=victim_id,
                                     turns=cleaned_turns,
@@ -1952,7 +2098,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             logger.info(
                                 "[DB] ConversationRound stored: case_id=%s run=%s turns=%s",
                                 sim_case_id,
-                                sim_run_idx,
+                                round_key,
                                 len(cleaned_turns),
                             )
                         except Exception as e:
@@ -1964,7 +2110,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 db.query(m.ConversationLog)
                                 .filter(
                                     m.ConversationLog.case_id == sim_case_id,
-                                    m.ConversationLog.run == sim_run_idx,
+                                    m.ConversationLog.run == round_key,
                                 )
                                 .delete(synchronize_session=False)
                             )
@@ -1983,7 +2129,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                     label=None,
                                     payload=turn,
                                     use_agent=True,
-                                    run=sim_run_idx,
+                                    run=round_key,
                                     guidance_type=None,
                                     guideline=None,
                                 )
@@ -1993,14 +2139,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             logger.info(
                                 "[DB] ConversationLog stored: case_id=%s run=%s turns=%s",
                                 sim_case_id,
-                                sim_run_idx,
+                                round_key,
                                 len(cleaned_turns),
                             )
                         except Exception as e:
                             logger.warning(
                                 "[DB] ConversationLog 저장 실패: case_id=%s run=%s error=%s",
                                 sim_case_id,
-                                sim_run_idx,
+                                round_key,
                                 e,
                             )
 
@@ -2008,7 +2154,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         try:
                             cache_run_dialog(
                                 case_id=str(sim_case_id),
-                                run_no=sim_run_idx,
+                                run_no=round_key,
                                 turns=cleaned_turns,
                                 victim_age=victim_meta.get("age"),
                                 victim_gender=victim_gender,
@@ -2016,7 +2162,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             logger.info(
                                 "[TTS_CACHE] cached dialog for case_id=%s run_no=%s (turns=%s, age=%s, gender=%s)",
                                 sim_case_id,
-                                sim_run_idx,
+                                round_key,
                                 len(cleaned_turns),
                                 victim_meta.get("age"),
                                 victim_gender,
@@ -2028,7 +2174,177 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 sim_run_idx,
                                 e,
                             )
-                    
+                    # ✅ 감정 라벨링 결과 처리: 직전 mcp.simulator_run 라운드(turns_by_round[sim_run_idx])를 덮어쓰기
+                    elif tool_name == "label_victim_emotions":
+                        # tool output은 보통 list(turns) 또는 {"turns":[...]} 형태
+                        labeled_any = _loose_parse_json_any(output)
+                        labeled_turns: Optional[List[Dict[str, Any]]] = None
+                        # ✅ merge 대상 라운드: 직전 simulator_run의 round_key 우선
+                        target_round = last_sim_round_key if isinstance(last_sim_round_key, int) else sim_run_idx
+
+                        if isinstance(labeled_any, dict):
+                            t = labeled_any.get("turns")
+                            if isinstance(t, list):
+                                labeled_turns = t
+                        elif isinstance(labeled_any, list):
+                            labeled_turns = labeled_any
+
+                        if not labeled_turns:
+                            logger.warning(
+                                "[Emotion] label_victim_emotions output이 turns(list)가 아님: type=%s value=%s",
+                                type(labeled_any).__name__,
+                                _truncate(labeled_any, 300),
+                            )
+                            continue
+
+                        # ✅ 기존 cleaned_turns(성별/age_group/victim_meta 등 유지) 위에 라벨 필드만 merge
+                        base_turns = turns_by_round.get(target_round) or []
+                        merged: List[Dict[str, Any]] = []
+                        try:
+                            max_len = max(len(base_turns), len(labeled_turns))
+                            for i in range(max_len):
+                                b = base_turns[i] if i < len(base_turns) and isinstance(base_turns[i], dict) else {}
+                                l = labeled_turns[i] if i < len(labeled_turns) and isinstance(labeled_turns[i], dict) else {}
+                                mt = dict(b)     # base 우선
+                                # ❗중요: labeled의 text가 JSON 문자열일 수 있으므로
+                                #         base의 text/victim_meta/gender/age_group 등을 덮어쓰지 않는다.
+                                OVERLAY_KEYS = (
+                                    "emotion",
+                                    "hmm", "hmm_state", "hmm_probs", "hmm_summary", "hmm_result",
+                                    "pair_mode", "pair_used",
+                                    "emotion_debug", "emotion_input",
+                                )
+                                for k in OVERLAY_KEYS:
+                                    if k in l:
+                                        mt[k] = l[k]
+
+                                # base에 role이 비어있으면 labeled role을 채우되 정규화
+                                if not mt.get("role") and l.get("role"):
+                                    mt["role"] = _norm_role(l.get("role"))
+                                merged.append(mt)
+                        except Exception:
+                            merged = [t for t in labeled_turns if isinstance(t, dict)]
+
+                        # ✅ 최종 안전 정규화:
+                        # - role 재정규화
+                        # - victim text가 JSON이면 dialogue로 복구
+                        # - gender/age_group 누락 시 주입
+                        normalized: List[Dict[str, Any]] = []
+                        for t in merged:
+                            if not isinstance(t, dict):
+                                continue
+                            tt = dict(t)
+                            tt["role"] = _norm_role(tt.get("role"))
+
+                            if tt["role"] == "victim":
+                                dialogue, vmeta = _parse_victim_turn_text(tt.get("text"))
+                                if dialogue:
+                                    tt["text"] = dialogue
+                                if vmeta:
+                                    tt.setdefault("victim_meta", vmeta)
+                                    tt.setdefault("is_convinced", vmeta.get("is_convinced"))
+                                    tt.setdefault("thoughts", vmeta.get("thoughts"))
+                                tt.setdefault("gender", victim_gender)
+                                if victim_age_group:
+                                    tt.setdefault("age_group", victim_age_group)
+                            elif tt["role"] == "offender":
+                                tt.setdefault("gender", offender_gender)
+
+                            normalized.append(tt)
+                        merged = normalized
+
+                        # ✅ 현재 라운드 turns 덮어쓰기
+                        turns_by_round[target_round] = merged
+
+                        _cid = case_id_by_round.get(target_round) or str(case_id)
+
+                        # ✅ SSE 업데이트(프론트가 후처리된 turns로 교체 가능)
+                        try:
+                            _emit_to_stream(
+                                "conversation_round",
+                                {
+                                    "case_id": _cid,
+                                    "run_no": target_round,
+                                    "turns": _truncate(merged, 2000),
+                                    "ended_by": ended_by_by_round.get(target_round),
+                                    "stats": _truncate(stats_by_round.get(target_round, {}), 2000),
+                                    "labeled": True,
+                                },
+                            )
+                        except Exception:
+                            pass
+
+                        # ✅ DB ConversationRound 덮어쓰기
+                        try:
+                            round_row = (
+                                db.query(m.ConversationRound)
+                                .filter(
+                                    m.ConversationRound.case_id == _cid,
+                                    m.ConversationRound.run == target_round,
+                                )
+                                .first()
+                            )
+                            if round_row:
+                                round_row.turns = merged
+                                db.commit()
+                                logger.info(
+                                    "[DB] ConversationRound updated(labeled): case_id=%s run=%s",
+                                    _cid,
+                                    target_round,
+                                )
+                        except Exception as e:
+                            logger.warning("[DB] ConversationRound labeled update failed: %s", e)
+
+                        # ✅ DB ConversationLog 덮어쓰기(턴 payload에 emotion/hmm 포함)
+                        try:
+                            (
+                                db.query(m.ConversationLog)
+                                .filter(
+                                    m.ConversationLog.case_id == _cid,
+                                    m.ConversationLog.run == target_round,
+                                )
+                                .delete(synchronize_session=False)
+                            )
+
+                            for idx, turn in enumerate(merged, start=1):
+                                role = (turn.get("role") or "").strip() or "unknown"
+                                text = turn.get("text") or ""
+                                log_row = m.ConversationLog(
+                                    case_id=_cid,
+                                    offender_id=offender_id,
+                                    victim_id=victim_id,
+                                    turn_index=idx,
+                                    role=role,
+                                    content=text,
+                                    label=None,
+                                    payload=turn,  # ✅ emotion/hmm 포함된 전체 턴 저장
+                                    use_agent=True,
+                                    run=target_round,
+                                    guidance_type=None,
+                                    guideline=None,
+                                )
+                                db.add(log_row)
+                            db.commit()
+                            logger.info(
+                                "[DB] ConversationLog updated(labeled): case_id=%s run=%s turns=%s",
+                                _cid,
+                                target_round,
+                                len(merged),
+                            )
+                        except Exception as e:
+                            logger.warning("[DB] ConversationLog labeled update failed: %s", e)
+
+                        # ✅ TTS 캐시도 라벨 결과로 최신화(음성엔 영향 없고, turn 구조 유지용)
+                        try:
+                            cache_run_dialog(
+                                case_id=str(_cid),
+                                run_no=target_round,
+                                turns=merged,
+                                victim_age=victim_meta.get("age"),
+                                victim_gender=victim_gender,
+                            )
+                        except Exception:
+                            pass
                     # admin.generate_guidance
                     elif tool_name == "admin.generate_guidance":
                         guidance_idx += 1
@@ -2039,6 +2355,14 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 "kind": guidance_obj.get("type", ""),
                                 "text": guidance_obj.get("text", "")
                             })
+
+            # ✅ 최종 turns_all 재구성(라벨링 덮어쓰기 반영)
+            try:
+                turns_all = []
+                for rno in sorted(turns_by_round.keys()):
+                    turns_all.extend(turns_by_round.get(rno) or [])
+            except Exception:
+                pass
 
             logger.info(f"[CaseMission] 판정 수: {len(judgements_history)}, turns 총 {len(turns_all)}개")
             # ✅ dump 모드 fallback: cap.events 수집이 실패한 경우 DB에서 라운드 대화 복구
@@ -2294,9 +2618,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
                 # 🔊 TTS용 대화 캐시도 함께 정리
                 try:
-                    clear_case_dialog_cache(str(case_id))
+                    _cid = locals().get("case_id", None)
+                    if _cid:
+                        clear_case_dialog_cache(str(_cid))
                 except Exception as e:
-                    logger.warning("[TTS_CACHE] clear_case_dialog_cache 실패: case_id=%s error=%s", case_id, e)
+                    _cid = locals().get("case_id", None)
+                    logger.warning("[TTS_CACHE] clear_case_dialog_cache 실패: case_id=%s error=%s", _cid, e)
         with contextlib.suppress(Exception):
             _ACTIVE_RUN_KEYS.discard(run_key)
         if sse_on:

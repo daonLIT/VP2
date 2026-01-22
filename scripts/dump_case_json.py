@@ -3,12 +3,21 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dotenv import load_dotenv
 import uuid
 import json
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+
+#
+# ✅ .env를 "이 스크립트 실행 프로세스"에 확실히 로드
+#   - VP/.env, VP/app/.env 둘 다 로드 (필요한 쪽만 남겨도 됨)
+#
+_ROOT = Path(__file__).resolve().parents[1]      # .../VP
+load_dotenv(_ROOT / ".env", override=False)
+load_dotenv(_ROOT / "app" / ".env", override=False)
 
 from app.db.session import SessionLocal
 from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stream
@@ -85,11 +94,11 @@ async def main():
             case_id = result.get("case_id") if isinstance(result, dict) else None
 
             if artifact_path:
-                success = 1
+                success += 1
                 print(f"[OK {success}/{TARGET_JSON}] case_id={case_id} artifact={artifact_path}")
             else:
                 # ✅ 보험: artifact_path가 없으면 result 자체라도 저장
-                success = 1
+                success += 1
                 fallback = ok_dir / f"fallback_{_ts()}_{stream_id}.json"
                 _write_json(fallback, {
                     "note": "artifact_path missing; saved fallback result",

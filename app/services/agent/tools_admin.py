@@ -9,6 +9,7 @@ import json
 import ast
 import httpx
 import re
+import inspect
 
 from pydantic import BaseModel, Field
 from langchain_core.tools import tool
@@ -295,7 +296,7 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         return v
 
     # 2) 첫 JSON 조각만 추출해서 시도
-    frag = _extract_first_json_fragment(s)
+    frag = _extract_first_json_fragment(s0)
     if frag:
         logger.info("[_to_dict] 2단계: JSON 조각 추출 (%d자)", len(frag))
         v = _parse_json_dict(frag)
@@ -304,9 +305,15 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
             return v
 
     # 2.5) (추가) 괄호 누락/미완결 JSON 복구 시도
-    frag2 = _balance_json_fragment(s)
+    balanced = _balance_json_fragment(s0)
+    # balance는 "끝 괄호"만 붙이므로, 뒤에 로그/문장이 섞여 있으면 Extra data가 날 수 있음.
+    # => balanced 결과에서 다시 "첫 번째로 완결되는 JSON 조각"만 뽑아서 파싱한다.
+    frag2 = None
+    if balanced:
+        frag2 = _extract_first_json_fragment(balanced) or balanced
+
     if frag2 and frag2 != frag:
-        logger.info("[_to_dict] 2.5단계: JSON 보정 조각 추출 (%d자)", len(frag2))
+        logger.info("[_to_dict] 2.5단계: JSON 보정+조각 추출 (%d자)", len(frag2))
         v = _parse_json_dict(frag2)
         if v is not None:
             logger.info("[_to_dict] 2.5단계 성공 (보정 조각 파싱)")
@@ -331,10 +338,10 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
 
     # 에러 위치를 남기기 위해 json.loads를 한번 더 시도해 위치 로그
     try:
-        json.loads(frag2 or frag or s0)
-    except json.JSONDecodeError as e:
-        logger.error("[_to_dict] JSONDecodeError: %s (pos=%d, len=%d)", e.msg, e.pos, len(frag or s0))
         ctx = (frag2 or frag or s0)
+        json.loads(ctx)
+    except json.JSONDecodeError as e:
+        logger.error("[_to_dict] JSONDecodeError: %s (pos=%d, len=%d)", e.msg, e.pos, len(ctx))
         cs = max(0, e.pos - 120)
         ce = min(len(ctx), e.pos + 120)
         logger.error("[_to_dict] 에러 주변(±120): %s", ctx[cs:ce])
@@ -422,14 +429,14 @@ class _MakePreventionInput(BaseModel):
 # ─────────────────────────────────────────────────────────
 def _is_terminal_case(rounds: int, judgements: List[Dict[str, Any]]) -> Tuple[bool, str]:
     """
-    rounds 가 2 이상이거나, judgements 중 risk.level == 'critical' 이 하나라도 있으면 터미널로 간주.
-    return: (is_terminal, reason)  # reason in {"round2", "critical", "not_terminal"}
+    rounds 가 5 이상이거나, judgements 중 risk.level == 'critical' 이 하나라도 있으면 터미널로 간주.
+    return: (is_terminal, reason)  # reason in {"round5", "critical", "not_terminal"}
     """
     logger.info(f"[_is_terminal_case] rounds={rounds}, judgements count={len(judgements or [])}")
 
     try:
-        if rounds >= 2:
-            return True, "round2"
+        if rounds >= 5:
+            return True, "round5"
 
         for idx, j in enumerate(judgements or []):
             logger.info(f"[_is_terminal_case] judgement[{idx}]: {j}")
@@ -462,10 +469,14 @@ def _fetch_turns_from_mcp(case_id: UUID, run_no: int) -> List[Dict[str, Any]]:
     url = f"{MCP_BASE_URL}/api/cases/{case_id}/turns"
     params = {"run": run_no}
     try:
-        with httpx.Client(timeout=30) as client:
-            r = client.get(url, params=params)
+        with httpx.Client(timeout=httpx.Timeout(30.0)) as client:
+            r = client.get(url, params=params, headers={"Accept": "application/json"})
         r.raise_for_status()
-        data = r.json()
+        try:
+            data = r.json()
+        except Exception:
+            logger.error(f"[MCP] JSON 파싱 실패. status={r.status_code}, text_head={r.text[:300]!r}")
+            raise
     except Exception as e:
         logger.error(f"[MCP] 대화 로그 조회 실패: {e}")
         raise HTTPException(status_code=502, detail=f"MCP 대화로그 조회 실패: {e}")
@@ -751,7 +762,29 @@ def _safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
 # 툴 팩토리
 # ─────────────────────────────────────────────────────────
 def make_admin_tools(db: Session, guideline_repo):
-    dynamic_generator = DynamicGuidanceGenerator()
+    # generator가 repo를 받는 버전/안받는 버전 둘 다 대비
+    try:
+        dynamic_generator = DynamicGuidanceGenerator(guideline_repo=guideline_repo)
+    except TypeError:
+        dynamic_generator = DynamicGuidanceGenerator()
+
+    def _call_with_signature_filter(fn, **kwargs):
+        """
+        ✅ 함수 시그니처에 존재하는 키워드만 골라 호출 (TypeError 방지)
+        - generator 메서드 파라미터가 바뀌어도 안전하게 동작
+        """
+        sig = inspect.signature(fn)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(**filtered)
+
+    def _normalize_previous_judgments(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        ✅ previous_judgements(오타) / previous_judgments(정상) 둘 다 허용
+        """
+        pj = payload.get("previous_judgments")
+        if pj is None:
+            pj = payload.get("previous_judgements")
+        return pj if isinstance(pj, list) else []
 
     @tool(
         "admin.make_judgement",
@@ -775,8 +808,25 @@ def make_admin_tools(db: Session, guideline_repo):
         if turns is None:
             turns = _fetch_turns_from_mcp(ji.case_id, ji.run_no)
 
+        # summarize_run_full이 기대하는 최소 필드(role/text)로 정규화
+        normalized_turns: List[Dict[str, Any]] = []
+        for t in (turns or []):
+            if not isinstance(t, dict):
+                continue
+            role = t.get("role") or t.get("speaker") or t.get("type")
+            text = t.get("text") or t.get("content") or t.get("message")
+            if role is None and isinstance(t.get("meta"), dict):
+                role = t["meta"].get("role")
+            if text is None and isinstance(t.get("meta"), dict):
+                text = t["meta"].get("text")
+            if role is None or text is None:
+                # 그래도 원본 보존(디버깅)
+                normalized_turns.append(t)
+                continue
+            normalized_turns.append({**t, "role": str(role), "text": str(text)})
+
         try:
-            verdict = summarize_run_full(turns=turns)
+            verdict = summarize_run_full(turns=normalized_turns)
         except TypeError as te:
             logger.error("[admin.make_judgement] summarize_run_full가 turns 기반 시그니처를 지원해야 합니다.")
             raise HTTPException(
@@ -884,31 +934,28 @@ def make_admin_tools(db: Session, guideline_repo):
 
         scenario = payload.get("scenario") or {}
         victim_profile = payload.get("victim_profile") or {}
-        previous_judgements = payload.get("previous_judgements") or []
+        previous_judgments = _normalize_previous_judgments(payload)
 
         try:
-            # guidance_generator 쪽 파라미터명이 (previous_judgments / previous_judgements)로
-            # 엇갈릴 수 있어서 TypeError 시 폴백
-            try:
-                result = dynamic_generator.generate_guidance(
-                    db=db,
-                    case_id=str(case_uuid),
-                    round_no=run_no,
-                    scenario=scenario,
-                    victim_profile=victim_profile,
-                    previous_judgments=previous_judgements,
-                    verdict=verdict,
-                )
-            except TypeError:
-                result = dynamic_generator.generate_guidance(
-                    db=db,
-                    case_id=str(case_uuid),
-                    round_no=run_no,
-                    scenario=scenario,
-                    victim_profile=victim_profile,
-                    previous_judgements=previous_judgements,
-                    verdict=verdict,
-                )
+            # ✅ 여기서 터지던 핵심 원인 해결:
+            # - guideline_repo: generate_guidance()가 안 받는 경우가 많음 → 시그니처 필터링으로 자동 제거
+            # - previous_judgements 오타 → previous_judgments로 정규화
+            #
+            # 또한 generator 구현에 따라 run_no/round_no 명칭이 다를 수 있어 둘 다 넣고,
+            # 시그니처에 있는 것만 전달한다.
+            kwargs = dict(
+                db=db,
+                case_id=str(case_uuid),
+                run_no=run_no,
+                round_no=run_no,
+                scenario=scenario,
+                victim_profile=victim_profile,
+                verdict=verdict,
+                previous_judgments=previous_judgments,
+                guideline_repo=guideline_repo,  # 있으면 전달, 없으면 자동 제거
+            )
+
+            result = _call_with_signature_filter(dynamic_generator.generate_guidance, **kwargs)
         except Exception as e:
             logger.exception("[admin.generate_guidance] 실패")
             return {"ok": False, "error": f"generator_failed: {e!s}"}
@@ -945,7 +992,7 @@ def make_admin_tools(db: Session, guideline_repo):
             return {
                 "ok": False,
                 "error": "not_terminal",
-                "message": "prevention can be generated only at round 2+ or when risk is critical",
+                "message": "prevention can be generated only at round 5+ or when risk is critical",
                 "rounds": pi.rounds,
             }
 

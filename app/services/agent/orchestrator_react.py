@@ -1408,15 +1408,17 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
             tools.append(_wrap_tool_force_json_input(tool, require_data_wrapper=True))
         else:
             tools.append(tool)
-    # ✅ Emotion tool 등록 (mcp.simulator_run 다음에 호출해서 turns에 emotion/hmm을 붙이는 용도)
-    tools.append(label_victim_emotions)
-    # ✅ tool name 고정: 이벤트 처리/validation에서 "label_victim_emotions"로 찾기 때문에 실제 등록 name 불일치 방지
-    # (langchain tool 데코레이터/버전에 따라 name이 달라질 수 있음)
+    # ✅ Emotion tool 등록
+    # - ReAct가 Action Input을 문자열로 망가뜨리는 경우가 있어서, orchestrator에서 먼저 dict로 복구 후 invoke하도록 래핑
+    # - label_victim_emotions는 {"turns": [...], "run_hmm": true, ...} 형태(상위 "data" 래핑 불필요)
+    emotion_tool = label_victim_emotions
     try:
-        if getattr(label_victim_emotions, "name", None) != "label_victim_emotions":
-            setattr(label_victim_emotions, "name", "label_victim_emotions")
+        # tool name 고정: 이벤트 처리/validation에서 "label_victim_emotions"로 찾기 때문에 불일치 방지
+        if getattr(emotion_tool, "name", None) != "label_victim_emotions":
+            setattr(emotion_tool, "name", "label_victim_emotions")
     except Exception:
         pass
+    tools.append(_wrap_tool_force_json_input(emotion_tool, require_data_wrapper=False))
     if use_tavily:
         tools += make_tavily_tools()
 
@@ -1572,12 +1574,15 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             templates_base = _as_dict(templates)
 
             # ─────────────────────────────────────
-            # ✅ Emotion/HMM 환경변수 기본값(선택)
-            # - main.py에서 load_dotenv()를 이미 수행하므로 여기선 "읽기"만 한다.
-            # - case_mission에서 pair_mode를 아예 지정하지 않으면 tools_emotion에서
-            #   EMOTION_PAIR_MODE를 기본값으로 사용하게 된다.
-            # - 그래도 디버깅/명시성을 원하면 아래 값을 case_mission에 주입할 수 있다.
-            # ─────────────────────────────────────
+            # ✅ Emotion pair_mode 결정 로직 (victim_only 지원 포함)
+            # 우선순위:
+            #  1) 요청(req/payload)에 명시된 pair_mode(또는 emotion_pair_mode)
+            #  2) 환경변수 EMOTION_PAIR_MODE
+            #  3) tools_emotion 내부 기본값
+            #
+            # ※ FE/배치에서 필드명을 pair_mode로 보내는 경우가 많아서 둘 다 지원한다.
+            # ※ env가 설정된 경우, tools_emotion이 env를 안 읽는 환경에서도 동작하도록
+            #    orchestrator가 pair_mode를 "명시적으로" 주입한다.
             def _env_emotion_pair_mode() -> Optional[str]:
                 try:
                     v = (os.getenv("EMOTION_PAIR_MODE") or "").strip()
@@ -1585,11 +1590,84 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 except Exception:
                     return None
 
-            env_pair_mode = _env_emotion_pair_mode()  # ex) "prev_offender"
-            if env_pair_mode:
-                logger.info("[EmotionEnv] EMOTION_PAIR_MODE=%s", env_pair_mode)
+            def _normalize_emotion_pair_mode(v: Optional[str]) -> Optional[str]:
+                """
+                pair_mode 표준화:
+                - victim_only 추가 지원
+                - 흔한 별칭/오타를 최대한 안전하게 정규화
+                """
+                if v is None:
+                    return None
+                s = str(v).strip()
+                if not s:
+                    return None
+                s_low = s.lower().strip()
+
+                # 별칭 정규화
+                alias = {
+                    # victim only
+                    "victimonly": "victim_only",
+                    "victim_only": "victim_only",
+                    "victim-only": "victim_only",
+                    "only_victim": "victim_only",
+                    "victim": "victim_only",
+                    # previous offender as pair
+                    "prev": "prev_offender",
+                    "prev_offender": "prev_offender",
+                    "previous_offender": "prev_offender",
+                    "victim+prev": "victim+prev_offender",
+                    "victim+prev_offender": "victim+prev_offender",
+                    # thoughts as pair
+                    "victim+thought": "victim+thoughts",
+                    "victim+thoughts": "victim+thoughts",
+                }
+                return alias.get(s_low, s)  # 모르는 값은 그대로 통과(도구 쪽에서 처리)
+
+            def _req_emotion_pair_mode() -> Optional[str]:
+                # SimulationStartRequest에 필드가 없을 수도 있으니 payload도 같이 본다.
+                # FE/배치 호환: pair_mode / emotion_pair_mode 둘 다 지원
+                try:
+                    v = getattr(req, "emotion_pair_mode", None)
+                    if v is not None:
+                        return _normalize_emotion_pair_mode(v)
+                except Exception:
+                    pass
+                try:
+                    v = getattr(req, "pair_mode", None)
+                    if v is not None:
+                        return _normalize_emotion_pair_mode(v)
+                except Exception:
+                    pass
+                try:
+                    v = payload.get("emotion_pair_mode")
+                    if v is not None:
+                        return _normalize_emotion_pair_mode(v)
+                except Exception:
+                    pass
+                try:
+                    v = payload.get("pair_mode")
+                    if v is not None:
+                        return _normalize_emotion_pair_mode(v)
+                except Exception:
+                    pass
+                return None
+
+            req_pair_mode = _req_emotion_pair_mode()                 # ex) "victim_only" / "prev_offender" / ...
+            env_pair_mode = _normalize_emotion_pair_mode(_env_emotion_pair_mode())  # ex) "prev_offender"
+            # ✅ 유효값이 뭔지 tool 쪽에서 더 엄격히 검증할 수도 있어서,
+            #    여기서는 "요청 > env > None" 순으로만 결정한다.
+            pair_mode_effective = req_pair_mode or env_pair_mode or None
+
+            if req_pair_mode:
+                logger.info("[EmotionPairMode] override(from_request)=%s", req_pair_mode)
+            elif env_pair_mode:
+                logger.info("[EmotionPairMode] using_env=%s (case_mission will INCLUDE pair_mode for safety)", env_pair_mode)
             else:
-                logger.info("[EmotionEnv] EMOTION_PAIR_MODE not set (tools default will apply)")
+                logger.info("[EmotionPairMode] not set (tools default will apply; case_mission will OMIT pair_mode)")
+
+            # case_mission에 넣을 Action Input suffix (없으면 빈 문자열로 pair_mode 생략)
+            # ✅ 요청 또는 env에서 결정된 값이 있으면 명시적으로 넣는다.
+            emotion_pair_mode_suffix = f', "pair_mode": "{pair_mode_effective}"' if pair_mode_effective else ""
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # ★★★ 전체 케이스 미션 구성 (동적 라운드)
@@ -1626,10 +1704,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 단계 3-1: 감정 라벨링 (라운드1)
 - 도구: label_victim_emotions
-- 입력: {{"turns": <3단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"}}
+- 입력: {{"turns": <3단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
 - 주의:
-  * pair_mode를 여기서 강제로 지정하지 마세요.
-  * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE(예: prev_offender)를 기본으로 사용합니다.
+  * (요청에서 emotion_pair_mode를 준 경우에만 pair_mode가 포함됩니다)
+  * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE 또는 내부 기본값을 사용합니다.
 - 저장: TURNS_R1_LABELED
 
 단계 4: 판정 (라운드1)
@@ -1665,10 +1743,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 단계 7-1: 감정 라벨링 (라운드N)
 - 도구: label_victim_emotions
-- 입력: {{"turns": <7단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"}}
+- 입력: {{"turns": <7단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
 - 주의:
-  * pair_mode를 여기서 강제로 지정하지 마세요.
-  * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE(예: prev_offender)를 기본으로 사용합니다.
+  * (요청에서 emotion_pair_mode를 준 경우에만 pair_mode가 포함됩니다)
+  * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE 또는 내부 기본값을 사용합니다.
 - 저장: TURNS_R{{N}}_LABELED
 
 단계 8: 판정 (라운드N)
@@ -1737,6 +1815,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 4. **도구별 입력 형식**
    - mcp.simulator_run: data 래핑 없음
    - 나머지 도구: {{"data": {{...}}}} 형식
+   - label_victim_emotions: data 래핑 없음 ({{"turns": [...], ...}})
 
 5. **Action Input 작성**
    - 반드시 한 줄로 작성

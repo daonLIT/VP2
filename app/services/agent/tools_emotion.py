@@ -109,7 +109,11 @@ class LabelVictimEmotionsInput(BaseModel):
 
         return data
 
-@tool("label_victim_emotions", args_schema=LabelVictimEmotionsInput)
+@tool(
+    "label_victim_emotions",
+    args_schema=LabelVictimEmotionsInput,
+    description="피해자 발화(turns)에 감정(pred4/pred8/probs 등)을 주입하고, 옵션에 따라 HMM(v1/v2/v3) 결과를 부착해 반환합니다.",
+)
 def label_victim_emotions(
     turns: Any,
     # ✅ schema 기본(default_factory=_default_pair_mode)와 직접 호출 기본을 일치

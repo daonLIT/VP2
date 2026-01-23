@@ -10,6 +10,156 @@ import json, re
 import statistics  # ✅ 추가: 평균 계산용
 
 # =========================
+# HMM 요약 유틸 (A안: LLM 기본 + HMM 보정/근거강화)
+# =========================
+def _extract_hmm_summary_from_turns(turns: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    turns 내에 label_turns.py가 붙여둔 HMM 결과(hmm_summary 또는 hmm)를 찾아서 반환.
+    우선순위:
+      1) 마지막 victim 턴의 hmm_summary
+      2) 마지막 victim 턴의 hmm (posterior/viterbi)
+      3) 그 외 victim 턴 중 마지막으로 발견되는 hmm_summary/hmm
+    """
+    last_candidate: Optional[Dict[str, Any]] = None
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+        if _normalize_role(t) != "victim":
+            continue
+        hs = t.get("hmm_summary")
+        if isinstance(hs, dict) and hs:
+            last_candidate = hs
+        else:
+            h = t.get("hmm")
+            if isinstance(h, dict) and h:
+                last_candidate = h
+    return last_candidate
+
+
+def _hmm_summary_text(hmm: Optional[Dict[str, Any]]) -> str:
+    """
+    프롬프트에 넣기 좋은 형태의 텍스트 요약 생성.
+    (없으면 "HMM 없음")
+    """
+    if not hmm:
+        return "HMM 없음"
+
+    # label_turns.py의 hmm_summary 포맷
+    final_state = hmm.get("final_state")
+    final_probs = hmm.get("final_probs")
+    path = hmm.get("path")
+
+    # per-turn hmm 포맷일 수도 있음
+    if final_state is None and isinstance(hmm.get("viterbi"), str):
+        final_state = hmm.get("viterbi")
+    if final_probs is None and isinstance(hmm.get("posterior"), (list, tuple)):
+        final_probs = list(hmm.get("posterior"))
+
+    # viterbi path 간단 통계
+    v3_ratio = None
+    if isinstance(path, list) and path:
+        norm_path = [str(x).upper() for x in path if x is not None]
+        if norm_path:
+            v3_ratio = norm_path.count("V3") / float(len(norm_path))
+
+    # final_probs는 [p1,p2,p3] 형태를 기대(없어도 OK)
+    fp_str = None
+    if isinstance(final_probs, (list, tuple)) and len(final_probs) == 3:
+        try:
+            fp_str = f"[{float(final_probs[0]):.3f}, {float(final_probs[1]):.3f}, {float(final_probs[2]):.3f}]"
+        except Exception:
+            fp_str = str(final_probs)
+
+    return (
+        "HMM 요약: "
+        f"final_state={final_state}, "
+        f"final_probs={fp_str}, "
+        f"v3_ratio={None if v3_ratio is None else f'{v3_ratio:.3f}'}, "
+        f"path_len={(len(path) if isinstance(path, list) else None)}"
+    )
+
+
+def _adjust_risk_score_with_hmm(base_score: int, hmm: Optional[Dict[str, Any]]) -> int:
+    """
+    A안: LLM이 산출한 base_score를 유지하되,
+    HMM의 취약 상태(V3) 신호가 강하면 가산, 약하면 감산.
+    - 최종 0~100 clamp
+    """
+    s = int(base_score)
+    if not hmm:
+        return max(0, min(100, s))
+
+    final_state = hmm.get("final_state")
+    final_probs = hmm.get("final_probs")
+    path = hmm.get("path")
+
+    # per-turn hmm 형태 대응
+    if final_state is None and isinstance(hmm.get("viterbi"), str):
+        final_state = hmm.get("viterbi")
+    if final_probs is None and isinstance(hmm.get("posterior"), (list, tuple)):
+        final_probs = list(hmm.get("posterior"))
+
+    # v3_ratio 계산
+    v3_ratio = None
+    if isinstance(path, list) and path:
+        norm_path = [str(x).upper() for x in path if x is not None]
+        if norm_path:
+            v3_ratio = norm_path.count("V3") / float(len(norm_path))
+
+    # pV3 추정
+    p_v3 = None
+    if isinstance(final_probs, (list, tuple)) and len(final_probs) == 3:
+        try:
+            p_v3 = float(final_probs[2])
+        except Exception:
+            p_v3 = None
+
+    st = str(final_state).upper() if final_state is not None else None
+
+    # --- 보정 규칙(보수적) ---
+    # 강한 취약 신호: V3 이거나 pV3>=0.55, v3_ratio>=0.45
+    if (st == "V3") or (p_v3 is not None and p_v3 >= 0.55) or (v3_ratio is not None and v3_ratio >= 0.45):
+        s += 10
+    # 중간 신호: V2 이거나 pV3 0.40~0.55, v3_ratio 0.30~0.45
+    elif (st == "V2") or (p_v3 is not None and 0.40 <= p_v3 < 0.55) or (v3_ratio is not None and 0.30 <= v3_ratio < 0.45):
+        s += 5
+    # 약한 신호: V1 이거나 pV3<0.25 & v3_ratio<0.20이면 약간 감산(과대평가 방지)
+    elif (st == "V1") or ((p_v3 is not None and p_v3 < 0.25) and (v3_ratio is not None and v3_ratio < 0.20)):
+        s -= 5
+
+    return max(0, min(100, int(s)))
+
+# =========================
+# role/turn 정규화 유틸
+# =========================
+def _normalize_role(turn: Dict[str, Any]) -> str:
+    """
+    다양한 로그 포맷에서 role을 표준화한다.
+    - offender/attacker/scammer -> offender
+    - victim/user/customer/피해자 -> victim
+    - system -> system
+    """
+    raw = (
+        turn.get("role")
+        or turn.get("speaker")
+        or turn.get("actor")
+        or turn.get("type")
+        or ""
+    )
+    s = str(raw).strip().lower()
+    if s in {"system", "sys"}:
+        return "system"
+    if s in {"offender", "attacker", "scammer", "fraudster", "agent", "caller", "공격자", "가해자"}:
+        return "offender"
+    if s in {"victim", "user", "customer", "callee", "피해자", "사용자"}:
+        return "victim"
+    # unknown은 시스템으로 취급하지 말고 unknown 유지 (프롬프트에서 피해자로 오해 방지)
+    return "unknown"
+
+def _get_turn_text(turn: Dict[str, Any]) -> str:
+    return (turn.get("text") or turn.get("content") or turn.get("dialogue") or "").strip()
+
+# =========================
 # LLM 프롬프트 (전체 대화: 공격자+피해자)
 # =========================
 PROMPT_FULL_DIALOG = """
@@ -84,6 +234,14 @@ E) **지속적 고신뢰 + 명시적 실행 의사(실행 직전 단계)**   # �
 
 [신뢰도 통계 요약]
 {conviction}
+
+[HMM 취약상태 요약] (참고)
+{hmm}
+
+[HMM 사용 지침]
+- phishing/evidence 판정은 **대화 텍스트(특히 피해자 실행/확약 발화)** 를 1순위 근거로 하라.
+- HMM은 **risk.score 보정 근거** 및 **victim_vulnerabilities 강화 근거**로만 사용하라.
+- HMM이 V3(취약)로 강하게 나오면: '권위/긴급에 흔들림', '검증 없이 따르려는 경향' 같은 취약성을 더 강하게 반영할 수 있다.
 """.strip()
 
 # =========================
@@ -92,9 +250,18 @@ E) **지속적 고신뢰 + 명시적 실행 의사(실행 직전 단계)**   # �
 def _format_dialog_from_turns(turns: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for i, t in enumerate(turns, start=1):
-        role = t.get("role", "")
-        role_ko = "공격자" if role in ("offender", "attacker") else "피해자"
-        text = t.get("text") or t.get("content") or ""
+        role_norm = _normalize_role(t)
+        if role_norm == "system":
+            role_ko = "시스템"
+        elif role_norm == "offender":
+            role_ko = "공격자"
+        elif role_norm == "victim":
+            role_ko = "피해자"
+        else:
+            role_ko = "알수없음"
+        text = _get_turn_text(t)
+        if not text:
+            continue
         lines.append(f"{i} [{role_ko}] {text}")
     return "\n".join(lines)
 
@@ -152,6 +319,23 @@ def _extract_is_convinced_from_text(text: str) -> Optional[int]:
             return None
     return None
 
+def _extract_is_convinced_from_turn(turn: Dict[str, Any]) -> Optional[int]:
+    """
+    턴 dict에 is_convinced가 직접 들어오는 케이스를 우선 처리하고,
+    없으면 기존 텍스트 파싱으로 fallback.
+    """
+    v = turn.get("is_convinced")
+    if isinstance(v, (int, float)):
+        return max(0, min(10, int(v)))
+    # meta 안에 들어오는 경우도 방어
+    meta = turn.get("meta")
+    if isinstance(meta, dict):
+        mv = meta.get("is_convinced")
+        if isinstance(mv, (int, float)):
+            return max(0, min(10, int(mv)))
+    raw = _get_turn_text(turn)
+    return _extract_is_convinced_from_text(raw)
+
 def _conviction_summary_text_from_turns(turns: List[Dict[str, Any]]) -> str:
     """
     피해자 턴의 is_convinced를 누적/지속 지표까지 계산해 프롬프트에 제공.
@@ -196,13 +380,14 @@ def _conviction_summary_text_from_turns(turns: List[Dict[str, Any]]) -> str:
 
     intent_hits: List[int] = []
     for idx, t in enumerate(turns, start=1):
-        role = t.get("role")
-        if role not in ("victim", "피해자"):
+        role_norm = _normalize_role(t)
+        if role_norm != "victim":
             continue
 
-        raw = (t.get("text") or t.get("content") or "").strip()
-        # is_convinced
-        v = _extract_is_convinced_from_text(raw)
+        raw = _get_turn_text(t)
+
+        # ✅ is_convinced: 턴 필드 우선, 없으면 텍스트에서 추출
+        v = _extract_is_convinced_from_turn(t)
         if v is not None:
             vals.append(v)
             last = v
@@ -381,9 +566,19 @@ def summarize_run_full(
     - 없으면 (db, case_id, run_no) 기반으로 DB에서 불러오기
     """
     if turns is not None:
-        dialog = _format_dialog_from_turns(turns)
+        # ✅ 입력 turns를 그대로 믿지 말고 role/text를 정규화해서 사용
+        normalized_turns: List[Dict[str, Any]] = []
+        for t in (turns or []):
+            if not isinstance(t, dict):
+                continue
+            tt = dict(t)
+            tt["role"] = _normalize_role(tt)
+            normalized_turns.append(tt)
+        dialog = _format_dialog_from_turns(normalized_turns)
         scenario_str = ""  # MCP JSON으로 넘어오는 경우 시나리오 문자열은 생략 가능
-        conviction_text = _conviction_summary_text_from_turns(turns)  # ✅ 추가
+        conviction_text = _conviction_summary_text_from_turns(normalized_turns)  # ✅ 버그 수정(오타)
+        hmm_summary = _extract_hmm_summary_from_turns(normalized_turns)
+        hmm_text = _hmm_summary_text(hmm_summary)
     else:
         if db is None or case_id is None or run_no is None:
             raise ValueError("summarize_run_full: turns 또는 (db, case_id, run_no) 중 하나는 제공해야 합니다.")
@@ -399,8 +594,15 @@ def summarize_run_full(
             .order_by(m.ConversationLog.turn_index.asc())
             .all()
         )
-        tmp_turns = [{"role": r.role, "text": r.content} for r in rows]
+        tmp_turns = []
+        for r in rows:
+            tmp_turns.append({
+                "role": (r.role or "").strip().lower(),
+                "text": (r.content or "")
+            })
         conviction_text = _conviction_summary_text_from_turns(tmp_turns)  # ✅ 추가
+        hmm_summary = _extract_hmm_summary_from_turns(tmp_turns)
+        hmm_text = _hmm_summary_text(hmm_summary)
 
     if not dialog.strip():
         return {
@@ -417,9 +619,47 @@ def summarize_run_full(
         scenario=_escape_braces(scenario_str),
         dialog=_escape_braces(dialog),
         conviction=_escape_braces(conviction_text),
+        hmm=_escape_braces(hmm_text),
     )
     resp = llm.invoke(prompt).content
-    return _json_loads_lenient_full(resp)
+    parsed = _json_loads_lenient_full(resp)
+
+    # ✅ A안: risk.score는 LLM 기본 + HMM 보정(0~100)
+    base_score = int((parsed.get("risk") or {}).get("score", 0))
+    adj_score = _adjust_risk_score_with_hmm(base_score, hmm_summary)
+    if "risk" not in parsed or not isinstance(parsed["risk"], dict):
+        parsed["risk"] = {"score": adj_score, "level": "low", "rationale": ""}
+    else:
+        parsed["risk"]["score"] = adj_score
+        # level은 score 기반으로 재계산(LLM이 잘못 주면 보정)
+        lvl = parsed["risk"].get("level")
+        if lvl not in {"low", "medium", "high", "critical"}:
+            lvl = None
+        if lvl is None:
+            parsed["risk"]["level"] = (
+                "critical" if adj_score >= 75 else
+                "high"     if adj_score >= 50 else
+                "medium"   if adj_score >= 25 else
+                "low"
+            )
+        else:
+            # score가 바뀌었는데 level이 모순이면 score 기준으로 덮어쓰기
+            expected = (
+                "critical" if adj_score >= 75 else
+                "high"     if adj_score >= 50 else
+                "medium"   if adj_score >= 25 else
+                "low"
+            )
+            if lvl != expected:
+                parsed["risk"]["level"] = expected
+
+    # downstream에서 디버깅/근거강화에 쓰기 쉽게 hmm 요약을 같이 싣고 싶으면 meta에 포함(선택)
+    parsed.setdefault("meta", {})
+    if isinstance(parsed["meta"], dict):
+        parsed["meta"]["hmm_summary"] = hmm_summary
+        parsed["meta"]["hmm_text"] = hmm_text
+
+    return parsed
 
 # =========================
 # 레거시 케이스 단위 판정

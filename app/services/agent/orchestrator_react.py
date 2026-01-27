@@ -1512,7 +1512,7 @@ def _extract_prevention_from_last_observation(cap: ThoughtCapture) -> Dict[str, 
         return prev_dict.get("personalized_prevention", {})
     return {}
 
-def _validate_complete_execution(cap: ThoughtCapture, rounds_done: int) -> dict:
+def _validate_complete_execution(cap: ThoughtCapture, rounds_done: int, *, inject_emotion: bool = True) -> dict:
     """실행 완료 여부를 검증하고 누락된 단계를 반환"""
     tools_called = _extract_tool_call_sequence(cap)
     
@@ -1521,7 +1521,7 @@ def _validate_complete_execution(cap: ThoughtCapture, rounds_done: int) -> dict:
         # ✅ 조기 종료(critical) 또는 max_rounds 미만 수행을 고려: "실제로 끝난 라운드 수" 기준
         "sim.compose_prompts": rounds_done,
         "mcp.simulator_run": rounds_done,
-        "label_victim_emotions": rounds_done,  # ✅ 추가
+        "label_victim_emotions": rounds_done if inject_emotion else 0,
         "admin.make_judgement": rounds_done,
         "admin.generate_guidance": max(0, rounds_done - 1),
         "admin.make_prevention": 1,
@@ -1738,7 +1738,13 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
         with ctx:
             req = SimulationStartRequest(**payload)
             ex, mcp_manager = build_agent_and_tools(db, use_tavily=req.use_tavily)
-
+            # ✅ 감정 주입 ON/OFF (기본 ON)
+            # - payload.inject_emotion=false면 label_victim_emotions 단계를 "미션에서" 생략하도록 유도
+            inject_emotion = payload.get("inject_emotion")
+            if inject_emotion is None:
+                inject_emotion = True
+            inject_emotion = bool(inject_emotion)
+            logger.info("[EmotionInject] inject_emotion=%s", inject_emotion)
             # 프롬프트 패키지 (DB 조립)
             pkg = build_prompt_package_from_payload(
                 db, req, tavily_result=None, is_first_run=True, skip_catalog_write=True
@@ -1921,6 +1927,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             # ✅ 요청 또는 env에서 결정된 값이 있으면 명시적으로 넣는다.
             emotion_pair_mode_suffix = f', "pair_mode": "{pair_mode_effective}"' if pair_mode_effective else ""
 
+            # ✅ 디버그 입력 플래그(원하면 payload로)
+            # - label_victim_emotions 입력(turns/pair_mode 등)을 서버 로그로 찍게 만들 때 사용
+            debug_input = payload.get("emotion_debug_input")
+            debug_input = 1 if str(debug_input).strip() in ("1", "true", "True") else 0
+            debug_input_suffix = f', "debug_input": {debug_input}' if debug_input else ""
+
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # ★★★ 전체 케이스 미션 구성 (동적 라운드)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1955,8 +1967,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 - 저장: case_id (CASE_ID 변수), turns
 
 단계 3-1: 감정 라벨링 (라운드1)
+- (inject_emotion==True일 때만 수행)
 - 도구: label_victim_emotions
-- 입력: {{"run_no": 1, "turns": <3단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
+- 입력: {{"run_no": 1, "turns": <3단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}{debug_input_suffix}}}
 - 주의:
   * (요청에서 emotion_pair_mode를 준 경우에만 pair_mode가 포함됩니다)
   * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE 또는 내부 기본값을 사용합니다.
@@ -1971,7 +1984,9 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 단계 4: 판정 (라운드1)
 - 도구: admin.make_judgement
-- 입력(중요): {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": TURNS_R1_LABELED, "hmm": HMM_R1}}}}
+- 입력(중요):
+    - inject_emotion==True: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": TURNS_R1_LABELED, "hmm": HMM_R1}}}}
+    - inject_emotion==False: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": <3단계 turns>, "hmm": {{"available": false, "reason": "emotion_disabled", "run_no": 1}}}}}}
 - 저장: 판정 결과 (JUDGEMENT_R1)
 
 단계 4-1: 라운드1 종료 조건 체크
@@ -2002,7 +2017,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 단계 7-1: 감정 라벨링 (라운드N)
 - 도구: label_victim_emotions
-- 입력: {{"run_no": N, "turns": <7단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
+- 입력: {{"run_no": N, "turns": <7단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}{debug_input_suffix}}}
 - 주의:
   * (요청에서 emotion_pair_mode를 준 경우에만 pair_mode가 포함됩니다)
   * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE 또는 내부 기본값을 사용합니다.
@@ -2747,7 +2762,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             logger.info(f"[CaseMission] 종료 사유: {finished_reason}")
 
             # 6. 실행 완료 검증
-            validation = _validate_complete_execution(cap, rounds_done)
+            validation = _validate_complete_execution(cap, rounds_done, inject_emotion=inject_emotion)
             if not validation["is_complete"]:
                 logger.warning(
                     f"[Validation] 누락된 단계: {validation['missing_steps']}\n"

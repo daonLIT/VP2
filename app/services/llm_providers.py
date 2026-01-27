@@ -1,6 +1,7 @@
 # app/services/llm_providers.py
 import os
 from typing import Optional
+from typing import Union
 from app.core.config import settings
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -43,20 +44,22 @@ def openai_chat(model: Optional[str] = None, temperature: float = 0.7):
 
 
 def agent_chat(model: str | None = None, temperature: float = 0.2):
-    name = model or getattr(settings, "AGENT_MODEL", None) #or STOP_SAFE_DEFAULT
-    # 'o4-mini' 같은 응답 API 전용 이름이 들어오면 안전 모델로 강제 매핑
-    alias_map = {
-        "o4-mini": "gpt-4o-mini-2024-07-18",  # 소형 버전 쓰고 싶으면 이걸로
-        "o4": "gpt-4o-2024-08-06",
-    }
-    name = alias_map.get(name, name)
+    name = (model or getattr(settings, "AGENT_MODEL", None))
+    if not name:
+        raise RuntimeError("AGENT_MODEL not set")
+
+    # ✅ o-series는 temperature를 잘못 넣으면 기대와 다르게 동작할 수 있으니
+    # openai_chat()와 동일한 정책으로 맞춘다.
+    is_o_series = name.strip().lower().startswith("o")
+    if is_o_series:
+        temperature = 1
 
     if not settings.OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set")
 
     return ChatOpenAI(
         model=name,
-        temperature=temperature,  # ReAct는 0~0.3 권장
+        temperature=temperature,  # non-o 모델은 0~0.3 권장
         api_key = settings.OPENAI_API_KEY,
         timeout=600000,
     )

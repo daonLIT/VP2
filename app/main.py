@@ -5,7 +5,22 @@ import asyncio
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv()
+
+# ✅ dotenv 로딩 디버그 (읽히는지 확인)
+import os
+import dotenv  # python-dotenv 패키지
+
+_cwd = os.getcwd()
+_found_dotenv = dotenv.find_dotenv(usecwd=True)  # 실제로 탐지된 .env 경로(없으면 "")
+print(f"[ENV-DEBUG] cwd={_cwd}")
+print(f"[ENV-DEBUG] find_dotenv(usecwd=True)={_found_dotenv!r}")
+
+# load_dotenv() 호출 전/후 값 비교
+print(f"[ENV-DEBUG] before load_dotenv: EMOTION_ENABLED={os.getenv('EMOTION_ENABLED')!r}")
+_loaded = load_dotenv()  # 기본: override=False (기존 OS env가 있으면 덮어쓰지 않음)
+print(f"[ENV-DEBUG] load_dotenv() returned={_loaded!r} (True면 .env 발견/로드)")
+print(f"[ENV-DEBUG] after load_dotenv:  EMOTION_ENABLED={os.getenv('EMOTION_ENABLED')!r}")
+
 from app.core.config import settings
 from app.db.session import engine
 from app.db.base import Base

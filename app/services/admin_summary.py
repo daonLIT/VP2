@@ -7,8 +7,48 @@ from app.db import models as m
 from app.services.llm_providers import admin_chat  # ADMIN_MODEL 사용
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import os
 import json, re
 import statistics  # ✅ 추가: 평균 계산용
+
+# =========================
+# tools_emotion / HMM 사용 여부 (.env 스위치)
+# =========================
+def _env_flag(names: List[str], default: bool) -> bool:
+    """
+    여러 env 키 후보를 지원하는 bool 파서.
+    - true: 1, true, yes, y, on
+    - false: 0, false, no, n, off
+    """
+    truthy = {"1", "true", "yes", "y", "on"}
+    falsy = {"0", "false", "no", "n", "off"}
+    for k in names:
+        v = os.getenv(k)
+        if v is None:
+            continue
+        s = v.strip().lower()
+        if s in truthy:
+            return True
+        if s in falsy:
+            return False
+    return default
+
+# ✅ 프로젝트마다 키명이 달라도 동작하도록 후보를 넓게 지원
+EMOTION_TOOL_ENABLED = _env_flag(
+    ["TOOLS_EMOTION_ENABLED", "EMOTION_ENABLED", "USE_EMOTION_TOOL", "ENABLE_EMOTION", "VP_EMOTION_ENABLED"],
+    default=True,
+)
+
+def _clamp_0_100(x: Any) -> int:
+    try:
+        v = int(x)
+    except Exception:
+        v = 0
+    if v < 0:
+        return 0
+    if v > 100:
+        return 100
+    return v
 
 # =========================
 # HMM 요약 유틸 (A안: LLM 기본 + HMM 보정/근거강화)
@@ -671,7 +711,12 @@ def summarize_run_full(
         scenario_str = ""  # MCP JSON으로 넘어오는 경우 시나리오 문자열은 생략 가능
         conviction_text = _conviction_summary_text_from_turns(normalized_turns)  # ✅ 버그 수정(오타)
         hmm_summary = _extract_hmm_summary_from_turns(normalized_turns)
-        hmm_text = _hmm_summary_text(hmm_summary)
+        # ✅ tools_emotion OFF면 HMM 신호는 사용하지 않음(호환 모드)
+        if not EMOTION_TOOL_ENABLED:
+            hmm_summary = None
+            hmm_text = "HMM 비활성화(.env)로 미사용"
+        else:
+            hmm_text = _hmm_summary_text(hmm_summary)
     else:
         if db is None or case_id is None or run_no is None:
             raise ValueError("summarize_run_full: turns 또는 (db, case_id, run_no) 중 하나는 제공해야 합니다.")
@@ -695,7 +740,12 @@ def summarize_run_full(
             })
         conviction_text = _conviction_summary_text_from_turns(tmp_turns)  # ✅ 추가
         hmm_summary = _extract_hmm_summary_from_turns(tmp_turns)
-        hmm_text = _hmm_summary_text(hmm_summary)
+        # ✅ tools_emotion OFF면 HMM 신호는 사용하지 않음(호환 모드)
+        if not EMOTION_TOOL_ENABLED:
+            hmm_summary = None
+            hmm_text = "HMM 비활성화(.env)로 미사용"
+        else:
+            hmm_text = _hmm_summary_text(hmm_summary)
 
     if not dialog.strip():
         return {
@@ -724,9 +774,13 @@ def summarize_run_full(
     base_vul = [str(x) for x in base_vul][:8]
     parsed["victim_vulnerabilities_base"] = base_vul
 
-    # ✅ A안: risk.score는 LLM 기본 + HMM 보정(0~100)
-    base_score = int((parsed.get("risk") or {}).get("score", 0))
-    adj_score = _adjust_risk_score_with_hmm(base_score, hmm_summary)
+    # ✅ A안: risk.score 보정은 "emotion/HMM ON"이고 hmm_summary가 있을 때만 적용
+    base_score = _clamp_0_100((parsed.get("risk") or {}).get("score", 0))
+    if EMOTION_TOOL_ENABLED and hmm_summary:
+        adj_score = _adjust_risk_score_with_hmm(base_score, hmm_summary)
+    else:
+        # OFF 또는 HMM 없음: LLM base score 그대로(클램프만)
+        adj_score = base_score
     if "risk" not in parsed or not isinstance(parsed["risk"], dict):
         parsed["risk"] = {"score": adj_score, "level": "low", "rationale": ""}
     else:
@@ -756,27 +810,30 @@ def summarize_run_full(
     # downstream에서 디버깅/근거강화에 쓰기 쉽게 hmm 요약을 같이 싣고 싶으면 meta에 포함(선택)
     parsed.setdefault("meta", {})
     if isinstance(parsed["meta"], dict):
+        # ✅ OFF면 hmm_summary는 None, hmm_text는 "미사용"으로 기록
         parsed["meta"]["hmm_summary"] = hmm_summary
         parsed["meta"]["hmm_text"] = hmm_text
         # BASE 판정에서는 HMM 미사용을 명시(나중에 디버깅할 때 혼동 방지)
         parsed["meta"]["hmm_used_for_phishing"] = False
-        parsed["meta"]["hmm_used_for_risk_score_calibration"] = True
+        parsed["meta"]["hmm_used_for_risk_score_calibration"] = bool(EMOTION_TOOL_ENABLED and hmm_summary)
 
     # (2) 취약점 강화: 텍스트 + HMM을 사용해서 '공격자 관점 취약점' 생성
     # - phishing/evidence는 건드리지 않는다.
     hmm_vul: List[str] = []
-    try:
-        prompt_vuln = PROMPT_VULN_WITH_HMM_ONLY.format(
-            dialog=_escape_braces(dialog),
-            hmm=_escape_braces(hmm_text),
-        )
-        resp_vuln = llm.invoke(prompt_vuln).content
-        vuln_obj = _json_loads_lenient_vuln_only(resp_vuln)
-        vv = vuln_obj.get("victim_vulnerabilities")
-        if isinstance(vv, list):
-            hmm_vul = [str(x).strip() for x in vv if str(x).strip()][:8]
-    except Exception:
-        hmm_vul = []
+    # ✅ OFF면 2차 호출 자체를 스킵(완전 호환/비용 절감)
+    if EMOTION_TOOL_ENABLED and hmm_summary:
+        try:
+            prompt_vuln = PROMPT_VULN_WITH_HMM_ONLY.format(
+                dialog=_escape_braces(dialog),
+                hmm=_escape_braces(hmm_text),
+            )
+            resp_vuln = llm.invoke(prompt_vuln).content
+            vuln_obj = _json_loads_lenient_vuln_only(resp_vuln)
+            vv = vuln_obj.get("victim_vulnerabilities")
+            if isinstance(vv, list):
+                hmm_vul = [str(x).strip() for x in vv if str(x).strip()][:8]
+        except Exception:
+            hmm_vul = []
 
     parsed["victim_vulnerabilities_hmm"] = hmm_vul
 
@@ -790,6 +847,7 @@ def summarize_run_full(
     else:
         parsed["victim_vulnerabilities"] = base_vul
         if isinstance(parsed.get("meta"), dict):
+            # ✅ OFF이거나 HMM 없음이면 False
             parsed["meta"]["hmm_used_for_vulnerabilities"] = False
 
     return parsed

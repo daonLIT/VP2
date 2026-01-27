@@ -1,83 +1,21 @@
-# # vp_mcp/mcp_server/server.py
-# from __future__ import annotations
-# import os
-# import uvicorn
-# from dotenv import load_dotenv
-# from fastapi import FastAPI
-
-# from mcp.server.fastmcp import FastMCP
-# from .db.base import init_db
-
-# try:
-#     from .tools.simulate_dialogue import register_simulate_dialogue_tool_fastmcp
-#     USE_HELPER = True
-# except ImportError:
-#     from .tools.simulate_dialogue import simulate_dialogue_impl
-#     from .schemas import SimulationInput
-#     USE_HELPER = False
-
-
-# def build_app():
-#     load_dotenv()
-#     init_db()
-
-#     mcp = FastMCP("vp-mcp-sim")
-#     print(">> MCP: registering tools...")
-
-#     if USE_HELPER:
-#         register_simulate_dialogue_tool_fastmcp(mcp)
-#     else:
-#         @mcp.tool(
-#             name="sim.simulate_dialogue",
-#             description="공격자/피해자 LLM 교대턴 시뮬레이션 실행 후 로그 저장"
-#         )
-#         async def simulate_dialogue(arguments: dict) -> dict:
-#             model = SimulationInput.model_validate(arguments)
-#             return simulate_dialogue_impl(model)
-
-#     print(">> MCP: tools registered OK")
-
-#     app = FastAPI()
-#     # ✅ 기본값(True) 유지: /mcp -> /mcp/ 로 307 자동 리다이렉트 허용
-#     # app.router.redirect_slashes = False  # ← 이 줄 제거 또는 주석
-
-#     @app.get("/")
-#     def info():
-#         return {"name": "vp-mcp-sim", "status": "ok", "endpoint": "/mcp/"}
-
-#     mount_target = getattr(mcp, "app", None) or mcp.streamable_http_app()
-
-#     # ✅ 마운트 지점
-#     #   - swagger에선 /mcp/ 로 접근됨
-#     #   - 클라이언트가 /mcp 로 치면 307 → /mcp/ 로 넘어감 (본문/메서드 유지)
-#     app.mount("/mcp", mount_target)
-
-#     # (선택) 헬스체크
-#     @app.get("/mcp/health")
-#     async def health():
-#         return {"ok": True}
-
-#     return app
-
-
-# app = build_app()
-
-# if __name__ == "__main__":
-#     host = os.getenv("MCP_HOST", "127.0.0.1")
-#     port = int(os.getenv("MCP_PORT", "5177"))
-#     uvicorn.run("vp_mcp.mcp_server.server:app", host=host, port=port, reload=True)
-
-
-
 # vp_mcp/mcp_server/server.py
 from __future__ import annotations
 import os
 import uvicorn
 from dotenv import load_dotenv
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Any, Dict, Callable, Awaitable, Optional
 import anyio
+
+# ✅ .env를 가장 먼저 로드 (schemas/import 이전)
+# server.py 위치: VP/vp_mcp/mcp_server/server.py
+# .env 위치: VP/.env
+ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=True)
+print(f">> dotenv loaded: {ENV_PATH}")
+print(f">> ENV ATTACKER_MODEL={os.getenv('ATTACKER_MODEL')} VICTIM_MODEL={os.getenv('VICTIM_MODEL')}")
 
 from mcp.server.fastmcp import FastMCP
 from .db.base import init_db
@@ -128,7 +66,6 @@ except Exception:
     _coerce_input_legacy = None  # type: ignore
 
 def build_app():
-    load_dotenv()
     init_db()
 
     # ----------------------------

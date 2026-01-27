@@ -1,7 +1,12 @@
 from pydantic import BaseModel, Field, model_validator
 from typing import Optional, Dict, Any, List
+import os
 
-DEFAULT_MODELS = {"attacker": "gpt-4o-mini", "victim": "gemini-2.5-flash-lite"}
+def _default_models() -> Dict[str, str]:
+    return {
+        "attacker": os.getenv("ATTACKER_MODEL", "gpt-4o-mini"),
+        "victim": os.getenv("VICTIM_MODEL", "gemini-2.5-flash-lite"),
+    }
 
 class RolePrompt(BaseModel):
     system: str
@@ -29,7 +34,15 @@ class SimulationInput(BaseModel):
     @model_validator(mode="after")
     def _merge_model_defaults(self):
         # 사용자가 일부만 보내도 기본과 병합되도록
-        self.models = {**DEFAULT_MODELS, **(self.models or {})}
+        merged = {**_default_models(), **(self.models or {})}
+        # ✅ env 강제 오버라이드(요청 payload가 models로 덮어써도 env가 최우선)
+        env_attacker = os.getenv("ATTACKER_MODEL")
+        env_victim = os.getenv("VICTIM_MODEL")
+        if env_attacker:
+            merged["attacker"] = env_attacker
+        if env_victim:
+            merged["victim"] = env_victim
+        self.models = merged
         return self
 
 class Turn(BaseModel):

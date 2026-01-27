@@ -10,14 +10,31 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from dotenv import dotenv_values
 
 #
 # ✅ .env를 "이 스크립트 실행 프로세스"에 확실히 로드
 #   - VP/.env, VP/app/.env 둘 다 로드 (필요한 쪽만 남겨도 됨)
 #
 _ROOT = Path(__file__).resolve().parents[1]      # .../VP
-load_dotenv(_ROOT / ".env", override=False)
-load_dotenv(_ROOT / "app" / ".env", override=False)
+env1 = _ROOT / ".env"
+env2 = _ROOT / "app" / ".env"
+
+print(f"[ENV-DEBUG] cwd={os.getcwd()}")
+print(f"[ENV-DEBUG] env1={env1} exists={env1.exists()}")
+print(f"[ENV-DEBUG] env2={env2} exists={env2.exists()}")
+print(f"[ENV-DEBUG] BEFORE load_dotenv: EMOTION_ENABLED={os.getenv('EMOTION_ENABLED')!r}")
+
+r1 = load_dotenv(env1, override=False)
+r2 = load_dotenv(env2, override=False)
+print(f"[ENV-DEBUG] load_dotenv(env1)={r1}, load_dotenv(env2)={r2} (True=파일 로드 시도 성공)")
+print(f"[ENV-DEBUG] AFTER load_dotenv:  EMOTION_ENABLED={os.getenv('EMOTION_ENABLED')!r}")
+
+# 파일 내부 값도 직접 확인(덮어쓰기와 무관하게 '파일에 뭐가 적혀있나' 확인)
+if env1.exists():
+    print(f"[ENV-DEBUG] env1 values: EMOTION_ENABLED={dotenv_values(env1).get('EMOTION_ENABLED')!r}")
+if env2.exists():
+    print(f"[ENV-DEBUG] env2 values: EMOTION_ENABLED={dotenv_values(env2).get('EMOTION_ENABLED')!r}")
 
 from app.db.session import SessionLocal
 from app.services.agent.orchestrator_react import run_orchestrated, _ensure_stream

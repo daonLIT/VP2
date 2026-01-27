@@ -17,6 +17,26 @@ HmmAttachMode = Literal["per_victim_turn", "last_victim_turn_only"]
 
 _PAIR_MODE_ALLOWED = {"none", "prev_offender", "prev_victim", "thoughts", "prev_offender+thoughts", "prev_victim+thoughts"}
 
+def _env_bool(name: str, default: bool) -> bool:
+    """
+    환경변수 bool 파서:
+        - true/1/yes/y/on => True
+        - false/0/no/n/off => False
+    """
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+def _default_emotion_enabled() -> bool:
+    # EMOTION_ENABLED=0 이면 tool이 no-op로 동작
+    return _env_bool("EMOTION_ENABLED", True)
+
 def _sanitize_pair_mode(v: Any) -> PairMode:
     s = (str(v).strip() if v is not None else "")
     if s in _PAIR_MODE_ALLOWED:
@@ -48,6 +68,7 @@ class LabelVictimEmotionsInput(BaseModel):
     - 비정상: turns 자체가 list로만 들어옴: [...]
     """
     turns: List[Dict[str, Any]] = Field(..., description="full turns list")
+    enabled: bool = Field(default_factory=_default_emotion_enabled, description="감정 주입 ON/OFF (env: EMOTION_ENABLED)")
     pair_mode: PairMode = Field(default_factory=_default_pair_mode)
     batch_size: int = 16
     max_length: int = 512
@@ -125,6 +146,7 @@ class LabelVictimEmotionsInput(BaseModel):
 def label_victim_emotions(
     turns: Any,
     # ✅ 직접 호출(테스트/스크립트)에서도 env 변경이 반영되게 런타임에 결정
+    enabled: Optional[bool] = None,
     pair_mode: Optional[PairMode] = None,
     batch_size: int = 16,
     max_length: int = 512,
@@ -141,6 +163,8 @@ def label_victim_emotions(
     - text: 발화 텍스트
     """
     # ✅ 최후 방어: tool_input 파싱이 어긋나서 turns가 문자열/딕트로 들어오는 케이스를 여기서도 흡수
+    if enabled is None:
+        enabled = _default_emotion_enabled()
     if pair_mode is None:
         pair_mode = _default_pair_mode()
     if isinstance(turns, str):
@@ -154,6 +178,9 @@ def label_victim_emotions(
 
     # turns 자리에 payload(dict)가 통째로 들어온 경우( {"turns":[...], "run_hmm":true,...} )
     if isinstance(turns, dict) and "turns" in turns:
+        # enabled도 payload로 들어오면 우선
+        if "enabled" in turns:
+            enabled = bool(turns.get("enabled"))
         run_hmm = turns.get("run_hmm", run_hmm)
         hmm_attach = turns.get("hmm_attach", hmm_attach)
         pair_mode = _sanitize_pair_mode(turns.get("pair_mode", pair_mode))
@@ -188,6 +215,10 @@ def label_victim_emotions(
     # 원본 보존(길이/정렬 보장용)
     original_turns: List[Dict[str, Any]] = turns if isinstance(turns, list) else []
     original_turns = [t if isinstance(t, dict) else {"role": "unknown", "text": str(t)} for t in original_turns]
+
+    # ✅ OFF면 no-op: 감정/HMM 주입 없이 원본 그대로 반환
+    if not enabled:
+        return original_turns
 
     labeled = label_emotions_on_turns(
         turns,

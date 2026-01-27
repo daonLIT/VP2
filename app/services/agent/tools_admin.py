@@ -38,6 +38,32 @@ logger = get_logger(__name__)
 # ─────────────────────────────────────────────────────────
 MCP_BASE_URL = os.getenv("MCP_BASE_URL", "http://127.0.0.1:5177")  # 운영 시 외부 MCP 주소로 설정
 
+def _env_flag(names: List[str], default: bool) -> bool:
+    """
+    여러 env 키를 동시에 지원하기 위한 bool 파서.
+    - true: 1, true, yes, y, on
+    - false: 0, false, no, n, off
+    """
+    truthy = {"1", "true", "yes", "y", "on"}
+    falsy  = {"0", "false", "no", "n", "off"}
+    for k in names:
+        v = os.getenv(k)
+        if v is None:
+            continue
+        s = v.strip().lower()
+        if s in truthy:
+            return True
+        if s in falsy:
+            return False
+    return default
+
+# ✅ emotion tool ON/OFF 스위치(.env)
+# - 어떤 키를 쓰든 동작하게 후보 다 지원
+EMOTION_TOOL_ENABLED = _env_flag(
+    ["TOOLS_EMOTION_ENABLED", "EMOTION_ENABLED", "USE_EMOTION_TOOL", "ENABLE_EMOTION", "VP_EMOTION_ENABLED"],
+    default=True,
+)
+
 # ─────────────────────────────────────────────────────────
 # 공통: {"data": {...}} 입력 통일
 # ─────────────────────────────────────────────────────────
@@ -840,22 +866,25 @@ def make_admin_tools(db: Session, guideline_repo):
             maybe = ji.log.get("turns")
             if isinstance(maybe, list):
                 turns = maybe
+        # ✅ emotion OFF 모드면: turns 미전달도 허용 → MCP에서 raw turns 재조회
+        # ✅ emotion ON 모드면: 기존처럼 라벨링된 turns 강제
         if turns is None:
-            # ✅ 여기서 MCP 재조회로 빠지면 감정라벨이 없는 원본 turns로 판정될 수 있음
-            # => 오케스트레이터가 tools_emotion 결과 turns를 반드시 넘기도록 강제
-            raise HTTPException(
-                status_code=422,
-                detail="turns가 없습니다. tools_emotion에서 라벨링된 turns를 받아 admin.make_judgement에 전달해야 합니다."
-            )
-        # ✅ 추가: turns가 라벨링된 turns인지 최소 검증
-        if isinstance(turns, list) and not _looks_labeled_turns(turns):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "turns에 감정/라벨 정보가 보이지 않습니다. "
-                    "MCP 원본 turns가 아니라 tools_emotion(label_victim_emotions) 결과 turns를 전달해야 합니다."
+            if EMOTION_TOOL_ENABLED:
+                raise HTTPException(
+                    status_code=422,
+                    detail="turns가 없습니다. tools_emotion에서 라벨링된 turns를 받아 admin.make_judgement에 전달해야 합니다."
                 )
-            )
+            turns = _fetch_turns_from_mcp(ji.case_id, ji.run_no)
+        # ✅ emotion ON일 때만 "라벨링 흔적" 검증
+        if EMOTION_TOOL_ENABLED:
+            if isinstance(turns, list) and not _looks_labeled_turns(turns):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "turns에 감정/라벨 정보가 보이지 않습니다. "
+                        "MCP 원본 turns가 아니라 tools_emotion(label_victim_emotions) 결과 turns를 전달해야 합니다."
+                    )
+                )
         # ✅ HMM 결과 추출 (payload 우선, log에 있으면 fallback)
         hmm_payload: Optional[Dict[str, Any]] = None
         if isinstance(ji.hmm, dict):
@@ -866,6 +895,10 @@ def make_admin_tools(db: Session, guideline_repo):
             maybe_hmm = ji.log.get("hmm") or ji.log.get("hmm_result")
             if isinstance(maybe_hmm, dict):
                 hmm_payload = maybe_hmm
+
+        # ✅ emotion OFF면 hmm 신호도 사용하지 않음(정합성 유지)
+        if not EMOTION_TOOL_ENABLED:
+            hmm_payload = None
 
         # summarize_run_full이 기대하는 최소 필드(role/text)로 정규화
         normalized_turns: List[Dict[str, Any]] = []

@@ -1,7 +1,7 @@
 #VP/app/services/agent/tools_emotion.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 import json
 import os
 import ast
@@ -14,6 +14,14 @@ from app.services.emotion.label_turns import label_emotions_on_turns
 
 PairMode = Literal["none", "prev_offender", "prev_victim", "thoughts", "prev_offender+thoughts", "prev_victim+thoughts"]
 HmmAttachMode = Literal["per_victim_turn", "last_victim_turn_only"]
+
+_PAIR_MODE_ALLOWED = {"none", "prev_offender", "prev_victim", "thoughts", "prev_offender+thoughts", "prev_victim+thoughts"}
+
+def _sanitize_pair_mode(v: Any) -> PairMode:
+    s = (str(v).strip() if v is not None else "")
+    if s in _PAIR_MODE_ALLOWED:
+        return s  # type: ignore[return-value]
+    return _default_pair_mode()
 
 def _default_pair_mode() -> PairMode:
     """
@@ -116,8 +124,8 @@ class LabelVictimEmotionsInput(BaseModel):
 )
 def label_victim_emotions(
     turns: Any,
-    # ✅ schema 기본(default_factory=_default_pair_mode)와 직접 호출 기본을 일치
-    pair_mode: PairMode = _default_pair_mode(),
+    # ✅ 직접 호출(테스트/스크립트)에서도 env 변경이 반영되게 런타임에 결정
+    pair_mode: Optional[PairMode] = None,
     batch_size: int = 16,
     max_length: int = 512,
     run_hmm: bool = True,
@@ -133,6 +141,8 @@ def label_victim_emotions(
     - text: 발화 텍스트
     """
     # ✅ 최후 방어: tool_input 파싱이 어긋나서 turns가 문자열/딕트로 들어오는 케이스를 여기서도 흡수
+    if pair_mode is None:
+        pair_mode = _default_pair_mode()
     if isinstance(turns, str):
         try:
             turns = json.loads(turns)
@@ -146,10 +156,12 @@ def label_victim_emotions(
     if isinstance(turns, dict) and "turns" in turns:
         run_hmm = turns.get("run_hmm", run_hmm)
         hmm_attach = turns.get("hmm_attach", hmm_attach)
-        pair_mode = turns.get("pair_mode", pair_mode)
+        pair_mode = _sanitize_pair_mode(turns.get("pair_mode", pair_mode))
         batch_size = turns.get("batch_size", batch_size)
         max_length = turns.get("max_length", max_length)
         turns = turns.get("turns", [])
+    else:
+        pair_mode = _sanitize_pair_mode(pair_mode)
 
     # turns 리스트 원소가 문자열(JSON)로 들어온 경우까지 정리
     if isinstance(turns, list):
@@ -208,7 +220,15 @@ def label_victim_emotions(
             lt = labeled[j] if isinstance(labeled[j], dict) else {}
             # victim 턴에만 덮어쓰기
             if isinstance(lt, dict):
-                merged[idx].update(lt)
+                # ✅ 텍스트/메타 보호: 라벨 관련 필드만 overlay
+                PROTECT_KEYS = {
+                    "text", "dialogue", "victim_meta", "is_convinced", "thoughts",
+                    "gender", "age_group",
+                }
+                for k, v in lt.items():
+                    if k in PROTECT_KEYS:
+                        continue
+                    merged[idx][k] = v
         return merged
 
     # 3) 그 외: 안전하게 원본 유지(혹은 labeled가 더 길면 앞부분만 overlay 등도 가능하지만,

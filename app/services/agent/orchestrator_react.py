@@ -49,6 +49,12 @@ MAX_ROUNDS_UI_LIMIT = 5
 # (기존 로직은 finally에서 "round_" 포함 키를 싹 지워서 다른 케이스 캐시까지 오염/삭제 가능)
 _PROMPT_CACHE: Dict[str, Dict[str, Any]] = {}
 
+# ✅ Emotion/HMM 캐시 (stream_id 스코프)
+# - label_victim_emotions 결과(라벨링된 turns, hmm)를 저장해두고
+# - LLM이 admin.make_judgement Action Input에서 hmm/turns를 누락/오염해도
+#   orchestrator wrapper가 캐시값으로 강제 보정한다.
+_EMO_CACHE: Dict[str, Dict[str, Any]] = {}
+
 # SSE 모듈
 import asyncio, logging, uuid, contextvars, contextlib, sys
 from threading import Event as ThreadEvent
@@ -712,6 +718,47 @@ def _robust_action_input_to_dict(data: Any) -> Optional[Dict[str, Any]]:
         return None
     return None
 
+def _looks_unlabeled_turns(turns_in: Any) -> bool:
+    """
+    turns(list[dict])가 '라벨링 전'처럼 보이는지 휴리스틱으로 판단.
+    - 첫 dict 샘플에 emotion/hmm 관련 키가 하나도 없으면 unlabeled로 간주
+    """
+    try:
+        if not isinstance(turns_in, list) or not turns_in:
+            return True
+        sample = next((t for t in turns_in if isinstance(t, dict)), None)
+        if not isinstance(sample, dict) or not sample:
+            return True
+        has_label_key = any(
+            k in sample
+            for k in (
+                "emotion", "pred4", "probs4",
+                "hmm_state", "v_state", "hmm", "hmm_viterbi",
+                "hmm_posterior", "hmm_summary",
+            )
+        )
+        return not has_label_key
+    except Exception:
+        return True
+
+def _flatten_cached_turns_by_round(cache_turns_by_round: Dict[int, List[Dict[str, Any]]], *, up_to_round: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    _EMO_CACHE[sid]["turns_by_round"]를 라운드 순서대로 flatten.
+    up_to_round가 있으면 1..up_to_round만 합침.
+    """
+    out: List[Dict[str, Any]] = []
+    try:
+        keys = sorted(int(k) for k in cache_turns_by_round.keys() if isinstance(k, int) or str(k).isdigit())
+        if up_to_round is not None:
+            keys = [k for k in keys if k <= int(up_to_round)]
+        for k in keys:
+            ts = cache_turns_by_round.get(k) or []
+            if isinstance(ts, list) and ts:
+                out.extend(ts)
+    except Exception:
+        pass
+    return out
+
 def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = True):
     """
     ReAct 에이전트가 Action Input을 문자열로 망가뜨려도,
@@ -741,14 +788,196 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
             if "data" not in parsed:
                 parsed = {"data": parsed}
 
+        # ─────────────────────────────────────────
+        # ✅ stream_id 스코프 emotion 캐시 준비
+        # ─────────────────────────────────────────
+        sid = _current_stream_id.get() or "no_stream"
+        if sid not in _EMO_CACHE:
+            _EMO_CACHE[sid] = {"turns_by_round": {}, "hmm_by_round": {}}
+        # 방어: 키 누락되었을 수 있음(핫리로드/부분 갱신 등)
+        _EMO_CACHE[sid].setdefault("turns_by_round", {})
+        _EMO_CACHE[sid].setdefault("hmm_by_round", {})
+
+        # ─────────────────────────────────────────
+        # ✅ (1) admin.make_judgement / admin.make_prevention 입력 자동 보정
+        # - hmm가 null이면 캐시 hmm 주입
+        # - turns가 라벨링 전(원본)처럼 보이면 캐시 turns로 교체
+        # ─────────────────────────────────────────
         try:
-            return original_tool.invoke(parsed)
+            tool_name = getattr(original_tool, "name", "") or ""
+            if tool_name in ("admin.make_judgement", "admin.make_prevention"):
+                d = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                # -----------------------------
+                # (A) admin.make_judgement: run_no 단위 보정
+                # -----------------------------
+                if tool_name == "admin.make_judgement":
+                    run_no = d.get("run_no") or d.get("run")
+                    try:
+                        run_no = int(run_no)
+                    except Exception:
+                        run_no = None
+
+                    if run_no is not None:
+                        cached_turns = _EMO_CACHE[sid]["turns_by_round"].get(run_no)
+                        cached_hmm = _EMO_CACHE[sid]["hmm_by_round"].get(run_no)
+
+                        # ✅ (0) 키 오타/불일치 정규화: hhm -> hmm
+                        if "hhm" in d and "hmm" not in d:
+                            d["hmm"] = d.pop("hhm")
+
+                        turns_in = d.get("turns")
+                        if cached_turns and (_looks_unlabeled_turns(turns_in)):
+                            d["turns"] = cached_turns
+
+                        # ✅ hmm는 항상 dict로 존재하도록 방어(없으면 캐시 주입, 없으면 available False)
+                        if d.get("hmm") is None:
+                            if cached_hmm is not None:
+                                d["hmm"] = cached_hmm
+                            else:
+                                d["hmm"] = {"available": False, "reason": "hmm_not_found_in_cache", "run_no": run_no}
+                        if not isinstance(d.get("hmm"), dict):
+                            d["hmm"] = {"available": False, "reason": "hmm_invalid_type", "run_no": run_no, "raw_type": type(d.get("hmm")).__name__}
+
+                # -----------------------------
+                # (B) admin.make_prevention: "케이스 전체 turns" 보정
+                # - LLM이 turns를 누락하거나 원본 turns를 넣어도,
+                #   캐시(turns_by_round)로 라벨링된 turns를 강제 주입.
+                # -----------------------------
+                if tool_name == "admin.make_prevention":
+                    rounds = d.get("rounds")
+                    try:
+                        rounds = int(rounds) if rounds is not None else None
+                    except Exception:
+                        rounds = None
+
+                    turns_in = d.get("turns")
+                    # 캐시에서 flatten한 "라운드별 라벨링된 turns" 생성
+                    cached_all = _flatten_cached_turns_by_round(_EMO_CACHE[sid]["turns_by_round"], up_to_round=rounds)
+
+                    # turns가 없거나 / unlabeled로 보이면 캐시로 교체
+                    if cached_all and _looks_unlabeled_turns(turns_in):
+                        d["turns"] = cached_all
+
+                # 다시 반영
+                if "data" in parsed and isinstance(parsed["data"], dict):
+                    parsed["data"] = d
+                else:
+                    parsed = {"data": d} if require_data_wrapper else d
+        except Exception:
+            # 보정 실패는 invoke를 막지 않음
+            pass
+
+        # ─────────────────────────────────────────
+        # ✅ (1-b) admin.make_prevention 입력 자동 보정
+        # - 예방책은 "최종 라벨링된 대화로그"를 기반으로 만들어야 함
+        # - 에이전트가 turns를 누락/라벨링 전 turns를 넣어도 캐시로 강제 교체
+        # ─────────────────────────────────────────
+        try:
+            tool_name = getattr(original_tool, "name", "") or ""
+            if tool_name == "admin.make_prevention":
+                d = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+
+                # rounds 결정: input 우선, 없으면 캐시에서 최대 라운드로
+                rounds = d.get("rounds")
+                try:
+                    rounds = int(rounds) if rounds is not None else None
+                except Exception:
+                    rounds = None
+
+                # cache에서 현재 stream의 라벨링된 라운드 목록
+                cache_rounds = sorted((_EMO_CACHE.get(sid, {}) or {}).get("turns_by_round", {}).keys())
+                if rounds is None and cache_rounds:
+                    rounds = int(cache_rounds[-1])
+
+                # turns가 라벨링 전처럼 보이는지 휴리스틱(=judgement 때와 동일한 느낌)
+                turns_in = d.get("turns")
+                looks_unlabeled = False
+                if isinstance(turns_in, list) and turns_in:
+                    sample = next((t for t in turns_in if isinstance(t, dict)), {})
+                    if isinstance(sample, dict):
+                        has_label_key = any(
+                            k in sample
+                            for k in ("emotion", "pred4", "probs4", "hmm_state", "v_state", "hmm", "hmm_viterbi")
+                        )
+                        looks_unlabeled = not has_label_key
+                else:
+                    looks_unlabeled = True  # turns 누락/비정상 => 교체
+
+                if rounds is not None and looks_unlabeled:
+                    labeled_all: List[Dict[str, Any]] = []
+                    turns_by_round = (_EMO_CACHE.get(sid, {}) or {}).get("turns_by_round", {})
+                    for rno in range(1, rounds + 1):
+                        t = turns_by_round.get(rno)
+                        if isinstance(t, list) and t:
+                            labeled_all.extend(t)
+                    if labeled_all:
+                        d["turns"] = labeled_all
+                        d["turns_source"] = "orchestrator._EMO_CACHE(turns_by_round)"
+                        # rounds도 확정값으로 정규화
+                        d["rounds"] = rounds
+
+                if "data" in parsed and isinstance(parsed["data"], dict):
+                    parsed["data"] = d
+                else:
+                    parsed = {"data": d} if require_data_wrapper else d
+        except Exception:
+            pass
+
+        try:
+            out = original_tool.invoke(parsed)
         except Exception as e:
             return {
                 "ok": False,
                 "error": "tool_invoke_failed",
                 "message": str(e),
             }
+        # ─────────────────────────────────────────
+        # ✅ (2) label_victim_emotions 결과 캐시 저장
+        # - input에 run_no를 반드시 포함시키도록 case_mission도 함께 수정되어야 함
+        # ─────────────────────────────────────────
+        try:
+            tool_name = getattr(original_tool, "name", "") or ""
+            if tool_name == "label_victim_emotions":
+                run_no = None
+                # require_data_wrapper=False라 보통 최상위에 run_no가 있음
+                if isinstance(parsed, dict):
+                    run_no = parsed.get("run_no")
+                    if run_no is None and isinstance(parsed.get("data"), dict):
+                        run_no = parsed["data"].get("run_no")
+                try:
+                    run_no = int(run_no) if run_no is not None else None
+                except Exception:
+                    run_no = None
+
+                labeled_any = _loose_parse_json_any(out)
+                labeled_turns: Optional[List[Dict[str, Any]]] = None
+                hmm_obj: Any = None
+
+                if isinstance(labeled_any, dict):
+                    t = labeled_any.get("turns")
+                    if isinstance(t, list):
+                        labeled_turns = t
+                    hmm_obj = (
+                        labeled_any.get("hmm")
+                        or labeled_any.get("hmm_result")
+                        or labeled_any.get("hmm_summary")
+                    )
+                elif isinstance(labeled_any, list):
+                    labeled_turns = labeled_any
+                    # ✅ dict로 hmm를 안 주고 list만 주는 모드일 수 있음 (per_victim_turn attach 가정)
+                    hmm_obj = {
+                        "available": True,
+                        "source": "per_victim_turn",
+                        "note": "label_victim_emotions returned list; hmm may be embedded per victim turn",
+                    }
+                if run_no is not None and isinstance(labeled_turns, list) and labeled_turns:
+                    _EMO_CACHE[sid]["turns_by_round"][run_no] = labeled_turns
+                    if hmm_obj is not None:
+                        _EMO_CACHE[sid]["hmm_by_round"][run_no] = hmm_obj
+        except Exception:
+            pass
+
+        return out
 
     _wrapped.name = original_tool.name
     _wrapped.description = getattr(original_tool, "description", "") or ""
@@ -1603,8 +1832,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             def _normalize_emotion_pair_mode(v: Optional[str]) -> Optional[str]:
                 """
                 pair_mode 표준화:
-                - victim_only 추가 지원
-                - 흔한 별칭/오타를 최대한 안전하게 정규화
+                - tools_emotion.PairMode 허용값으로만 정규화
                 """
                 if v is None:
                     return None
@@ -1615,23 +1843,37 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
                 # 별칭 정규화
                 alias = {
-                    # victim only
-                    "victimonly": "victim_only",
-                    "victim_only": "victim_only",
-                    "victim-only": "victim_only",
-                    "only_victim": "victim_only",
-                    "victim": "victim_only",
-                    # previous offender as pair
+                    # victim only => tools_emotion에서는 "none"으로 취급
+                    "victimonly": "none",
+                    "victim_only": "none",
+                    "victim-only": "none",
+                    "only_victim": "none",
+                    "victim": "none",
+
+                    # prev offender
                     "prev": "prev_offender",
                     "prev_offender": "prev_offender",
                     "previous_offender": "prev_offender",
-                    "victim+prev": "victim+prev_offender",
-                    "victim+prev_offender": "victim+prev_offender",
-                    # thoughts as pair
-                    "victim+thought": "victim+thoughts",
-                    "victim+thoughts": "victim+thoughts",
+                    "victim+prev": "prev_offender",
+                    "victim+prev_offender": "prev_offender",
+
+                    # prev victim
+                    "prev_victim": "prev_victim",
+                    "previous_victim": "prev_victim",
+                    "victim+prev_victim": "prev_victim",
+
+                    # thoughts
+                    "thought": "thoughts",
+                    "thoughts": "thoughts",
+                    "victim+thought": "thoughts",
+                    "victim+thoughts": "thoughts",
+
+                    # combos
+                    "prev_offender+thoughts": "prev_offender+thoughts",
+                    "prev_victim+thoughts": "prev_victim+thoughts",
+                    "none": "none",
                 }
-                return alias.get(s_low, s)  # 모르는 값은 그대로 통과(도구 쪽에서 처리)
+                return alias.get(s_low, None)
 
             def _req_emotion_pair_mode() -> Optional[str]:
                 # SimulationStartRequest에 필드가 없을 수도 있으니 payload도 같이 본다.
@@ -1714,15 +1956,22 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 단계 3-1: 감정 라벨링 (라운드1)
 - 도구: label_victim_emotions
-- 입력: {{"turns": <3단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
+- 입력: {{"run_no": 1, "turns": <3단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
 - 주의:
   * (요청에서 emotion_pair_mode를 준 경우에만 pair_mode가 포함됩니다)
   * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE 또는 내부 기본값을 사용합니다.
-- 저장: TURNS_R1_LABELED
+- 저장(매우 중요):
+    * EMO_R1 = label_victim_emotions Observation 원문 전체(그대로 보관)
+    * TURNS_R1_LABELED =
+        - EMO_R1이 list이면 EMO_R1 자체
+        - EMO_R1이 dict이면 EMO_R1.turns
+    * HMM_R1 =
+        - EMO_R1이 dict이면 EMO_R1.hmm 또는 EMO_R1.hmm_result 또는 EMO_R1.hmm_summary (있는 것)
+        - EMO_R1이 list이면 null (턴에 이미 hmm이 붙어있다고 가정)
 
 단계 4: 판정 (라운드1)
 - 도구: admin.make_judgement
-- 입력: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": TURNS_R1_LABELED}}}}
+- 입력(중요): {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": TURNS_R1_LABELED, "hmm": HMM_R1}}}}
 - 저장: 판정 결과 (JUDGEMENT_R1)
 
 단계 4-1: 라운드1 종료 조건 체크
@@ -1753,15 +2002,22 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 
 단계 7-1: 감정 라벨링 (라운드N)
 - 도구: label_victim_emotions
-- 입력: {{"turns": <7단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
+- 입력: {{"run_no": N, "turns": <7단계 turns>, "run_hmm": true, "hmm_attach": "per_victim_turn"{emotion_pair_mode_suffix}}}
 - 주의:
   * (요청에서 emotion_pair_mode를 준 경우에만 pair_mode가 포함됩니다)
   * pair_mode를 생략하면 tools_emotion이 환경변수 EMOTION_PAIR_MODE 또는 내부 기본값을 사용합니다.
-- 저장: TURNS_R{{N}}_LABELED
+- 저장(매우 중요):
+    * EMO_R{{N}} = label_victim_emotions Observation 원문 전체
+    * TURNS_R{{N}}_LABELED =
+        - EMO_R{{N}}이 list이면 EMO_R{{N}} 자체
+        - EMO_R{{N}}이 dict이면 EMO_R{{N}}.turns
+    * HMM_R{{N}} =
+        - EMO_R{{N}}이 dict이면 EMO_R{{N}}.hmm 또는 EMO_R{{N}}.hmm_result 또는 EMO_R{{N}}.hmm_summary (있는 것)
+        - EMO_R{{N}}이 list이면 null
 
 단계 8: 판정 (라운드N)
 - 도구: admin.make_judgement
-- 입력: {{"data": {{"case_id": CASE_ID, "run_no": N, "turns": TURNS_R{{N}}_LABELED}}}}
+- 입력(중요): {{"data": {{"case_id": CASE_ID, "run_no": N, "turns": TURNS_R{{N}}_LABELED, "hmm": HMM_R{{N}}}}}}
 - 저장: JUDGEMENT_R{{N}}
 
 단계 8-1: 라운드N 종료 조건 체크 ← **매우 중요**
@@ -2267,6 +2523,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                     elif tool_name == "label_victim_emotions":
                         # tool output은 보통 list(turns) 또는 {"turns":[...]} 형태
                         labeled_any = _loose_parse_json_any(output)
+                        if isinstance(labeled_any, dict) and labeled_any.get("ok") is False:
+                            logger.warning("[Emotion] label_victim_emotions failed: %s", _truncate(labeled_any, 500))
                         labeled_turns: Optional[List[Dict[str, Any]]] = None
                         # ✅ merge 대상 라운드: 직전 simulator_run의 round_key 우선
                         target_round = last_sim_round_key if isinstance(last_sim_round_key, int) else sim_run_idx
@@ -2295,17 +2553,16 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                                 b = base_turns[i] if i < len(base_turns) and isinstance(base_turns[i], dict) else {}
                                 l = labeled_turns[i] if i < len(labeled_turns) and isinstance(labeled_turns[i], dict) else {}
                                 mt = dict(b)     # base 우선
-                                # ❗중요: labeled의 text가 JSON 문자열일 수 있으므로
-                                #         base의 text/victim_meta/gender/age_group 등을 덮어쓰지 않는다.
-                                OVERLAY_KEYS = (
-                                    "emotion",
-                                    "hmm", "hmm_state", "hmm_probs", "hmm_summary", "hmm_result",
-                                    "pair_mode", "pair_used",
-                                    "emotion_debug", "emotion_input",
-                                )
-                                for k in OVERLAY_KEYS:
-                                    if k in l:
-                                        mt[k] = l[k]
+                                # ✅ labeled 쪽에서 붙은 감정/확률/HMM 관련 모든 필드를 반영하되,
+                                #    base의 텍스트/성별/메타는 보호한다.
+                                PROTECT_KEYS = {
+                                    "text", "dialogue", "victim_meta", "is_convinced", "thoughts",
+                                    "gender", "age_group",
+                                }
+                                for k, v in l.items():
+                                    if k in PROTECT_KEYS:
+                                        continue
+                                    mt[k] = v
 
                                 # base에 role이 비어있으면 labeled role을 채우되 정규화
                                 if not mt.get("role") and l.get("role"):
@@ -2713,6 +2970,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 except Exception as e:
                     _cid = locals().get("case_id", None)
                     logger.warning("[TTS_CACHE] clear_case_dialog_cache 실패: case_id=%s error=%s", _cid, e)
+        # ✅ Emotion/HMM 캐시도 stream_id 스코프로 정리 (레벨 A: run 동안만 유지)
+        with contextlib.suppress(Exception):
+            sid = stream_id
+            if sid in _EMO_CACHE:
+                _EMO_CACHE.pop(sid, None)
+                logger.info("[EMO_CACHE] 정리: stream_id=%s", sid)
         with contextlib.suppress(Exception):
             _ACTIVE_RUN_KEYS.discard(run_key)
         if sse_on:

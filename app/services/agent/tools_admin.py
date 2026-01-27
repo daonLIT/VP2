@@ -788,6 +788,38 @@ def make_admin_tools(db: Session, guideline_repo):
         if pj is None:
             pj = payload.get("previous_judgements")
         return pj if isinstance(pj, list) else []
+    def _looks_labeled_turns(turns: List[Dict[str, Any]]) -> bool:
+        """
+        tools_emotion(label_emotions_on_turns) 결과 turns인지 최소 휴리스틱 검증.
+        - victim 턴에 pred4/pred8/probs4/probs8/emotion/hmm 관련 키가 조금이라도 있으면 OK
+        """
+        if not isinstance(turns, list) or not turns:
+            return False
+
+        victim_seen = 0
+        labeled_seen = 0
+
+        for t in turns:
+            if not isinstance(t, dict):
+                continue
+            role = (t.get("role") or t.get("speaker") or t.get("actor") or "").strip().lower()
+            if role != "victim":
+                continue
+            victim_seen += 1
+
+            # tools_emotion에서 붙을 법한 키들
+            if any(k in t for k in ("pred4", "pred8", "probs4", "probs8", "emotion", "emotion4", "emotion8")):
+                labeled_seen += 1
+                continue
+            meta = t.get("meta")
+            if isinstance(meta, dict) and any(k in meta for k in ("hmm", "hmm_result", "emotion", "pred4", "pred8")):
+                labeled_seen += 1
+
+        # victim이 없으면(이상) False
+        if victim_seen == 0:
+            return False
+        # victim 턴 중 최소 1개라도 라벨 흔적이 있으면 OK
+        return labeled_seen > 0
 
     @tool(
         "admin.make_judgement",
@@ -809,7 +841,21 @@ def make_admin_tools(db: Session, guideline_repo):
             if isinstance(maybe, list):
                 turns = maybe
         if turns is None:
-            turns = _fetch_turns_from_mcp(ji.case_id, ji.run_no)
+            # ✅ 여기서 MCP 재조회로 빠지면 감정라벨이 없는 원본 turns로 판정될 수 있음
+            # => 오케스트레이터가 tools_emotion 결과 turns를 반드시 넘기도록 강제
+            raise HTTPException(
+                status_code=422,
+                detail="turns가 없습니다. tools_emotion에서 라벨링된 turns를 받아 admin.make_judgement에 전달해야 합니다."
+            )
+        # ✅ 추가: turns가 라벨링된 turns인지 최소 검증
+        if isinstance(turns, list) and not _looks_labeled_turns(turns):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "turns에 감정/라벨 정보가 보이지 않습니다. "
+                    "MCP 원본 turns가 아니라 tools_emotion(label_victim_emotions) 결과 turns를 전달해야 합니다."
+                )
+            )
         # ✅ HMM 결과 추출 (payload 우선, log에 있으면 fallback)
         hmm_payload: Optional[Dict[str, Any]] = None
         if isinstance(ji.hmm, dict):
@@ -837,17 +883,16 @@ def make_admin_tools(db: Session, guideline_repo):
                 normalized_turns.append(t)
                 continue
             normalized_turns.append({**t, "role": str(role), "text": str(text)})
-        # ✅ 핵심: HMM을 summarize_run_full로 “확실히” 전달
-        # - summarize_run_full이 turns만 받는 구조라면,
-        #   system 턴을 하나 추가해 hmm JSON을 넣어 전달하는 게 가장 안전함.
-        if hmm_payload:
-            normalized_turns.append({
-                "role": "system",
-                "text": "[HMM_RESULT] 아래 meta.hmm에 HMM 결과가 포함됨",
-                "meta": {"hmm": hmm_payload}
-            })
         try:
-            verdict = summarize_run_full(turns=normalized_turns)
+            # ✅ summarize_run_full이 혹시 hmm 인자를 지원하면 전달(미래 대비)
+            kwargs = {"turns": normalized_turns}
+            try:
+                sig = inspect.signature(summarize_run_full)
+                if hmm_payload and "hmm" in sig.parameters:
+                    kwargs["hmm"] = hmm_payload
+            except Exception:
+                pass
+            verdict = summarize_run_full(**kwargs)
         except TypeError as te:
             logger.error("[admin.make_judgement] summarize_run_full가 turns 기반 시그니처를 지원해야 합니다.")
             raise HTTPException(

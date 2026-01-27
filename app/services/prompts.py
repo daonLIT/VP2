@@ -55,6 +55,12 @@ PPSE_LABELS_EN = """
 * **S5:** The scammer states or implies that it is socially correct to help them.
 * **S6:** It is otherwise reasonable for the victim to believe that it is socially correct to help the scammer.
 * **S7:** The scammer states or implies that if the victim does not comply with their request then the victim will be “left out” in some way.
+
+---
+
+## Non-persuasive / Procedural (Minimal persuasive function)
+
+* **N1:** This utterance is primarily procedural or informational, with minimal persuasive function even within the current stage.
 """.strip()
 
 # ─────────────────────────────────────────────────────────────
@@ -767,6 +773,13 @@ ATTACKER_PROMPT_V2_SYSTEM = "\n".join([
 - utterance는 “직전 피해자 발화”에 직접 반응해야 한다.
 - 2~4문장, 350자 이내, 한 단락.
 - 설득/압박/실행 유도는 약하게, 교육·분석용으로 무해화한 표현을 사용한다.
+- ppse_labels는 위 [PPSE 라벨 정의]의 코드만 사용한다.
+- **N1 사용 규칙(중요):**
+  - 발화가 **주로 절차 안내/정보 전달**(예: 확인 요청, 진행 절차 안내, 사실관계 정리)이고
+    **설득/압박/긴급성/권위 과시/사회적 압력** 등의 기능이 거의 없다면 **N1**을 부여한다.
+  - N1은 “설득 기능이 최소”임을 나타내는 라벨이므로,
+    **N1을 쓸 때는 ppse_labels를 ["N1"] 단독으로 출력**한다. (다른 PPSE와 혼용 금지)
+  - 반대로 설득 기능(A/C/D/S)이 뚜렷하면 N1은 쓰지 말고 A/C/D/S에서 1~3개를 선택한다.
 - 출력은 JSON 1개만(종료면 종료 한 줄만).
 """).strip(),
 ])
@@ -788,6 +801,175 @@ ATTACKER_PROMPT_V2 = ChatPromptTemplate.from_messages([
 """)
 ])
 
+# ─────────────────────────────────────────────────────────────
+# (추가) A안: 2-Call 구성
+#   1) Planner: proc_code만 선택
+#   2) Realizer: 선택된 proc_code를 "고정"하고 utterance+ppse 생성
+# ─────────────────────────────────────────────────────────────
+
+# 1) Planner (proc_code 선택기)
+ATTACKER_PROC_PLANNER_V2_SYSTEM = dedent("""
+너는 보이스피싱(검경/수사관 사칭) 시나리오를 “방어/연구 목적”으로 생성하기 위한
+'절차 선택기(Planner)'이다.
+목표는 직전 대화(특히 직전 피해자 발화)를 보고, 아래 절차 목록 중
+다음 공격자 턴에 해당하는 proc_code를 "딱 하나" 선택하는 것이다.
+
+[중요 — 출력 형식]
+종료 조건이 아니면, 반드시 JSON 1개만 출력:
+{"proc_code": "<절차 목록 중 하나>"}
+
+종료 조건이면, 정확히 한 줄만 출력하고 종료:
+"여기서 마무리하겠습니다."
+
+[피해자 발화 해석(강제)]
+- 직전 피해자 발화가 JSON처럼 보이면 dialogue 필드만 실제 발화로 간주한다.
+- thoughts, is_convinced 등 메타는 절대 사용하지 않는다.
+- JSON이 아니면 텍스트 전체를 실제 발화로 간주한다.
+
+[종료 규칙(강제)]
+피해자 발화에 아래가 포함되면 즉시 종료 문구만 출력:
+- "대화를 종료"
+- "전화(를) 끊"
+- "더 이상 (대화|통화) 원치"
+- "필요 없습니다" / "관심 없습니다"
+- "그만하시죠"
+
+최근 2턴 내에 아래 2개 이상이면 종료:
+(A) 사기/보이스피싱이라고 명시
+(B) 신고/차단/대표번호 확인/지점 방문 의사
+(D) 제3자(은행/가족/경찰/지인)에게 확인/상담 의사
+(E) 2턴 연속 의미 있는 진전 없음
+
+[절차 선택 규칙]
+- 매 턴, proc_code는 하나만 선택한다.
+- 같은 proc_code 2턴 연속 반복은 피한다(불가피하면 다음 단계/인접 단계로 변형).
+- 기본적으로는 전진하되, 피해자가 의심/질문/혼란이면 2-1/2-2/3-x로 회귀한다.
+""").strip()
+
+# 절차 목록은 기존 PROCEDURE_LIST_KO 그대로 사용
+ATTACKER_PROC_PLANNER_V2_SYSTEM = "\n".join([
+    ATTACKER_PROC_PLANNER_V2_SYSTEM,
+    "",
+    PROCEDURE_LIST_KO,
+])
+
+ATTACKER_PROC_PLANNER_V2 = ChatPromptTemplate.from_messages([
+    ("system", ATTACKER_PROC_PLANNER_V2_SYSTEM),
+    MessagesPlaceholder("history"),
+    ("human", """
+다음 정보를 참고하여 **다음 proc_code**를 선택하라.
+
+[직전 대화]
+{previous_turns_block}
+
+**유효 JSON 한 개만 출력하세요.**
+단, 위 **종료 규칙**을 충족하면 JSON 대신 **정확히 한 줄**
+"여기서 마무리하겠습니다."만 출력하고 즉시 종료합니다.
+""")
+])
+
+
+# 2) Realizer (발화 생성기: proc_code 고정)
+ATTACKER_REALIZER_V2_SYSTEM = dedent("""
+너는 보이스피싱(검경/수사관 사칭) 시나리오를 “방어/연구 목적”으로 생성하는
+'발화 생성기(Realizer)'이다.
+
+목표는 입력으로 주어진 proc_code를 절대 변경하지 않고,
+그 proc_code에 해당하는 내용만으로 다음 공격자 발화 1턴(utterance)을 생성하며,
+PPSE 라벨(ppse_labels)을 1~3개 붙이는 것이다.
+
+[중요 — proc_code 고정]
+- 너는 아래에 제공되는 proc_code를 "그대로" 출력해야 한다.
+- proc_code가 가리키는 절차 범위 밖 내용(다른 단계 요소)을 절대 섞지 않는다.
+
+[출력 형식 — 반드시 준수]
+종료 조건이 아니면, 아래 JSON 1개만 출력(추가 텍스트 금지):
+{
+    "utterance": "<한국어 1~2문장, 220자 내외, 한 단락>",
+    "proc_code": "<입력으로 받은 proc_code와 정확히 동일>",
+    "ppse_labels": ["<PPSE 코드 1~3개>"]
+}
+
+종료 조건이면, 정확히 한 줄만 출력하고 종료:
+"여기서 마무리하겠습니다."
+
+[무해화 규칙]
+- 설득력/압박/실행 유도 최소화(교육용).
+- 금전/송금/앱설치/계좌/개인정보 제공을 실제로 유도하거나 구체 지시하지 않는다.
+- 필요한 고유명사는 [PLACEHOLDER].
+
+[피해자 발화 해석(강제)]
+- 직전 피해자 발화가 JSON처럼 보이면 dialogue 필드만 실제 발화로 간주한다.
+- thoughts, is_convinced 등 메타는 절대 사용하지 않는다.
+
+[종료 규칙(Planner와 동일)]
+피해자 발화에 아래가 포함되면 즉시 종료 문구만 출력:
+- "대화를 종료"
+- "전화(를) 끊"
+- "더 이상 (대화|통화) 원치"
+- "필요 없습니다" / "관심 없습니다"
+- "그만하시죠"
+
+최근 2턴 내에 아래 2개 이상이면 종료:
+(A) 사기/보이스피싱이라고 명시
+(B) 신고/차단/대표번호 확인/지점 방문 의사
+(D) 제3자(은행/가족/경찰/지인)에게 확인/상담 의사
+(E) 2턴 연속 의미 있는 진전 없음
+
+[N1 사용 규칙]
+- 발화가 주로 절차 안내/정보 전달이고 설득 기능이 거의 없으면 N1 단독:
+    "ppse_labels": ["N1"]
+- 설득 기능(A/C/D/S)이 뚜렷하면 N1 금지, A/C/D/S에서 1~3개.
+
+[자기검증(내부)]
+- 작성한 utterance에 다른 proc_code 요소가 섞였다고 판단되면,
+    같은 proc_code 범위로 다시 짧게 고쳐서 출력한다.
+""").strip()
+
+ATTACKER_REALIZER_V2_SYSTEM = "\n".join([
+    ATTACKER_REALIZER_V2_SYSTEM,
+    "",
+    PROCEDURE_LIST_KO,
+    "",
+    "[PPSE 라벨 정의(영어 원문 그대로)]",
+    PPSE_LABELS_EN,
+])
+
+ATTACKER_REALIZER_V2 = ChatPromptTemplate.from_messages([
+    ("system", ATTACKER_REALIZER_V2_SYSTEM),
+    MessagesPlaceholder("history"),
+    ("human", """
+다음 정보를 참고하여 **다음 공격자 턴**을 생성하라.
+
+[고정 proc_code]
+{proc_code}
+
+[직전 대화]
+{previous_turns_block}
+
+**유효 JSON 한 개만 출력하세요.**
+단, 위 **종료 규칙**을 충족하면 JSON 대신 **정확히 한 줄**
+"여기서 마무리하겠습니다."만 출력하고 즉시 종료합니다.
+""")
+])
+
+
+def build_proc_planner_inputs_v2(previous_turns: list[dict], scenario: dict | None = None) -> dict:
+    # scenario는 현재는 굳이 안 써도 되지만 호출부 호환 위해 남겨둠
+    prev_lines = [
+        f"[{t.get('role','?')}] {t.get('text','').replace(chr(10), ' ')}"
+        for t in (previous_turns or [])
+    ]
+    previous_turns_block = "\n".join(prev_lines) if prev_lines else "직전 대화 없음."
+    return {"previous_turns_block": previous_turns_block}
+
+def build_realizer_inputs_v2(previous_turns: list[dict], proc_code: str) -> dict:
+    prev_lines = [
+        f"[{t.get('role','?')}] {t.get('text','').replace(chr(10), ' ')}"
+        for t in (previous_turns or [])
+    ]
+    previous_turns_block = "\n".join(prev_lines) if prev_lines else "직전 대화 없음."
+    return {"previous_turns_block": previous_turns_block, "proc_code": proc_code}
 
 def build_data_prompt_inputs_v2(SCENARIO: dict, previous_turns: list[dict]) -> dict:
     """

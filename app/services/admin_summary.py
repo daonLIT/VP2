@@ -1,3 +1,4 @@
+# app/services/admin_summary.py
 from __future__ import annotations
 
 from sqlalchemy.orm import Session
@@ -14,25 +15,51 @@ import statistics  # ✅ 추가: 평균 계산용
 # =========================
 def _extract_hmm_summary_from_turns(turns: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
-    turns 내에 label_turns.py가 붙여둔 HMM 결과(hmm_summary 또는 hmm)를 찾아서 반환.
-    우선순위:
-      1) 마지막 victim 턴의 hmm_summary
-      2) 마지막 victim 턴의 hmm (posterior/viterbi)
-      3) 그 외 victim 턴 중 마지막으로 발견되는 hmm_summary/hmm
+    turns 내 HMM 결과를 찾아서 반환.
+    ✅ 지원 소스(우선순위 높은 것부터 마지막으로 발견된 값을 사용):
+        0) system 턴의 meta.hmm_summary / meta.hmm  (오케스트레이터/툴에서 주입하는 케이스)
+        1) victim 턴의 hmm_summary
+        2) victim 턴의 hmm (posterior/viterbi)
+        3) 그 외 victim 턴 중 마지막으로 발견되는 hmm_summary/hmm
     """
     last_candidate: Optional[Dict[str, Any]] = None
     for t in turns:
         if not isinstance(t, dict):
             continue
-        if _normalize_role(t) != "victim":
+        role_norm = _normalize_role(t)
+
+        # ✅ (우선) system meta에 주입된 HMM 신호 탐색
+        if role_norm == "system":
+            meta = t.get("meta")
+            if isinstance(meta, dict):
+                hs = meta.get("hmm_summary") or meta.get("hmmSummary")
+                if isinstance(hs, dict) and hs:
+                    last_candidate = hs
+                    continue
+                h = meta.get("hmm") or meta.get("HMM")
+                if isinstance(h, dict) and h:
+                    last_candidate = h
+                    continue
+            # system turn에 meta 없이 최상위로 붙는 경우도 방어
+            hs2 = t.get("hmm_summary")
+            if isinstance(hs2, dict) and hs2:
+                last_candidate = hs2
+                continue
+            h2 = t.get("hmm")
+            if isinstance(h2, dict) and h2:
+                last_candidate = h2
+                continue
+
+        # 기존: victim 턴 기반 탐색
+        if role_norm != "victim":
             continue
         hs = t.get("hmm_summary")
         if isinstance(hs, dict) and hs:
             last_candidate = hs
-        else:
-            h = t.get("hmm")
-            if isinstance(h, dict) and h:
-                last_candidate = h
+            continue
+        h = t.get("hmm")
+        if isinstance(h, dict) and h:
+            last_candidate = h
     return last_candidate
 
 
@@ -242,6 +269,34 @@ E) **지속적 고신뢰 + 명시적 실행 의사(실행 직전 단계)**   # �
 - phishing/evidence 판정은 **대화 텍스트(특히 피해자 실행/확약 발화)** 를 1순위 근거로 하라.
 - HMM은 **risk.score 보정 근거** 및 **victim_vulnerabilities 강화 근거**로만 사용하라.
 - HMM이 V3(취약)로 강하게 나오면: '권위/긴급에 흔들림', '검증 없이 따르려는 경향' 같은 취약성을 더 강하게 반영할 수 있다.
+""".strip()
+
+PROMPT_VULN_WITH_HMM_ONLY = """
+당신은 보이스피싱 공격 시뮬레이션의 '취약점 분석가'입니다.
+아래 대화 로그와 HMM 요약을 참고하여, 공격자 관점에서 활용 가능한 피해자 취약점을 작성하세요.
+
+[중요]
+- phishing 여부/근거 판단은 절대 하지 마세요. (여기서는 취약점만)
+- PPSE/절차 라벨의 '의미'를 재정의하지 마세요. (라벨은 이미 계산된 신호로 가정)
+- HMM은 피해자 상태 전이(취약/경계/방어 등)의 신호로만 사용하세요.
+
+[원하는 취약점 스타일]
+- 단순 나열이 아니라, '왜 취약한지'가 드러나게 문장형으로 작성
+- 아래 3가지를 섞어서 3~8개:
+  1) 현재 상태에서 노리기 쉬운 취약점(예: 공포/불안이 지속 → 권위/긴급에 취약)
+  2) 공격자가 피해야 할 자극(예: 분노 유발 금지/의심 촉발 금지/반감 유발 금지)
+  3) 다음 단계로 유도할 때 유효한 방향(예: 확인 욕구/안전 욕구/상대 권위 수용)
+
+[출력 형식]
+- 오직 JSON 1개만
+- 키는 정확히 1개: "victim_vulnerabilities"
+- 값은 문자열 리스트(3~8개)
+
+[대화 로그]
+{dialog}
+
+[HMM 요약]
+{hmm}
 """.strip()
 
 # =========================
@@ -552,6 +607,44 @@ def _json_loads_lenient_full(s: str) -> Dict[str, Any]:
     fixed_esc = _escape_inner_quotes_for_value_of("evidence", fixed_min)
     return _sanitize(json.loads(fixed_esc))
 
+def _json_loads_lenient_vuln_only(s: str) -> Dict[str, Any]:
+    """
+    PROMPT_VULN_WITH_HMM_ONLY 전용 파서.
+    - 출력 키가 "victim_vulnerabilities" 1개뿐인 JSON을 안전하게 파싱한다.
+    - 기존 _json_loads_lenient_full()은 5키 sanitize 전제가 있어 재사용하면 구조가 깨질 수 있음.
+    """
+    s0 = _normalize_quotes(_strip_code_fences(s))
+    raw = _extract_json_with_balancing(s0)
+
+    # 1) 1차 파싱
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        # 최소 보정: trailing comma 제거
+        raw2 = re.sub(r",(\s*[}\]])", r"\1", raw)
+        obj = json.loads(raw2)
+
+    v = None
+    if isinstance(obj, dict):
+        v = obj.get("victim_vulnerabilities")
+
+    # list가 아니면 최대한 list로 정규화
+    if isinstance(v, list):
+        vul_list = v
+    elif v is None:
+        vul_list = []
+    else:
+        vul_list = [str(v)]
+
+    # 문자열 정리 + 길이 제한
+    out: List[str] = []
+    for x in vul_list:
+        s = str(x).strip()
+        if s:
+            out.append(s)
+
+    return {"victim_vulnerabilities": out[:8]}
+
 # =========================
 # 메인: 라운드별 전체대화 판정
 # =========================
@@ -614,15 +707,22 @@ def summarize_run_full(
         }
 
     llm = admin_chat()
-    # ✅ conviction을 프롬프트에 주입
-    prompt = PROMPT_FULL_DIALOG.format(
+    # (1) BASE 판정: HMM 미제공(혼입 방지)
+    prompt_base = PROMPT_FULL_DIALOG.format(
         scenario=_escape_braces(scenario_str),
         dialog=_escape_braces(dialog),
         conviction=_escape_braces(conviction_text),
-        hmm=_escape_braces(hmm_text),
+        hmm=_escape_braces("HMM 미제공 (취약점 강화 단계에서만 사용)"),
     )
-    resp = llm.invoke(prompt).content
-    parsed = _json_loads_lenient_full(resp)
+    resp_base = llm.invoke(prompt_base).content
+    parsed = _json_loads_lenient_full(resp_base)
+
+    # BASE 취약점은 따로 보관(디버깅/비교용)
+    base_vul = parsed.get("victim_vulnerabilities") or []
+    if not isinstance(base_vul, list):
+        base_vul = [str(base_vul)]
+    base_vul = [str(x) for x in base_vul][:8]
+    parsed["victim_vulnerabilities_base"] = base_vul
 
     # ✅ A안: risk.score는 LLM 기본 + HMM 보정(0~100)
     base_score = int((parsed.get("risk") or {}).get("score", 0))
@@ -658,6 +758,39 @@ def summarize_run_full(
     if isinstance(parsed["meta"], dict):
         parsed["meta"]["hmm_summary"] = hmm_summary
         parsed["meta"]["hmm_text"] = hmm_text
+        # BASE 판정에서는 HMM 미사용을 명시(나중에 디버깅할 때 혼동 방지)
+        parsed["meta"]["hmm_used_for_phishing"] = False
+        parsed["meta"]["hmm_used_for_risk_score_calibration"] = True
+
+    # (2) 취약점 강화: 텍스트 + HMM을 사용해서 '공격자 관점 취약점' 생성
+    # - phishing/evidence는 건드리지 않는다.
+    hmm_vul: List[str] = []
+    try:
+        prompt_vuln = PROMPT_VULN_WITH_HMM_ONLY.format(
+            dialog=_escape_braces(dialog),
+            hmm=_escape_braces(hmm_text),
+        )
+        resp_vuln = llm.invoke(prompt_vuln).content
+        vuln_obj = _json_loads_lenient_vuln_only(resp_vuln)
+        vv = vuln_obj.get("victim_vulnerabilities")
+        if isinstance(vv, list):
+            hmm_vul = [str(x).strip() for x in vv if str(x).strip()][:8]
+    except Exception:
+        hmm_vul = []
+
+    parsed["victim_vulnerabilities_hmm"] = hmm_vul
+
+    # 최종 취약점 정책:
+    # - hmm_vul이 있으면 그걸 최종 취약점으로 채택(네가 원하는 방향)
+    # - 없으면 BASE 취약점 유지
+    if hmm_vul:
+        parsed["victim_vulnerabilities"] = hmm_vul
+        if isinstance(parsed.get("meta"), dict):
+            parsed["meta"]["hmm_used_for_vulnerabilities"] = True
+    else:
+        parsed["victim_vulnerabilities"] = base_vul
+        if isinstance(parsed.get("meta"), dict):
+            parsed["meta"]["hmm_used_for_vulnerabilities"] = False
 
     return parsed
 
@@ -699,6 +832,7 @@ def summarize_case(db: Session, case_id: UUID):
         scenario=_escape_braces(scenario_str),
         dialog=_escape_braces(dialog),
         conviction=_escape_braces(conviction_text),
+        hmm=_escape_braces("HMM 없음"),
     )
     resp = llm.invoke(prompt).content
     parsed = _json_loads_lenient_full(resp)

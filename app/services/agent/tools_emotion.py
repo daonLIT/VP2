@@ -17,6 +17,82 @@ HmmAttachMode = Literal["per_victim_turn", "last_victim_turn_only"]
 
 _PAIR_MODE_ALLOWED = {"none", "prev_offender", "prev_victim", "thoughts", "prev_offender+thoughts", "prev_victim+thoughts"}
 
+def _loads_maybe_obj(s: str) -> Optional[Any]:
+    """
+    문자열이 JSON 또는 Python literal(dict/list) 형태일 수 있어 파싱을 시도한다.
+    실패하면 None.
+    """
+    ss = (s or "").strip()
+    if not ss:
+        return None
+    try:
+        return json.loads(ss)
+    except Exception:
+        try:
+            return ast.literal_eval(ss)
+        except Exception:
+            return None
+
+def _normalize_turn_text(t: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    turns 원소의 text 형태를 안정적으로 정규화한다.
+    - text가 JSON 문자열이면 dict로 변환
+    - text가 일반 문자열이면 role에 따라 {"utterance":...} / {"dialogue":...} 로 감싼다
+    - turn 최상위에 있는 proc_code/ppse_labels/is_convinced/thoughts 등을 text dict로 복사해 일관성 유지
+    """
+    role = (t.get("role") or t.get("speaker") or t.get("actor") or "").strip().lower()
+
+    # 0) text가 아예 없고 최상위에 utterance/dialogue가 있으면 text dict 생성
+    if "text" not in t or t.get("text") is None:
+        if "utterance" in t:
+            t["text"] = {"utterance": t.get("utterance")}
+        elif "dialogue" in t:
+            t["text"] = {"dialogue": t.get("dialogue")}
+
+    text = t.get("text")
+
+    # 1) text가 문자열인 경우: JSON 문자열인지 먼저 파싱 시도
+    if isinstance(text, str):
+        parsed = _loads_maybe_obj(text)
+        if isinstance(parsed, dict):
+            t["text"] = parsed
+        else:
+            s = text.strip()
+            if role == "offender":
+                t["text"] = {"utterance": s}
+            elif role == "victim":
+                t["text"] = {"dialogue": s}
+            else:
+                t["text"] = {"raw": s}
+
+    # 2) text가 dict가 아니면 raw로 감싸기
+    elif not isinstance(text, dict):
+        if role == "offender":
+            t["text"] = {"utterance": str(text)}
+        elif role == "victim":
+            t["text"] = {"dialogue": str(text)}
+        else:
+            t["text"] = {"raw": str(text)}
+
+    # 3) 일관성: 최상위 메타를 text(dict)에도 복사 (label_turns 쪽이 어디서 읽든 안전)
+    if isinstance(t.get("text"), dict):
+        td: Dict[str, Any] = t["text"]
+
+        if role == "offender":
+            for k in ("proc_code", "ppse_labels", "utterance"):
+                if k in t and k not in td:
+                    td[k] = t[k]
+        elif role == "victim":
+            for k in ("is_convinced", "thoughts", "dialogue"):
+                if k in t and k not in td:
+                    td[k] = t[k]
+
+        # role도 보존(혹시 downstream이 text 내부 role을 참고하는 경우 방어)
+        if "role" not in td and role:
+            td["role"] = role
+
+    return t
+
 def _env_bool(name: str, default: bool) -> bool:
     """
     환경변수 bool 파서:
@@ -78,26 +154,10 @@ class LabelVictimEmotionsInput(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _coerce_input(cls, data: Any) -> Any:
-        def _loads_maybe(s: str) -> Any:
-            """
-            LangChain tool_input이 문자열로 들어올 때:
-            - JSON: {"run_hmm": true} 같은 형태도 처리
-            - 혹시 JSON이 아니고 Python literal(True/False)로 들어오면 ast로 fallback
-            """
-            ss = (s or "").strip()
-            if not ss:
-                return None
-            try:
-                return json.loads(ss)
-            except Exception:
-                try:
-                    return ast.literal_eval(ss)
-                except Exception:
-                    return None
 
         # 1) 입력 전체가 문자열인 경우: '{"turns":[...]}'
         if isinstance(data, str):
-            parsed = _loads_maybe(data)
+            parsed = _loads_maybe_obj(data)
             if parsed is None:
                 # 파싱 실패 시 최소한의 형태로 반환(여기서 에러 내기 싫으면 빈 turns)
                 return {"turns": []}
@@ -121,7 +181,7 @@ class LabelVictimEmotionsInput(BaseModel):
         #    {"turns":"{...}"} 또는 {"turns":"[...]"}
         if isinstance(data, dict) and isinstance(data.get("turns"), str):
             raw = data["turns"]
-            parsed = _loads_maybe(raw)
+            parsed = _loads_maybe_obj(raw)
             if isinstance(parsed, dict) and isinstance(parsed.get("turns"), list):
                 data["turns"] = parsed["turns"]
             elif isinstance(parsed, list):
@@ -168,13 +228,8 @@ def label_victim_emotions(
     if pair_mode is None:
         pair_mode = _default_pair_mode()
     if isinstance(turns, str):
-        try:
-            turns = json.loads(turns)
-        except Exception:
-            try:
-                turns = ast.literal_eval(turns)
-            except Exception:
-                turns = []
+        parsed = _loads_maybe_obj(turns)
+        turns = parsed if parsed is not None else []
 
     # turns 자리에 payload(dict)가 통째로 들어온 경우( {"turns":[...], "run_hmm":true,...} )
     if isinstance(turns, dict) and "turns" in turns:
@@ -195,26 +250,26 @@ def label_victim_emotions(
         cleaned: List[Dict[str, Any]] = []
         for t in turns:
             if isinstance(t, dict):
-                cleaned.append(t)
+                cleaned.append(_normalize_turn_text(t))
                 continue
             if isinstance(t, str):
-                try:
-                    pt = json.loads(t)
-                    if isinstance(pt, dict):
-                        cleaned.append(pt)
-                        continue
-                except Exception:
-                    pass
-                cleaned.append({"role": "unknown", "text": t})
+                pt = _loads_maybe_obj(t)
+                if isinstance(pt, dict):
+                    cleaned.append(_normalize_turn_text(pt))
+                else:
+                    cleaned.append(_normalize_turn_text({"role": "unknown", "text": t}))
                 continue
-            cleaned.append({"role": "unknown", "text": str(t)})
+            cleaned.append(_normalize_turn_text({"role": "unknown", "text": str(t)}))
         turns = cleaned
     else:
         turns = []
 
     # 원본 보존(길이/정렬 보장용)
     original_turns: List[Dict[str, Any]] = turns if isinstance(turns, list) else []
-    original_turns = [t if isinstance(t, dict) else {"role": "unknown", "text": str(t)} for t in original_turns]
+    original_turns = [
+        _normalize_turn_text(t) if isinstance(t, dict) else _normalize_turn_text({"role": "unknown", "text": str(t)})
+        for t in original_turns
+    ]
 
     # ✅ OFF면 no-op: 감정/HMM 주입 없이 원본 그대로 반환
     if not enabled:

@@ -2,12 +2,14 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Tuple, Optional, Set, AsyncGenerator
 from dataclasses import dataclass, field
+import copy
 import json
 import re
 import ast
+import tempfile
+from pathlib import Path
 from datetime import datetime
 import os
-from pathlib import Path
 
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -24,6 +26,7 @@ from app.services.agent.tools_emotion import label_victim_emotions
 from app.services.agent.tools_tavily import make_tavily_tools
 from app.services.agent.guideline_repo_db import GuidelineRepoDB
 from app.core.logging import get_logger
+from app.services.agent.tools_summary import make_summary_tools, put_payload as _raw_put_payload
 
 
 from app.schemas.simulation_request import SimulationStartRequest
@@ -34,6 +37,68 @@ from app.services.tts_service import (
 )
 
 logger = get_logger(__name__)
+
+# ─────────────────────────────────────────────────────────
+# ✅ Round payload inclusion policy
+# - 현재는 "매 라운드마다 full-history(누적 turns/judgements/guidances)" 유지
+# - 나중에 payload/env 조건으로 "현재 라운드만" 또는 "최근 N 라운드만"으로 변경 가능
+# ─────────────────────────────────────────────────────────
+@dataclass
+class RoundDataPolicy:
+    # ✅ 고정 정책: auto(현재 구현상 full과 동일 동작)
+    # - 사용자가 "무조건 full/auto"로 강제하겠다고 했으므로 외부 입력(payload/env)을 무시한다.
+    mode: str = "auto"  # "auto" (== full)
+    history_window: Optional[int] = None  # 최근 N 라운드만 누적 (None이면 전체)
+    history_on_critical_only: bool = False
+
+    # 어떤 입력에서 history(누적)를 쓸지 세부 토글 (필요해지면 여기만 건드리면 됨)
+    use_history_for_round_summary: bool = True
+    use_history_for_prevention: bool = True
+
+def _env_int(name: str) -> Optional[int]:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return int(v) if v else None
+    except Exception:
+        return None
+
+def _env_bool(name: str) -> Optional[bool]:
+    try:
+        v = (os.getenv(name) or "").strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off"):
+            return False
+    except Exception:
+        pass
+    return None
+
+def _resolve_round_data_policy(payload: Dict[str, Any]) -> RoundDataPolicy:
+    """
+    ✅ 정책 고정:
+        - 사용자의 요구사항: "무조건 full/auto"
+        - 따라서 payload/env로 절대 변경되지 않도록 auto로 고정한다.
+        - (현재 auto는 full과 동일하게 동작하도록 구현되어 있음)
+    """
+    return RoundDataPolicy(mode="auto", history_window=None, history_on_critical_only=False)
+
+def _render_history_rule(policy: RoundDataPolicy, *, for_what: str) -> str:
+    """
+    case_mission 안에서 LLM에게 "누적 범위"를 명확히 지시하기 위한 텍스트 렌더러.
+    for_what: "round_summary" | "prevention"
+    """
+    use_history = (policy.use_history_for_round_summary if for_what == "round_summary" else policy.use_history_for_prevention)
+    if not use_history:
+        return "현재 라운드(turns/judgement/guidance)만 사용한다."
+
+    # mode에 따라 누적 방식 안내
+    # ✅ 강제 정책에서는 round_only를 사용하지 않지만, 혹시라도 호출되면 안전하게 처리
+    if policy.mode == "round_only":
+        return "현재 라운드(turns/judgement/guidance)만 사용한다. (누적 금지)"
+    if policy.history_window and policy.history_window > 0:
+        return f"최근 {policy.history_window}개 라운드만 누적해서 사용한다. (1..N 전체 누적 금지)"
+    # ✅ auto(현재는 full과 동일) / full
+    return "1라운드부터 현재 라운드까지의 모든 라운드를 누적해서 사용한다."
 
 # ─────────────────────────────────────────────────────────
 # 전역 설정
@@ -54,6 +119,11 @@ _PROMPT_CACHE: Dict[str, Dict[str, Any]] = {}
 # - LLM이 admin.make_judgement Action Input에서 hmm/turns를 누락/오염해도
 #   orchestrator wrapper가 캐시값으로 강제 보정한다.
 _EMO_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# ✅ Run meta 캐시 (stream_id 스코프)
+# - tools_summary 입력 보정(피해자정보 등)용
+# - agent가 summary tool input에서 victim_profile을 누락해도 여기서 강제 주입
+_RUN_META_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # SSE 모듈
 import asyncio, logging, uuid, contextvars, contextlib, sys
@@ -803,6 +873,132 @@ def _flatten_cached_turns_by_round(cache_turns_by_round: Dict[int, List[Dict[str
         pass
     return out
 
+def _get_summary_tool() -> Optional[Any]:
+    """
+    summary tool 객체를 가져온다.
+    - tools_summary.py에서 name이 summary.round_summaries 또는 summary.make_round_summaries로 정의될 수 있어 둘 다 대응.
+    """
+    try:
+        tools = make_summary_tools() or []
+        for t in tools:
+            nm = getattr(t, "name", "") or ""
+            if nm in ("summary.round_summaries", "summary.make_round_summaries"):
+                return t
+        # fallback: summary.* 중 첫 번째
+        for t in tools:
+            nm = getattr(t, "name", "") or ""
+            if nm.startswith("summary."):
+                return t
+    except Exception:
+        pass
+    return None
+
+def _cache_payload_and_call_summary(summary_tool: Any, *, payload: Dict[str, Any]) -> Any:
+    """
+    ✅ LLM Action Input 무시
+    - orchestrator가 파이썬에서 직접 summary tool을 호출한다.
+    - payload가 크면 _raw_put_payload.func(...)로 캐시하고 cache_key만 전달한다.
+    """
+    # 1) payload를 임시 파일로 저장 -> put_payload.func 로 캐시
+    temp_file_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8", suffix=".json") as tf:
+            json.dump(payload, tf, ensure_ascii=False)
+            temp_file_path = tf.name
+
+        cache_result = _raw_put_payload.func(payload_json_path=temp_file_path)
+        if isinstance(cache_result, dict) and cache_result.get("ok"):
+            cache_key = cache_result.get("cache_key")
+            # ✅ summary tool 입력은 cache_key만
+            return summary_tool.invoke({"data": {"cache_key": cache_key}})
+
+        # 캐시 실패 시 payload를 그대로 호출(최후 fallback)
+        return summary_tool.invoke({"data": payload})
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
+
+def _force_make_round_summaries_python(
+    *,
+    case_id: str,
+    victim_profile: Dict[str, Any],
+    turns_by_round: Dict[int, List[Dict[str, Any]]],
+    judgements_by_round: Dict[int, Dict[str, Any]],
+    guidances_by_round: Dict[int, Dict[str, Any]],
+    round_policy: RoundDataPolicy,
+) -> Dict[int, Any]:
+    """
+    ✅ summary.round_summaries를 "에이전트가 호출"하는 방식 제거.
+    - orchestrator가 라운드별로 직접 호출해서 결과를 만든다.
+    - 반환: {round_no: summary_result}
+    """
+    summary_tool = _get_summary_tool()
+    if not summary_tool:
+        return {}
+
+    out: Dict[int, Any] = {}
+
+    def _sorted_rounds() -> List[int]:
+        keys = []
+        for k in turns_by_round.keys():
+            try:
+                keys.append(int(k))
+            except Exception:
+                pass
+        return sorted(set(keys))
+
+    rounds = _sorted_rounds()
+    for rno in rounds:
+        # ✅ policy(현재 auto==full) 반영: 1..rno 누적
+        # (나중에 round_only / window를 쓰려면 여기만 바꾸면 됨)
+        turns_acc: List[Dict[str, Any]] = []
+        jud_acc: List[Dict[str, Any]] = []
+        guid_acc: List[Dict[str, Any]] = []
+
+        if round_policy.mode in ("auto", "full"):
+            # 1..rno 누적
+            for k in rounds:
+                if k > rno:
+                    break
+                turns_acc.extend(turns_by_round.get(k) or [])
+                j = judgements_by_round.get(k)
+                if isinstance(j, dict):
+                    jud_acc.append(j)
+                g = guidances_by_round.get(k)
+                if isinstance(g, dict):
+                    guid_acc.append(g)
+        else:
+            # 혹시라도 mode가 바뀌면 기본은 round-only로 안전 동작
+            turns_acc = turns_by_round.get(rno) or []
+            j = judgements_by_round.get(rno)
+            if isinstance(j, dict):
+                jud_acc = [j]
+            g = guidances_by_round.get(rno)
+            if isinstance(g, dict):
+                guid_acc = [g]
+
+        payload = {
+            "case_id": case_id,
+            "run_no": rno,
+            "round_no": rno,
+            "victim_profile": victim_profile,
+            "turns": turns_acc,
+            "judgement": judgements_by_round.get(rno) or {},
+            "judgements": jud_acc,
+            "guidances": guid_acc,
+            "guidance_next": None,
+        }
+
+        try:
+            out[rno] = _cache_payload_and_call_summary(summary_tool, payload=payload)
+        except Exception as e:
+            out[rno] = {"ok": False, "error": "summary_call_failed", "message": str(e), "round_no": rno}
+
+    return out
+
 def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = True):
     """
     ReAct 에이전트가 Action Input을 문자열로 망가뜨려도,
@@ -986,6 +1182,53 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
             pass
 
         # ─────────────────────────────────────────
+        # ✅ (1-c) summary.* 입력 자동 보정
+        # - victim_profile / scenario 등 run-level 메타가 누락되면 stream 캐시로 주입
+        # - judgement만 있고 judgements가 없으면 judgements를 보강(호환)
+        # ─────────────────────────────────────────
+        try:
+            tool_name = getattr(original_tool, "name", "") or ""
+            if tool_name.startswith("summary."):
+                # ✅ summary.*도 LLM이 호출할 수는 있지만,
+                #    이제는 orchestrator가 "강제 파이썬 호출"을 수행하므로
+                #    여기서는 최소한의 메타 주입만 유지한다.
+                d = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                if not isinstance(d, dict):
+                    d = {}
+
+                sid2 = _current_stream_id.get() or "no_stream"
+                meta = _RUN_META_CACHE.get(sid2) or {}
+
+                # victim_profile 주입 (가장 중요)
+                if d.get("victim_profile") is None and meta.get("victim_profile") is not None:
+                    d["victim_profile"] = meta["victim_profile"]
+                    d["victim_profile_source"] = "orchestrator._RUN_META_CACHE"
+
+                # scenario도 필요하면 같이 주입(스키마가 받는 경우 대비)
+                if d.get("scenario") is None and meta.get("scenario") is not None:
+                    d["scenario"] = meta["scenario"]
+                    d["scenario_source"] = "orchestrator._RUN_META_CACHE"
+
+                # judgement → judgements 보강(스키마가 judgements를 요구하는 경우 대비)
+                if d.get("judgements") is None and isinstance(d.get("judgement"), dict):
+                    d["judgements"] = [d["judgement"]]
+                    d["judgements_source"] = "orchestrator.auto_wrap_from_judgement"
+
+                # 반대로 judgements만 있고 judgement가 없으면 가장 최근(마지막)으로 보강
+                if d.get("judgement") is None and isinstance(d.get("judgements"), list) and d["judgements"]:
+                    last_j = next((x for x in reversed(d["judgements"]) if isinstance(x, dict)), None)
+                    if last_j:
+                        d["judgement"] = last_j
+                        d["judgement_source"] = "orchestrator.auto_pick_from_judgements[-1]"
+
+                if "data" in parsed and isinstance(parsed["data"], dict):
+                    parsed["data"] = d
+                else:
+                    parsed = {"data": d} if require_data_wrapper else d
+        except Exception:
+            pass
+
+        # ─────────────────────────────────────────
         # ✅ admin.generate_guidance run_no 보정(안전장치)
         # - LLM이 실수로 다음 라운드 번호(N+1)로 호출하면 no_saved_verdict가 발생
         # - 이 경우 run_no를 1 감소시켜 1회만 자동 재시도한다.
@@ -1004,6 +1247,11 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                 return False
 
         tool_name = getattr(original_tool, "name", "") or ""
+
+        # 모든 툴 호출은 이제 동기적으로 처리
+        def _invoke_tool_sync(tool_obj, input_data):
+            return tool_obj.invoke(input_data)
+
         if tool_name == "admin.generate_guidance":
             d = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
             run_no_raw = None
@@ -1017,7 +1265,7 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                 run_no_int = None
 
             try:
-                out = original_tool.invoke(parsed)
+                out = _invoke_tool_sync(original_tool, parsed)
             except Exception as e:
                 # invoke 예외도 no_saved_verdict 성격이면 한 번 보정 시도
                 if run_no_int is not None and run_no_int > 1 and _looks_like_no_saved_verdict(str(e)):
@@ -1029,7 +1277,7 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                         else:
                             parsed = {"data": d} if require_data_wrapper else d
                         logger.warning("[GuidanceRunNoFix] tool=admin.generate_guidance run_no %s -> %s (retry after exception)", run_no_int, fixed)
-                        out = original_tool.invoke(parsed)
+                        out = _invoke_tool_sync(original_tool, parsed)
                     except Exception as e2:
                         return {"ok": False, "error": "tool_invoke_failed", "message": str(e2)}
                 else:
@@ -1045,13 +1293,13 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                     else:
                         parsed = {"data": d} if require_data_wrapper else d
                     logger.warning("[GuidanceRunNoFix] tool=admin.generate_guidance run_no %s -> %s (retry)", run_no_int, fixed)
-                    out2 = original_tool.invoke(parsed)
+                    out2 = _invoke_tool_sync(original_tool, parsed)
                     out = out2
                 except Exception as e:
                     return {"ok": False, "error": "tool_invoke_failed", "message": str(e)}
         else:
             try:
-                out = original_tool.invoke(parsed)
+                out = _invoke_tool_sync(original_tool, parsed)
             except Exception as e:
                 return {
                     "ok": False,
@@ -1653,6 +1901,8 @@ def _validate_complete_execution(cap: ThoughtCapture, rounds_done: int, *, injec
         "label_victim_emotions": rounds_done if inject_emotion else 0,
         "admin.make_judgement": rounds_done,
         "admin.generate_guidance": max(0, rounds_done - 1),
+        # ✅ 라운드 요약은 orchestrator가 강제 생성(LLM tool 호출 필수 아님)
+        "summary.round_summaries": 0,
         "admin.make_prevention": 1,
         "admin.save_prevention": 1,
     }
@@ -1709,6 +1959,7 @@ REACT_SYS = (
     "  1. ✅ admin.make_prevention을 호출하여 Observation을 받았는가?\n"
     "  2. ✅ admin.save_prevention을 호출하여 Observation을 받았는가?\n"
     "  3. ✅ 위 2개 도구의 Observation에 실제 데이터가 포함되어 있는가?\n"
+    "  4. (참고) round summary는 orchestrator가 파이썬 코드로 강제 생성한다. summary.* 호출을 시도하지 말 것.\n"
     "\n"
     "  ❌ 다음 행동은 절대 금지:\n"
     "  • 도구를 호출하지 않고 '최종 예방 요약'이라는 텍스트를 직접 작성\n"
@@ -1718,6 +1969,7 @@ REACT_SYS = (
     "  ✅ 올바른 순서:\n"
     "  → admin.make_prevention 호출 → Observation 확인\n"
     "  → admin.save_prevention 호출 → Observation 확인\n"
+    "  → summary.round_summaries 호출 → Observation 확인\n"
     "  → Final Answer 작성 (Observation 내용 포함)\n"
     "\n"
     "▼ Final Answer 구성 규칙\n"
@@ -1787,6 +2039,11 @@ def build_agent_and_tools(db: Session, use_tavily: bool) -> Tuple[AgentExecutor,
     except Exception:
         pass
     tools.append(_wrap_tool_force_json_input(emotion_tool, require_data_wrapper=False))
+    # ✅ Summary tool 등록 (ReAct가 마지막에 반드시 호출하도록 프롬프트로 강제)
+    for t in make_summary_tools():
+        # ✅ summary.* 도 LLM이 래핑/비래핑을 섞어 내는 경우가 많아서
+        #    오케스트레이터에서 {"data": {...}} 형태로 강제해 일관성 확보
+        tools.append(_wrap_tool_force_json_input(t, require_data_wrapper=True))
     if use_tavily:
         tools += make_tavily_tools()
 
@@ -1874,6 +2131,11 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 inject_emotion = True
             inject_emotion = bool(inject_emotion)
             logger.info("[EmotionInject] inject_emotion=%s", inject_emotion)
+
+            # ✅ Round data inclusion policy (강제: full/auto)
+            # - payload/env로 절대 바뀌지 않도록 auto로 고정
+            round_policy = RoundDataPolicy(mode="auto")
+            logger.info("[RoundDataPolicy] FORCED mode=%s (auto==full)", round_policy.mode)
             # 프롬프트 패키지 (DB 조립)
             pkg = build_prompt_package_from_payload(
                 db, req, tavily_result=None, is_first_run=True, skip_catalog_write=True
@@ -1881,6 +2143,18 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             scenario = pkg["scenario"]
             victim_profile = pkg["victim_profile"]
             templates = pkg["templates"]
+
+            # ─────────────────────────────────────
+            # ✅ summary 도구 입력 보정용 meta 캐시 주입 (stream_id 스코프)
+            # - agent가 summary.round_summaries Action Input에서 victim_profile을 누락해도 안전하게 보정
+            # ─────────────────────────────────────
+            try:
+                _RUN_META_CACHE[stream_id] = {
+                    "scenario": _as_dict(scenario),
+                    "victim_profile": _as_dict(victim_profile),
+                }
+            except Exception:
+                _RUN_META_CACHE[stream_id] = {}
 
             logger.info("[InitialInput] %s", json.dumps(_truncate(payload), ensure_ascii=False))
             logger.info("[ComposedPromptPackage] %s", json.dumps(_truncate(pkg), ensure_ascii=False))
@@ -2065,6 +2339,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # ★★★ 전체 케이스 미션 구성 (동적 라운드)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # ✅ case_mission에 넣을 "누적 범위 규칙" (지금은 기본 full-history)
+            round_summary_history_rule = _render_history_rule(round_policy, for_what="round_summary")
+            prevention_history_rule = _render_history_rule(round_policy, for_what="prevention")
+
             case_mission = f"""
 당신은 보이스피싱 시뮬레이션 케이스를 최대 {max_rounds}라운드까지 실행하는 에이전트입니다.
 
@@ -2118,6 +2396,21 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
     - inject_emotion==False: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": <3단계 turns>, "hmm": {{"available": false, "reason": "emotion_disabled", "run_no": 1}}}}}}
 - 저장: 판정 결과 (JUDGEMENT_R1)
 
+단계 4-1: 라운드 요약 생성 (라운드1) ← **필수**
+- 도구: summary.round_summaries
+- 입력(중요): {{"data": {{
+    "case_id": CASE_ID,
+    "run_no": 1,
+    "round_no": 1,
+    "victim_profile": <1단계 victim_profile>,
+    "turns": TURNS_R1_LABELED,
+    "judgement": JUDGEMENT_R1,
+    "judgements": [JUDGEMENT_R1],
+    "guidances": [],
+    "guidance_next": null
+}}}}
+- 저장: ROUND_SUMMARY_R1
+
 단계 5: 가이던스 생성 (라운드2용)
 - 도구: admin.generate_guidance
 - 입력: {{"data": {{"case_id": CASE_ID, "run_no": 1, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
@@ -2166,6 +2459,26 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
       → YES: **즉시 단계 10으로 이동** (최대 라운드 도달)
       → NO: 단계 9로 (다음 라운드 준비)
 
+단계 8-2: 라운드 요약 생성 (라운드N) ← 필수 (8-1 직후 / 9 이전)
+- 도구: summary.round_summaries
+- ✅ 누적 범위 규칙(정책): {round_summary_history_rule}
+- 입력(정책에 따라 turns/judgements/guidances 범위를 결정):
+  - (full/auto): turns=<1..N 누적 TURNS_LABELED>, judgements=<1..N 누적>, guidances=<1..(N-1) 누적>
+  - (round_only): turns=<N 라운드 TURNS_LABELED>, judgements=<N 라운드만>, guidances=<N 라운드에 사용된 guidance(있으면)>
+  - (history_window=K): turns=<max(1,N-K+1)..N>, judgements=<동일 범위>, guidances=<동일 범위 또는 1..(N-1) 중 최근 K개>
+- 입력 예시(형식 고정/한줄, 내용은 정책대로 채움):
+    {{"data": {{
+        "case_id": CASE_ID,
+        "run_no": N,
+        "round_no": N,
+        "victim_profile": <1단계 victim_profile>,
+        "turns": <POLICY_TURNS>,
+        "judgement": JUDGEMENT_R{{N}},
+        "judgements": <POLICY_JUDGEMENTS>,
+        "guidances": <POLICY_GUIDANCES>
+    }}}}
+- 저장: ROUND_SUMMARY_R<N>
+
 단계 9: 가이던스 생성 (다음 라운드용)
 - **진입 조건**: N < {max_rounds} AND risk.level != "critical"
 - 도구: admin.generate_guidance
@@ -2180,7 +2493,13 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
   * risk.level == "critical" OR
   * N == {max_rounds}
 - 도구: admin.make_prevention
-- 입력: {{"data": {{"case_id": CASE_ID, "rounds": N, "turns": [모든라운드_TURNS_LABELED], "judgements": [모든judgement], "guidances": [모든guidance]}}}}
+- ✅ 누적 범위 규칙(정책): {prevention_history_rule}
+- 입력(정책에 따라 turns/judgements/guidances 범위를 결정):
+  - (full/auto): turns=<1..N 누적 TURNS_LABELED>, judgements=<1..N 누적>, guidances=<1..(N-1) 누적>
+  - (round_only): turns=<N 라운드 TURNS_LABELED>, judgements=<N 라운드>, guidances=<N 라운드 사용 guidance(있으면)>
+  - (history_window=K): turns=<max(1,N-K+1)..N>, judgements=<동일>, guidances=<동일>
+- 입력 예시(형식 고정, 내용은 정책대로 채움):
+  {{"data": {{"case_id": CASE_ID, "rounds": N, "turns": <POLICY_TURNS>, "judgements": <POLICY_JUDGEMENTS>, "guidances": <POLICY_GUIDANCES>}}}}
 - 저장: prevention_result
 
 단계 11: 예방책 저장 ← **필수**
@@ -2229,16 +2548,16 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 초기화: 1 (엔티티 로드)
 
 라운드1:
-  2→3→4→5
+  2→3→4→4-1→5
 
 라운드2:
-  6→7→8→8-1 체크: critical? NO, 2=={max_rounds}? NO → 9→6
+  6→7→8→8-1 체크: critical? NO, 2=={max_rounds}? NO → 8-2→9→6
 
 라운드3:
-  6→7→8→8-1 체크: critical? NO, 3=={max_rounds}? NO → 9→6
+  6→7→8→8-1 체크: critical? NO, 3=={max_rounds}? NO → 8-2→9→6
 
 라운드4:
-  6→7→8→8-1 체크: critical? NO, 4=={max_rounds}? NO → 9→6
+  6→7→8→8-1 체크: critical? NO, 4=={max_rounds}? NO → 8-2→9→6
 
 라운드5:
   6→7→8→8-1 체크: critical? NO, 5=={max_rounds}? YES → **10**
@@ -2407,6 +2726,10 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             ended_by_by_round: Dict[int, Optional[str]] = {}
             case_id_by_round: Dict[int, str] = {}  # ✅ 라운드별 case_id (override 포함) 추적
 
+            # ✅ orchestrator 강제 summary 생성을 위한 라운드별 객체 맵
+            judgements_by_round: Dict[int, Dict[str, Any]] = {}
+            guidances_by_round: Dict[int, Dict[str, Any]] = {}
+
             # ThoughtCapture에서 순서대로 추출
             judgement_idx = 0
             guidance_idx = 0
@@ -2437,6 +2760,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                             else:
                                 judgement_idx += 1
                                 use_run_no = judgement_idx
+                            # ✅ round summary 강제 실행용 저장
+                            judgements_by_round[use_run_no] = judgement if isinstance(judgement, dict) else {}
                             judgements_history.append({
                                 "run_no": use_run_no,
                                 "phishing": judgement.get("phishing", False),
@@ -2831,6 +3156,12 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                         guidance_idx += 1
                         guidance_obj = _loose_parse_json(output)
                         if guidance_obj:
+                            # ✅ 다음 라운드용 guidance이므로 "for_round"를 키로 저장
+                            try:
+                                fr = int(guidance_idx + 1)
+                                guidances_by_round[fr] = guidance_obj if isinstance(guidance_obj, dict) else {}
+                            except Exception:
+                                pass
                             guidance_history.append({
                                 "for_round": guidance_idx + 1,
                                 "kind": guidance_obj.get("type", ""),
@@ -2846,6 +3177,26 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
                 pass
 
             logger.info(f"[CaseMission] 판정 수: {len(judgements_history)}, turns 총 {len(turns_all)}개")
+            # ─────────────────────────────────────
+            # ✅ (NEW) 라운드 요약: orchestrator가 파이썬으로 강제 생성
+            # - 더 이상 LLM Action Input/도구 호출 흐름에 의존하지 않는다.
+            # ─────────────────────────────────────
+            round_summaries_by_round: Dict[int, Any] = {}
+            try:
+                vp = _RUN_META_CACHE.get(stream_id, {}).get("victim_profile") or victim_profile_base
+                round_summaries_by_round = _force_make_round_summaries_python(
+                    case_id=str(case_id),
+                    victim_profile=vp,
+                    turns_by_round=turns_by_round,
+                    judgements_by_round=judgements_by_round,
+                    guidances_by_round=guidances_by_round,
+                    round_policy=round_policy,
+                )
+                # SSE로도 전달 (프론트에서 라운드요약 탭/패널 즉시 구성 가능)
+                _emit_to_stream("round_summaries", _truncate(round_summaries_by_round, 2000))
+            except Exception as e:
+                logger.warning("[RoundSummariesForced] failed: %s", e)
+                round_summaries_by_round = {}
             # ✅ dump 모드 fallback: cap.events 수집이 실패한 경우 DB에서 라운드 대화 복구
             try:
                 dump_enabled = bool(payload.get("dump_case_json", False))
@@ -2974,6 +3325,8 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
             result_obj = {
                 "status": "success",
                 "case_id": case_id,
+                # ✅ orchestrator가 강제로 만든 라운드 요약
+                "round_summaries": round_summaries_by_round,
                 "rounds": rounds_done,
                 "turns_per_round": req.max_turns,
                 "timestamp": datetime.now().isoformat(),

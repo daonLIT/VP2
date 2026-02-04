@@ -11,13 +11,10 @@ import json, ast, re
 import inspect
 
 from app.services.prompts import (
-    ATTACKER_PROMPT,
-    ATTACKER_PROMPT_V2,
-    VICTIM_PROMPT,
-    render_victim_from_profile,
     render_attacker_system_string,   # ✅ 추가
+    render_attacker_planner_system_string,  # ✅ 2-call: Planner system
+    render_attacker_realizer_system_string, # ✅ 2-call: Realizer system
     render_victim_system_string,     # ✅ 추가
-    build_guidance_block_from_meta,
 )
 
 def _call_with_supported_kwargs(fn, **kwargs):
@@ -226,6 +223,8 @@ def make_sim_tools(db: Session):
         """
         실제로 우리가 쓰는 app/services/prompts.py 안의
         - render_attacker_system_string(...)
+        - render_attacker_planner_system_string(...)
+        - render_attacker_realizer_system_string(...)
         - render_victim_system_string(...)
         를 그대로 호출해서 MCP에 들어갈 system 프롬프트를 만든다.
         이렇게 하면 orchestrator → sim.compose_prompts → mcp.simulator_run
@@ -245,14 +244,28 @@ def make_sim_tools(db: Session):
 
         rn = int(round_no) if round_no is not None else 1
 
-        # ✅ 정석: prompts.py의 render 함수만 호출
-        # - render_attacker_system_string은 prompts.py에서 'V2 고정'으로 바뀐 상태
-        attacker_system = _call_with_supported_kwargs(
-            render_attacker_system_string,
+        # ✅ 핵심 변경:
+        # - orchestrator/tools_sim은 "시스템 프롬프트 조립"까지만 담당
+        # - 실제 2-call(Planner→Realizer)은 MCP 서버(simulate_dialogue.py)에서만 수행
+        #
+        # 따라서 MCP로 아래 2개의 system을 함께 전달한다.
+        # 1) Planner system: proc_code만 선택 (기본 설계상 guidance 미주입)
+        # 2) Realizer system: 입력 proc_code 고정 + utterance + ppse_labels 생성 (guidance 주입)
+        attacker_planner_system = _call_with_supported_kwargs(
+            render_attacker_planner_system_string,
+            scenario=scenario,
+            guidance=guidance,  # 함수 내부에서 기본적으로 미주입(주석 처리된 옵션)
+        )
+        attacker_realizer_system = _call_with_supported_kwargs(
+            render_attacker_realizer_system_string,
             scenario=scenario,
             guidance=guidance,
-            current_step="",   # V2에서는 의미 없지만 시그니처 호환을 위해 전달해도 됨
         )
+
+        # (하위호환) 기존 단일 attacker_system이 필요하면 Realizer를 대표로 둔다.
+        # - render_attacker_system_string은 1-call 호환용(남겨둠)
+        # - 하지만 실제 실행은 MCP에서 planner→realizer 2-call로 간다.
+        attacker_system = attacker_realizer_system
         victim_system = _call_with_supported_kwargs(
             render_victim_system_string,
             victim_profile=victim_profile,
@@ -263,10 +276,17 @@ def make_sim_tools(db: Session):
 
         return {
             # ✅ 정석 키(권장)
-            "attacker": {"system": attacker_system},
+            # MCP가 2-call을 수행할 수 있도록 분리된 system 제공
+            "attacker": {
+                "system": attacker_system,  # legacy 대표(=realizer)
+                "planner_system": attacker_planner_system,
+                "realizer_system": attacker_realizer_system,
+            },
             "victim": {"system": victim_system},
             # ✅ 하위호환 키(기존 코드 대비)
             "attacker_prompt": attacker_system,
+            "attacker_planner_prompt": attacker_planner_system,
+            "attacker_realizer_prompt": attacker_realizer_system,
             "victim_prompt": victim_system,
         }
 

@@ -402,6 +402,11 @@ def render_attacker_system_string(
     - 항상 ATTACKER_PROMPT_V2_SYSTEM(=ATTACKER_PROMPT_V2의 system)을 반환한다.
     - current_step 기반이 아니라, 직전 대화에 따라 proc_code 전진/회귀를 V2가 수행한다.
     - guidance/scenario는 '참고용 블록'으로만 system 하단에 덧붙인다(옵션).
+    ⚠️ 주의:
+    - 이 함수는 "1-call(단일 호출)" 호환용 시스템 빌더다.
+    - 2-call(Planner→Realizer) 구조에서는 아래
+        `render_attacker_planner_system_string`, `render_attacker_realizer_system_string`
+        를 사용하여 MCP 서버에서만 2-call을 수행한다.
     """
     guidance_block = build_guidance_block_from_meta(guidance)
     scenario_block = _build_scenario_reference_block_v2(scenario or {})
@@ -415,6 +420,57 @@ def render_attacker_system_string(
     if extra_parts:
         return "\n\n".join([ATTACKER_PROMPT_V2_SYSTEM, *extra_parts]).strip()
     return ATTACKER_PROMPT_V2_SYSTEM.strip()
+
+def render_attacker_planner_system_string(
+    *,
+    scenario: Dict[str, Any],
+    guidance: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    ✅ 2-call용 Planner system 문자열 빌더
+    - Planner는 proc_code만 선택하는 역할이므로, 기본적으로 guidance(공격형/방어형)를 주입하지 않는다.
+        (톤/어조 지침이 proc_code 선택을 과도하게 왜곡하는 것을 방지)
+    - 다만 시나리오 메타(이름/유형/목적)는 참고용으로 붙일 수 있다.
+    """
+    scenario_block = _build_scenario_reference_block_v2(scenario or {})
+
+    extra_parts: List[str] = []
+    if scenario_block:
+        extra_parts.append(scenario_block)
+
+    # guidance는 기본적으로 Planner에 미주입 (의도된 설계)
+    # 필요하면 아래처럼 켤 수 있으나, 기본은 OFF:
+    # if guidance:
+    #     extra_parts.append("[동적 전략 지침]\n" + build_guidance_block_from_meta(guidance))
+
+    if extra_parts:
+        return "\n\n".join([ATTACKER_PROC_PLANNER_V2_SYSTEM, *extra_parts]).strip()
+    return ATTACKER_PROC_PLANNER_V2_SYSTEM.strip()
+
+
+def render_attacker_realizer_system_string(
+    *,
+    scenario: Dict[str, Any],
+    guidance: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    ✅ 2-call용 Realizer system 문자열 빌더
+    - Realizer는 입력으로 받은 proc_code를 "고정"한 채 utterance + ppse_labels를 생성한다.
+    - 동적 전략 지침(guidance)은 문장 표현/전략(어조, 긴급성, 의심무마 등)에 영향을 주도록
+        Realizer에만 주입하는 것을 기본으로 한다.
+    """
+    guidance_block = build_guidance_block_from_meta(guidance)
+    scenario_block = _build_scenario_reference_block_v2(scenario or {})
+
+    extra_parts: List[str] = []
+    if scenario_block:
+        extra_parts.append(scenario_block)
+    if guidance_block:
+        extra_parts.append("[동적 전략 지침]\n" + guidance_block)
+
+    if extra_parts:
+        return "\n\n".join([ATTACKER_REALIZER_V2_SYSTEM, *extra_parts]).strip()
+    return ATTACKER_REALIZER_V2_SYSTEM.strip()
 
 def render_victim_system_string(
     *,
@@ -710,6 +766,12 @@ ATTACKER_PROC_PLANNER_V2_SYSTEM = dedent("""
 종료 조건이 아니면, 반드시 JSON 1개만 출력:
 {"proc_code": "<절차 목록 중 하나>"}
 
+✅ [첫 턴 예외 규칙(강제)]
+- 만약 [직전 대화] 블록이 "직전 대화 없음." 이라면(=대화 시작 / 이전 발화 없음),
+    proc_code는 반드시 아래 JSON으로 고정 출력한다:
+    {"proc_code": "1-1"}
+- 이 경우에도 다른 키/설명/코드펜스 없이 JSON 한 개만 출력한다.
+
 종료 조건이면, 정확히 한 줄만 출력하고 종료:
 "여기서 마무리하겠습니다."
 
@@ -736,6 +798,10 @@ ATTACKER_PROC_PLANNER_V2_SYSTEM = dedent("""
 - 매 턴, proc_code는 하나만 선택한다.
 - 같은 proc_code 2턴 연속 반복은 피한다(불가피하면 다음 단계/인접 단계로 변형).
 - 기본적으로는 전진하되, 피해자가 의심/질문/혼란이면 2-1/2-2/3-x로 회귀한다.
+
+[직전 대화 없음 처리]
+- [직전 대화]가 "직전 대화 없음." 이면, 위 일반 규칙보다
+"첫 턴 예외 규칙(=1-1 고정)"이 최우선이다.
 """).strip()
 
 # 절차 목록은 기존 PROCEDURE_LIST_KO 그대로 사용

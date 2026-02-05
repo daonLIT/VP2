@@ -724,6 +724,9 @@ def _looks_unlabeled_turns(turns_in: Any) -> bool:
     - 첫 dict 샘플에 emotion/hmm 관련 키가 하나도 없으면 unlabeled로 간주
     """
     try:
+        # {"turns":[...]} 같은 래퍼가 들어오는 경우도 방어
+        if isinstance(turns_in, dict) and isinstance(turns_in.get("turns"), list):
+            turns_in = turns_in.get("turns")
         if not isinstance(turns_in, list) or not turns_in:
             return True
         sample = next((t for t in turns_in if isinstance(t, dict)), None)
@@ -738,6 +741,47 @@ def _looks_unlabeled_turns(turns_in: Any) -> bool:
             )
         )
         return not has_label_key
+    except Exception:
+        return True
+    
+def _pick_last_run_no_from_cache(sid: str) -> Optional[int]:
+    """
+    run_no가 누락/오염된 경우, EMO_CACHE에서 가장 그럴듯한 run_no를 추정한다.
+    우선순위:
+      1) _EMO_CACHE[sid]["last_run_no"]
+      2) turns_by_round의 max key
+    """
+    try:
+        c = _EMO_CACHE.get(sid) or {}
+        last = c.get("last_run_no")
+        if isinstance(last, int) and last > 0:
+            return last
+        tbr = c.get("turns_by_round") or {}
+        keys = []
+        for k in tbr.keys():
+            try:
+                keys.append(int(k))
+            except Exception:
+                pass
+        return max(keys) if keys else None
+    except Exception:
+        return None
+
+def _hmm_missing_or_empty(hmm_val: Any) -> bool:
+    """
+    make_judgement 입력 hmm가 사실상 비어있는 상태인지 판단.
+    - None / {} / {"available": false, ...} 모두 보정 대상으로 본다.
+    """
+    try:
+        if hmm_val is None:
+            return True
+        if isinstance(hmm_val, dict):
+            if not hmm_val:
+                return True
+            av = hmm_val.get("available")
+            if av is False:
+                return True
+        return False
     except Exception:
         return True
 
@@ -793,10 +837,11 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
         # ─────────────────────────────────────────
         sid = _current_stream_id.get() or "no_stream"
         if sid not in _EMO_CACHE:
-            _EMO_CACHE[sid] = {"turns_by_round": {}, "hmm_by_round": {}}
+            _EMO_CACHE[sid] = {"turns_by_round": {}, "hmm_by_round": {}, "last_run_no": None}
         # 방어: 키 누락되었을 수 있음(핫리로드/부분 갱신 등)
         _EMO_CACHE[sid].setdefault("turns_by_round", {})
         _EMO_CACHE[sid].setdefault("hmm_by_round", {})
+        _EMO_CACHE[sid].setdefault("last_run_no", None)
 
         # ─────────────────────────────────────────
         # ✅ (1) admin.make_judgement / admin.make_prevention 입력 자동 보정
@@ -817,6 +862,12 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                     except Exception:
                         run_no = None
 
+                    # ✅ run_no가 없으면 캐시 기반으로 추정 (가장 흔한 누락 케이스)
+                    if run_no is None:
+                        run_no = _pick_last_run_no_from_cache(sid)
+                        if run_no is not None:
+                            d["run_no"] = run_no
+
                     if run_no is not None:
                         cached_turns = _EMO_CACHE[sid]["turns_by_round"].get(run_no)
                         cached_hmm = _EMO_CACHE[sid]["hmm_by_round"].get(run_no)
@@ -826,11 +877,21 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                             d["hmm"] = d.pop("hhm")
 
                         turns_in = d.get("turns")
+                        # {"turns":[...]} 래퍼로 들어오면 벗겨서 검사
+                        if isinstance(turns_in, dict) and isinstance(turns_in.get("turns"), list):
+                            turns_in = turns_in.get("turns")
+
                         if cached_turns and (_looks_unlabeled_turns(turns_in)):
                             d["turns"] = cached_turns
+                            d["turns_source"] = "orchestrator._EMO_CACHE(turns_by_round)"
 
-                        # ✅ hmm는 항상 dict로 존재하도록 방어(없으면 캐시 주입, 없으면 available False)
-                        if d.get("hmm") is None:
+                        # ✅ turns 자체가 아예 없는데 캐시는 있으면 무조건 주입
+                        if cached_turns and (d.get("turns") is None or d.get("turns") == []):
+                            d["turns"] = cached_turns
+                            d["turns_source"] = "orchestrator._EMO_CACHE(turns_by_round)"
+
+                        # ✅ hmm는 "없거나/비어있거나/available false"면 캐시로 교체
+                        if _hmm_missing_or_empty(d.get("hmm")):
                             if cached_hmm is not None:
                                 d["hmm"] = cached_hmm
                             else:
@@ -857,6 +918,7 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                     # turns가 없거나 / unlabeled로 보이면 캐시로 교체
                     if cached_all and _looks_unlabeled_turns(turns_in):
                         d["turns"] = cached_all
+                        d["turns_source"] = "orchestrator._EMO_CACHE(turns_by_round:flatten)"
 
                 # 다시 반영
                 if "data" in parsed and isinstance(parsed["data"], dict):
@@ -1039,6 +1101,8 @@ def _wrap_tool_force_json_input(original_tool, *, require_data_wrapper: bool = T
                     _EMO_CACHE[sid]["turns_by_round"][run_no] = labeled_turns
                     if hmm_obj is not None:
                         _EMO_CACHE[sid]["hmm_by_round"][run_no] = hmm_obj
+                    # ✅ 다음 make_judgement가 run_no를 누락해도 맞춰주기 위해 기록
+                    _EMO_CACHE[sid]["last_run_no"] = run_no
         except Exception:
             pass
 
@@ -1247,7 +1311,7 @@ def _smart_print(*args, **kwargs):
         
         elif ("persisted" in data) and ("phishing" in data) and ("risk" in data):
             tag = "judgement"
-        elif ("type" in data) and ("text" in data) and (("categories" in data) or ("targets" in data)):
+        elif ("type" in data) and (("전략" in data) or ("수법" in data) or ("targets" in data)):
             tag = "guidance"
         elif ("personalized_prevention" in data):
             tag = "prevention"
@@ -2054,15 +2118,6 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
     - inject_emotion==False: {{"data": {{"case_id": <3단계 case_id>, "run_no": 1, "turns": <3단계 turns>, "hmm": {{"available": false, "reason": "emotion_disabled", "run_no": 1}}}}}}
 - 저장: 판정 결과 (JUDGEMENT_R1)
 
-단계 4-1: 라운드1 종료 조건 체크
-  [A] risk.level == "critical"인가?
-      → YES: 즉시 단계 10으로 이동
-      → NO: 단계 4-2로
-      
-  [B] 현재 라운드 == {max_rounds}인가? (1 == {max_rounds}?)
-      → YES: 즉시 단계 10으로 이동
-      → NO: 단계 5로
-
 단계 5: 가이던스 생성 (라운드2용)
 - 도구: admin.generate_guidance
 - 입력: {{"data": {{"case_id": CASE_ID, "run_no": 1, "scenario": <1단계 scenario>, "victim_profile": <1단계 victim_profile>}}}}
@@ -2174,7 +2229,7 @@ def run_orchestrated(db: Session, payload: Dict[str, Any], _stop: Optional[Threa
 초기화: 1 (엔티티 로드)
 
 라운드1:
-  2→3→4→4-1 체크: critical? NO, 1=={max_rounds}? NO → 5
+  2→3→4→5
 
 라운드2:
   6→7→8→8-1 체크: critical? NO, 2=={max_rounds}? NO → 9→6

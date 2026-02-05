@@ -1,3 +1,4 @@
+#VP/vp_mcp/mcp_server/tools/simulate_dialogue.py
 from typing import List, Dict, Any, Optional
 from pydantic import ValidationError
 from ..schemas import SimulationInput, SimulationResult, Turn
@@ -8,6 +9,8 @@ from ..db.models import Conversation, TurnLog
 import json
 import re
 from typing import Tuple
+import hashlib
+
 
 # FastMCP 등록용
 from mcp.server.fastmcp import FastMCP
@@ -19,6 +22,40 @@ from vp_mcp.mcp_server.utils.end_rules import (
     ATTACKER_TRIGGER_PHRASE,    # "여기서 마무리하겠습니다."
     VICTIM_FINAL_JSON,          # 피해자 마지막 고정 JSON
 )
+
+# ✅ 2-call에서 Planner 출력(proc_code + proc_text) 파싱용
+def _extract_proc_bundle(planner_raw: str) -> tuple[Optional[str], str]:
+    t = _strip_code_fences(planner_raw or "")
+    if attacker_declared_end(t):
+        return (None, "")
+    obj = _try_extract_first_json_obj(t)
+    if isinstance(obj, dict):
+        pc = obj.get("proc_code")
+        proc_code = pc.strip() if isinstance(pc, str) and pc.strip() else None
+
+        # planner가 함께 내주길 원하는 "절차 전문" 필드
+        # (planner 프롬프트에서 proc_text로 통일하는 걸 권장)
+        pt = (
+            obj.get("proc_text")
+            or obj.get("proc_label_text")
+            or obj.get("procedure_text")
+            or obj.get("label_text")
+            or ""
+        )
+        proc_text = pt.strip() if isinstance(pt, str) else ""
+        return (proc_code, proc_text)
+    return (None, "")
+
+def _debug_head(s: str, n: int = 140) -> str:
+    return ((s or "")[:n]).replace("\n", " ")
+
+def _build_previous_turns_block(turns: List[Turn]) -> str:
+    lines = []
+    for t in turns:
+        role = t.role
+        text = (t.text or "").replace("\n", " ")
+        lines.append(f"[{role}] {text}")
+    return "\n".join(lines) if lines else "직전 대화 없음."
 
 # 하드캡(안전장치). 필요 시 .env로 이관
 MAX_OFFENDER_TURNS = 60
@@ -152,7 +189,9 @@ def register_simulate_dialogue_tool_fastmcp(mcp: FastMCP):
 
         # 2) 실제 실행
         try:
-            out = simulate_dialogue_impl(data)
+            # ✅ templates는 스키마에서 드랍될 수 있으니 validate 전에 따로 보관
+            raw_templates = (payload.get("templates") or {}) if isinstance(payload.get("templates"), dict) else {}
+            out = simulate_dialogue_impl(data, templates=raw_templates)
             # out은 dict(평탄화된 결과)로 반환됨. 하위 호환 위해 보호 로직.
             if hasattr(out, "model_dump"):
                 core = out.model_dump()
@@ -176,6 +215,7 @@ def register_simulate_dialogue_tool_fastmcp(mcp: FastMCP):
 def _coerce_input_legacy(arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
     - templates.attacker / templates.victim 이 '완성된 시스템 프롬프트'면 그대로 system에 주입
+    - ✅ 2-call용: templates.attacker_planner / templates.attacker_realizer도 받아둔다.
     - victim.system이 비어있고 victim_profile가 있다면 victim_profile 기반으로 system을 생성하여 주입
     """
     args = dict(arguments or {})
@@ -185,12 +225,23 @@ def _coerce_input_legacy(arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     atk_tpl = tpls.get("attacker") or ""
     vic_tpl = tpls.get("victim") or ""
+    atk_planner_tpl = tpls.get("attacker_planner") or ""
+    atk_realizer_tpl = tpls.get("attacker_realizer") or ""
 
     # 1) 템플릿이 이미 '완성된 system 프롬프트'라면 그대로 사용
     if atk_tpl and not attacker.get("system"):
         attacker["system"] = atk_tpl
     if vic_tpl and not victim.get("system"):
         victim["system"] = vic_tpl
+
+    # ✅ 2-call 템플릿은 args에 보존 (schemas가 몰라도 impl에서 arguments로 읽어도 됨)
+    #   - 가능하면 templates dict에 그대로 유지
+    if isinstance(tpls, dict):
+        if atk_planner_tpl:
+            tpls["attacker_planner"] = atk_planner_tpl
+        if atk_realizer_tpl:
+            tpls["attacker_realizer"] = atk_realizer_tpl
+    args["templates"] = tpls
 
     # 2) 피해자 system이 여전히 비어있다면 victim_profile로 완성
     if not victim.get("system"):
@@ -231,7 +282,7 @@ def _build_victim_system(meta: Any, knowledge: Any, traits: Any) -> str:
 # ─────────────────────────────────────────────────────────
 # 순수 구현 함수 (입력 → 실행 → dict 반환)
 # ─────────────────────────────────────────────────────────
-def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
+def simulate_dialogue_impl(input_obj: SimulationInput, *, templates: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     핵심 시뮬 엔진: 공격자/피해자 교대턴, MCP DB 저장, JSON 결과 반환.
     FastMCP에서 바로 호출 가능하도록 '순수 함수'로 분리.
@@ -261,9 +312,42 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
         print(">> models:", input_obj.models)
 
         # 2) LLM 준비
-        atk = AttackerLLM(
+        # ✅ 2-call(Planner→Realizer)을 MCP 서버에서만 수행:
+        # - input_obj.attacker.system: 대표/호환(보통 realizer system)
+        # - arguments.templates.attacker_planner / attacker_realizer: 2-call용 system
+        #
+        # schemas(SimulationInput)가 templates를 모를 수 있으니,
+        # input_obj에 담긴 scenario/meta만으로는 알 수 없어서
+        # "attacker.system을 realizer로" 유지하면서
+        # planner/realizer는 templates에서 꺼내 쓰도록 구성한다.
+
+        # templates는 SimulationInput에 직접 없을 수 있어 안전하게 우회:
+        # ✅ validate 이후 스키마 드랍 대비: simulate_dialogue()에서 별도로 넘겨준 templates를 우선 사용
+        templates = templates or {}
+
+        # 만약 SimulationInput에 templates가 없으면, scenario/meta에 실려오지 않으므로
+        # caller(REST /api/simulate)가 input_obj 생성 직전에 주입했어야 함.
+        # 그래도 비는 경우를 대비해서 attacker.system을 폴백으로 사용한다.
+        planner_system = ""
+        realizer_system = ""
+        if isinstance(templates, dict):
+            planner_system = (templates.get("attacker_planner") or "").strip()
+            realizer_system = (templates.get("attacker_realizer") or "").strip()
+
+        if not realizer_system:
+            realizer_system = (input_obj.attacker.system or "").strip()
+        if not planner_system:
+            # planner가 없으면 1-call처럼 동작(= realizer system으로 planner도 호출)
+            planner_system = realizer_system
+
+        atk_planner = AttackerLLM(
             model=input_obj.models["attacker"],
-            system=input_obj.attacker.system,
+            system=planner_system,
+            temperature=input_obj.temperature,
+        )
+        atk_realizer = AttackerLLM(
+            model=input_obj.models["attacker"],
+            system=realizer_system,
             temperature=input_obj.temperature,
         )
         vic = VictimLLM(
@@ -306,14 +390,59 @@ def simulate_dialogue_impl(input_obj: SimulationInput) -> Dict[str, Any]:
                 end_turn = (turn_index - 1) if (turn_index - 1) >= 0 else None
                 break
 
-            attacker_text = atk.next(
-                history=history_attacker,
-                # 공격자에게는 피해자 dialogue만 제공
-                last_victim=last_victim_dialogue,
-                current_step="",  # 필요 시 단계 주입
-                guidance=guidance_text,
-                guidance_type=guidance_type,
-            )
+            # ✅ 2-call: (1) Planner로 proc_code 선택 → (2) Realizer로 utterancepse 생성
+            previous_turns_block = _build_previous_turns_block(turns)
+
+            # ✅ 첫 턴(공격자 시작) 강제:
+            # - 직전 대화가 없으므로 planner의 proc_code 선택이 불가능/불안정
+            # - 첫 공격자 턴은 proc_code를 1-1로 고정하고, planner 호출을 스킵한다.
+            is_first_offender_turn = (turn_index == 0 and len(turns) == 0 and previous_turns_block == "직전 대화 없음.")
+
+            if is_first_offender_turn:
+                # 첫 턴은 안정적으로 고정 (planner를 첫턴부터 돌리고 싶으면 여기 분기를 제거해도 됨)
+                proc_code = "1-1"
+                proc_text = ""  # ✅ realizer 시스템에서 절차 전문을 뺄 거면, 여기도 채우는 게 좋음(아래 NOTE 참고)
+                attacker_text = atk_realizer.next(
+                    history=history_attacker,
+                    last_victim=last_victim_dialogue,
+                    current_step=proc_text,
+                    guidance=guidance_text,
+                    guidance_type=guidance_type,
+                    previous_turns_block=previous_turns_block,
+                    proc_code=proc_code,
+                )
+            else:
+                # (1) Planner call
+                planner_raw = atk_planner.next(
+                    history=history_attacker,
+                    last_victim=last_victim_dialogue,  # 호환: planner는 이 값만으로도 충분히 판단 가능
+                    current_step="",
+                    guidance="",  # planner는 guidance를 최대한 배제(라벨 선택 순수성)
+                    guidance_type="",
+                    # ✅ 템플릿이 previous_turns_block을 요구하는 경우를 위해 같이 전달
+                    previous_turns_block=previous_turns_block,
+                )
+
+                # planner가 종료 선언하면 즉시 종료 프로토콜로 전환
+                if attacker_declared_end(planner_raw or ""):
+                    attacker_text = ATTACKER_TRIGGER_PHRASE
+                else:
+                    proc_code, proc_text = _extract_proc_bundle(planner_raw or "")
+                    proc_code = proc_code or ""
+                    proc_text = proc_text or ""
+
+
+
+                    # (2) Realizer call (proc_code 고정)
+                    attacker_text = atk_realizer.next(
+                        history=history_attacker,
+                        last_victim=last_victim_dialogue,
+                        current_step=proc_text,
+                        guidance=guidance_text,
+                        guidance_type=guidance_type,
+                        previous_turns_block=previous_turns_block,
+                        proc_code=proc_code,
+                    )
 
             # ✅ 공격자 출력 방어:
             # - 종료 문구면 그대로

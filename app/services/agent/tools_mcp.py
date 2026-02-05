@@ -9,7 +9,12 @@ from langchain_core.tools import tool
 from app.core.logging import get_logger
 import re
 
-from app.services.prompts import render_attacker_system_string, render_victim_system_string
+from app.services.prompts import (
+    render_attacker_system_string,              # 1-call 호환(legacy)
+    render_attacker_planner_system_string,      # ✅ 2-call: Planner
+    render_attacker_realizer_system_string,     # ✅ 2-call: Realizer
+    render_victim_system_string,
+)
 from app.services.agent.payload_store import load_payload
 
 logger = get_logger(__name__)
@@ -26,6 +31,9 @@ MCP_BASE_URL = _base_from_env.replace("/mcp", "").rstrip("/")
 class Templates(BaseModel):
     attacker: str
     victim: str
+    # ✅ 2-call 확장: MCP 서버에서 planner→realizer 2번 호출할 때 사용
+    attacker_planner: Optional[str] = None
+    attacker_realizer: Optional[str] = None
 
 class Guidance(BaseModel):
     type: Literal["A","P"]
@@ -39,7 +47,12 @@ class MCPRunInput(BaseModel):
 
     # templates: dict 혹은 미제공 시 기본값
     templates: Templates = Field(
-        default_factory=lambda: Templates(attacker="ATTACKER_PROMPT_V1", victim="VICTIM_PROMPT_V1")
+        default_factory=lambda: Templates(
+            attacker="ATTACKER_PROMPT_V1",
+            victim="VICTIM_PROMPT_V1",
+            attacker_planner=None,
+            attacker_realizer=None,
+        )
     )
 
     # 모델: 여러 형태를 허용하고 아래에서 정규화
@@ -222,19 +235,64 @@ def make_mcp_tools():
             logger.info(f"[MCP] using explicit models: {eff_models}")
 
         # ---------- 4) prompts.py 빌더로 system 문자열 생성 ----------
+        # ✅ 목표:
+        # - 오케스트레이터/툴에서는 "프롬프트 조립"까지만
+        # - 실제 2-call(planner→realizer)은 MCP 서버에서만 수행
+        #
+        # 여기 tools_mcp는 MCP 서버에 전달할 templates를 정규화한다.
         atk_system = payload.get("attacker_prompt") or None
         vic_system = payload.get("victim_prompt") or None
 
+        # 2-call용 시스템 프롬프트(있으면 그대로 사용, 없으면 생성)
+        atk_planner_system = (
+            payload.get("attacker_planner_prompt")
+            or payload.get("attacker_planner_system")
+            or None
+        )
+        atk_realizer_system = (
+            payload.get("attacker_realizer_prompt")
+            or payload.get("attacker_realizer_system")
+            or None
+        )
+
+        # --- attacker(legacy 대표 system) ---
         if not atk_system:
+            # 2-call로 갈 것이므로 대표 system은 "realizer"를 우선 사용
+            if isinstance(atk_realizer_system, str) and atk_realizer_system.strip():
+                atk_system = atk_realizer_system
+            else:
+                try:
+                    atk_system = render_attacker_system_string(
+                        scenario=scenario,
+                        current_step="",
+                        guidance=(model.guidance.model_dump() if model.guidance else None),
+                    )
+                except Exception as e:
+                    logger.warning(f"[MCP] render_attacker_system_string failed: {e}")
+                    atk_system = None  # 폴백 필요
+
+        # --- 2-call: planner/realizer system ---
+        # Planner는 보통 guidance를 안 넣는 편이 안정적(라벨 순수 선택).
+        # Realizer는 guidance를 넣어 표현/전략을 반영.
+        if not atk_planner_system:
             try:
-                atk_system = render_attacker_system_string(
+                atk_planner_system = render_attacker_planner_system_string(
                     scenario=scenario,
-                    current_step="",
                     guidance=(model.guidance.model_dump() if model.guidance else None),
                 )
             except Exception as e:
-                logger.warning(f"[MCP] render_attacker_system_string failed: {e}")
-                atk_system = None  # 폴백 필요
+                logger.warning(f"[MCP] render_attacker_planner_system_string failed: {e}")
+                atk_planner_system = None
+
+        if not atk_realizer_system:
+            try:
+                atk_realizer_system = render_attacker_realizer_system_string(
+                    scenario=scenario,
+                    guidance=(model.guidance.model_dump() if model.guidance else None),
+                )
+            except Exception as e:
+                logger.warning(f"[MCP] render_attacker_realizer_system_string failed: {e}")
+                atk_realizer_system = None
 
         if not vic_system:
             try:
@@ -254,6 +312,18 @@ def make_mcp_tools():
         if vic_system is None:
             vic_system = model.templates.victim
 
+        # 2-call 폴백: templates에 들어온 값이 있으면 사용
+        if atk_planner_system is None:
+            atk_planner_system = model.templates.attacker_planner
+        if atk_realizer_system is None:
+            atk_realizer_system = model.templates.attacker_realizer
+
+        # 그래도 비면: 대표 system으로 채운다(서버가 1-call로라도 진행 가능하게)
+        if not atk_planner_system:
+            atk_planner_system = atk_system
+        if not atk_realizer_system:
+            atk_realizer_system = atk_system
+
         # 디버깅용: 실제 전송되는 system 머리만 로그
         def _head(s: str, n: int = 140) -> str:
             try:
@@ -262,9 +332,17 @@ def make_mcp_tools():
                 return "<non-str>"
 
         logger.info("[MCP] attacker system head: %s", _head(atk_system))
+        logger.info("[MCP] planner  system head: %s", _head(atk_planner_system))
+        logger.info("[MCP] realizer system head: %s", _head(atk_realizer_system))
         logger.info("[MCP] victim   system head: %s", _head(vic_system))
 
-        templates_payload = {"attacker": atk_system, "victim": vic_system}
+        # ✅ MCP 서버가 2-call을 수행할 수 있도록 templates 확장
+        templates_payload = {
+            "attacker": atk_system,
+            "victim": vic_system,
+            "attacker_planner": atk_planner_system,
+            "attacker_realizer": atk_realizer_system,
+        }
 
         # ---------- 5) 서버 스키마에 맞게 arguments 구성 ----------
         args: Dict[str, Any] = {
@@ -347,13 +425,13 @@ def make_mcp_tools():
             "stats": stats,
             "ended_by": ended_by,
             "meta": meta,
-            "log": result,
+            # "log": result,
             "total_turns": stats.get("turns"),
             "run_no": model.round_no or 1,
-            "debug_templates": {          # 👈 추가
-                "attacker": atk_system,
-                "victim":   vic_system,
-            },
+            # "debug_templates": {          # 👈 추가
+            #     "attacker_planner": atk_planner_system,
+            #     "attacker_realizer": atk_realizer_system,
+            # },
         }
 
     return [simulator_run]

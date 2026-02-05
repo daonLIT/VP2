@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Optional, Dict, Any, List
 
+import re
 import os
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -120,11 +121,34 @@ def _compose_turn_prompt(
     victim_meta: Optional[Dict[str, Any]] = None,
     victim_knowledge: Optional[Dict[str, Any]] = None,
     victim_traits: Optional[Dict[str, Any]] = None,
+    # ✅ (옵션) planner/realizer 지원
+    # - planner: previous_turns_block(이전 대화 블록)을 보고 proc_code를 선택하게 할 때 사용
+    # - realizer: proc_code를 고정해 발화를 생성하게 할 때 사용
+    previous_turns_block: str = "",
+    proc_code: str = "",
 ) -> str:
     """
     한 턴 프롬프트 합성 (공격자/피해자 공통)
     """
+    # ✅ Planner/Realizer 휴리스틱 판별
+    # - simulate_dialogue.py에서 planner 호출은 guidance="" / guidance_type="" / proc_code="" 로 들어옴
+    # - realizer 호출은 proc_code가 채워져 들어오는 것이 정상
+    #
+    # 목적:
+    # - Planner는 "proc_code만 JSON으로" 내야 하므로,
+    #   공통 instruction("한 턴 대사") 같은 문구가 끼면 출력이 오염될 수 있음.
+    is_planner_call = (
+        role == "attacker"
+        and (guidance or "").strip() == ""
+        and (guidance_type or "").strip() == ""
+        and (proc_code or "").strip() == ""
+    )
     lines = []
+    # planner/realizer용 추가 슬롯 (필요할 때만 포함)
+    if previous_turns_block:
+        lines.append(f"[Previous Turns]\n{previous_turns_block}")
+    if proc_code:
+        lines.append(f"[Fixed Proc Code]\n{proc_code}")
     if current_step:
         lines.append(f"[Step]\n{current_step}")
     if guidance:
@@ -139,8 +163,34 @@ def _compose_turn_prompt(
             lines.append(f"[Victim Knowledge]\n{victim_knowledge}")
         if victim_traits:
             lines.append(f"[Victim Traits]\n{victim_traits}")
-    lines.append("[Instruction]\nRespond with one concise turn, staying in character.")
+
+    # ✅ Planner에서는 instruction을 제거/완화
+    # - Planner: system 프롬프트 규칙(=proc_code JSON only)을 방해하지 않게 함
+    # - Realizer/Victim: 기존대로 "한 턴" 지시 유지
+    if is_planner_call:
+        lines.append(
+            "[Instruction]\n"
+            "Follow the SYSTEM rules exactly. Output ONLY the required JSON. No extra text."
+        )
+    else:
+        lines.append("[Instruction]\nRespond with one concise turn, staying in character.")
     return "\n\n".join(lines)
+
+def _infer_attacker_phase(*, guidance: str, guidance_type: str, proc_code: str) -> str:
+    """
+    simulate_dialogue.py의 호출 규약에 기반한 휴리스틱:
+    - Planner call: guidance="", guidance_type="", proc_code=""
+    - Realizer call: proc_code가 채워져 들어오는 것이 정상
+    (혹시 예외가 있으면 'attacker'로 표기)
+    """
+    g = (guidance or "").strip()
+    gt = (guidance_type or "").strip()
+    pc = (proc_code or "").strip()
+    if g == "" and gt == "" and pc == "":
+        return "planner"
+    if pc != "":
+        return "realizer"
+    return "attacker"
 
 class _BaseLLM:
     def __init__(self, *, model: str, system: str, temperature: float):
@@ -162,11 +212,17 @@ class _BaseLLM:
             self.llm = _openai_chat(model or "gpt-4o-mini-2024-07-18", temperature)
         logger.info(f"[LLM:init] model={model} provider={provider} temperature={temperature}")
 
-    def _invoke(self, messages: List):
-        logger.info(f"[LLM:invoke] model={self.model_name} len_messages={len(messages)}")
+    def _invoke(self, messages: List, *, phase: Optional[str] = None):
+        if phase:
+            logger.info(f"[LLM:invoke] phase={phase} model={self.model_name} len_messages={len(messages)}")
+        else:
+            logger.info(f"[LLM:invoke] model={self.model_name} len_messages={len(messages)}")
         res = self.llm.invoke(messages)
         out = getattr(res, "content", str(res)).strip()
-        logger.info(f"[LLM:done] model={self.model_name} out_len={len(out)}")
+        if phase:
+            logger.info(f"[LLM:done] phase={phase} model={self.model_name} out_len={len(out)}")
+        else:
+            logger.info(f"[LLM:done] model={self.model_name} out_len={len(out)}")
         return out
 
 class AttackerLLM(_BaseLLM):
@@ -178,6 +234,9 @@ class AttackerLLM(_BaseLLM):
         current_step: str,
         guidance: str,
         guidance_type: str,
+        # ✅ (옵션) planner/realizer 지원
+        previous_turns_block: str = "",
+        proc_code: str = "",
     ) -> str:
         messages: List = [SystemMessage(self.system)]
         messages.extend(history or [])
@@ -187,9 +246,12 @@ class AttackerLLM(_BaseLLM):
             current_step=current_step,
             guidance=guidance,
             guidance_type=guidance_type,
+            previous_turns_block=previous_turns_block,
+            proc_code=proc_code,
         )
         messages.append(HumanMessage(prompt))
-        return self._invoke(messages)
+        phase = _infer_attacker_phase(guidance=guidance, guidance_type=guidance_type, proc_code=proc_code)
+        return self._invoke(messages, phase=phase)
 
 class VictimLLM(_BaseLLM):
     def next(
@@ -216,4 +278,5 @@ class VictimLLM(_BaseLLM):
             victim_traits=traits,
         )
         messages.append(HumanMessage(prompt))
-        return self._invoke(messages)
+        # victim도 phase 태그를 달아 planner/realizer/victim 흐름을 로그에서 확정 가능하게 함
+        return self._invoke(messages, phase="victim")
